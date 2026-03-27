@@ -1,0 +1,5 @@
+name: door_env
+sim_backend: isaac_sim
+robot: franka
+notes: "环境细节待补充"
+

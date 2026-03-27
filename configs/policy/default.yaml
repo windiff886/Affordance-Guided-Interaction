@@ -1,0 +1,6 @@
+actor:
+  type: recurrent
+critic:
+  type: asymmetric
+notes: "网络结构待补充"
+
