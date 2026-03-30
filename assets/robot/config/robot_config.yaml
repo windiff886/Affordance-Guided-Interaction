@@ -1,0 +1,91 @@
+# Uni-Dingo Robot Configuration
+# ==============================
+
+robot:
+  name: "uni_dingo"
+  mode: "simulation"  # "simulation" | "real"
+
+# Subsystem configuration
+subsystems:
+  base:
+    enabled: true
+    type: "dingo_omni"  # "dingo_omni" | "dingo_diff"
+    cmd_vel_topic: "/cmd_vel"
+    odom_topic: "/odometry/filtered"
+    max_linear_vel: 1.0   # m/s
+    max_angular_vel: 2.0  # rad/s
+    model_name: "uni_dingo_dual_arm"  # For Gazebo services
+
+  left_arm:
+    enabled: true
+    planning_group: "left_arm_manipulator"
+    end_effector_link: "left_link06"
+    joint_names:
+      - "left_joint1"
+      - "left_joint2"
+      - "left_joint3"
+      - "left_joint4"
+      - "left_joint5"
+      - "left_joint6"
+    gripper:
+      enabled: true
+      joint_name: "left_gripper"
+
+  right_arm:
+    enabled: true
+    planning_group: "right_arm_manipulator"
+    end_effector_link: "right_link06"
+    joint_names:
+      - "right_joint1"
+      - "right_joint2"
+      - "right_joint3"
+      - "right_joint4"
+      - "right_joint5"
+      - "right_joint6"
+    gripper:
+      enabled: true
+      joint_name: "right_gripper"
+
+  head:
+    enabled: true
+    pan_joint: "pan_tilt_yaw_joint"
+    tilt_joint: "pan_tilt_pitch_joint"
+    # Limits in radians (±60 degrees)
+    pan_min: -1.047
+    pan_max: 1.047
+    tilt_min: -1.047
+    tilt_max: 1.047
+    # Simulation topics (Gazebo position controllers)
+    sim_pan_topic: "/pan_tilt/pan_controller/command"
+    sim_tilt_topic: "/pan_tilt/tilt_controller/command"
+    # Real robot topics
+    real_cmd_topic: "/pan_tilt_cmd_deg"
+    real_status_topic: "/pan_tilt_status"
+
+  perception:
+    enabled: true
+    camera_frame: "camera_link"
+    optical_frame: "camera_color_optical_frame"
+    # Simulation topics (Gazebo camera)
+    sim_rgb_topic: "/camera/color/image_raw"
+    sim_depth_topic: "/camera/depth/image_raw"
+    sim_points_topic: "/camera/depth/points"
+    sim_camera_info_topic: "/camera/color/camera_info"
+    # Real robot topics (RealSense D455)
+    real_rgb_topic: "/d455/color/image_raw"
+    real_depth_topic: "/d455/aligned_depth_to_color/image_raw"
+    real_points_topic: "/d455/depth/color/points"
+    real_camera_info_topic: "/d455/color/camera_info"
+
+# Named poses for arms
+named_poses:
+  home:
+    left: [0.0, 0.0, 0.0, -0.07435, 0.0, 0.0]
+    right: [0.0, 0.0, 0.0, -0.07435, 0.0, 0.0]
+
+# Motion parameters
+motion:
+  default_velocity_scaling: 0.1
+  default_acceleration_scaling: 0.1
+  planning_time: 5.0
+  num_planning_attempts: 10

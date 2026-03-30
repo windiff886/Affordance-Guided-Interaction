@@ -1,0 +1,137 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="pan_tilt" description="iqr pan tilt">
+  <xacro:macro name="pan_tilt" params="parent *origin">
+    <xacro:property name="prefix" value="pan_tilt"/>
+    <xacro:property name="P_PI" value="3.1415926535897931"/>
+
+    <joint name="${prefix}_base_joint" type="fixed">
+      <xacro:insert_block name="origin"/>
+      <parent link="${parent}"/>
+      <child link="${prefix}_base_link"/>
+    </joint>
+
+    <link name="${prefix}_base_link">
+      <inertial>
+        <origin xyz="0 0 0.01" rpy="0 0 0"/>
+        <mass value="0.1"/>
+        <inertia ixx="0.0001" ixy="0" ixz="0" iyy="0.0001" iyz="0" izz="0.0001"/>
+      </inertial>
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 -${P_PI/2}"/>
+        <geometry>
+          <mesh filename="package://pan_tilt_description/urdf/mesh/base.stl"/>
+        </geometry>
+        <material name="">
+          <color rgba="0.2 0.2 0.2 1"/>
+        </material>
+      </visual>
+      <collision>
+        <origin xyz="0 0 0.01" rpy="0 0 0"/>
+        <geometry>
+          <cylinder length="0.023" radius="0.03"/>
+        </geometry>
+      </collision>
+    </link>
+
+    <link name="${prefix}_yaw_link">
+      <inertial>
+        <origin xyz="0 0 0.03" rpy="0 0 0"/>
+        <mass value="0.08"/>
+        <inertia ixx="0.0001" ixy="0" ixz="0" iyy="0.0001" iyz="0" izz="0.0001"/>
+      </inertial>
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 -${P_PI/2}"/>
+        <geometry>
+          <mesh filename="package://pan_tilt_description/urdf/mesh/yaw.stl"/>
+        </geometry>
+        <material name="">
+          <color rgba="0.2 0.2 0.2 1"/>
+        </material>
+      </visual>
+      <collision>
+        <origin xyz="0 0 0.03" rpy="0 0 0"/>
+        <geometry>
+          <cylinder length="0.062" radius="0.03"/>
+        </geometry>
+      </collision>
+    </link>
+    <joint name="${prefix}_yaw_joint" type="revolute">
+      <origin xyz="0.0 0.0 0.023" rpy="0.0 0.0 0.0"/>
+      <parent link="${prefix}_base_link"/>
+      <child link="${prefix}_yaw_link"/>
+      <axis xyz="0 0 1"/>
+      <limit lower="${-P_PI/3}" upper="${P_PI/3}" effort="5.0" velocity="${P_PI/6}"/>
+      <dynamics damping="0.5" friction="0.1"/>
+    </joint>
+
+    <!-- Yaw Transmission for Gazebo -->
+    <transmission name="${prefix}_yaw_trans">
+      <type>transmission_interface/SimpleTransmission</type>
+      <joint name="${prefix}_yaw_joint">
+        <hardwareInterface>hardware_interface/PositionJointInterface</hardwareInterface>
+      </joint>
+      <actuator name="${prefix}_yaw_motor">
+        <hardwareInterface>hardware_interface/PositionJointInterface</hardwareInterface>
+        <mechanicalReduction>1</mechanicalReduction>
+      </actuator>
+    </transmission>
+
+    <link name="${prefix}_pitch_link">
+      <inertial>
+        <origin xyz="0 0 0.016" rpy="0 0 0"/>
+        <mass value="0.06"/>
+        <inertia ixx="0.0001" ixy="0" ixz="0" iyy="0.0001" iyz="0" izz="0.0001"/>
+      </inertial>
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 -${P_PI/2}"/>
+        <geometry>
+          <mesh filename="package://pan_tilt_description/urdf/mesh/pitch.stl"/>
+        </geometry>
+        <material name="">
+          <color rgba="0.2 0.2 0.2 1"/>
+        </material>
+      </visual>
+      <collision>
+        <origin xyz="0 0 0.016" rpy="0 0 0"/>
+        <geometry>
+          <cylinder length="0.032" radius="0.03"/>
+        </geometry>
+      </collision>
+    </link>
+    <joint name="${prefix}_pitch_joint" type="revolute">
+      <origin xyz="0.0 0.0 0.062" rpy="0.0 0.0 0.0"/>
+      <parent link="${prefix}_yaw_link"/>
+      <child link="${prefix}_pitch_link"/>
+      <axis xyz="0 1 0"/>
+      <limit lower="${-P_PI/3}" upper="${P_PI/3}" effort="5.0" velocity="${P_PI/6}"/>
+      <dynamics damping="0.5" friction="0.1"/>
+    </joint>
+
+    <!-- Pitch Transmission for Gazebo -->
+    <transmission name="${prefix}_pitch_trans">
+      <type>transmission_interface/SimpleTransmission</type>
+      <joint name="${prefix}_pitch_joint">
+        <hardwareInterface>hardware_interface/PositionJointInterface</hardwareInterface>
+      </joint>
+      <actuator name="${prefix}_pitch_motor">
+        <hardwareInterface>hardware_interface/PositionJointInterface</hardwareInterface>
+        <mechanicalReduction>1</mechanicalReduction>
+      </actuator>
+    </transmission>
+
+    <link name="${prefix}_surface">
+      <inertial>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <mass value="0.01"/>
+        <inertia ixx="0.00001" ixy="0" ixz="0" iyy="0.00001" iyz="0" izz="0.00001"/>
+      </inertial>
+    </link>
+    <joint name="${prefix}_surface_joint" type="fixed">
+      <origin xyz="0.0 0.0 0.032" rpy="0 0 0"/>
+      <parent link="${prefix}_pitch_link"/>
+      <child link="${prefix}_surface"/>
+    </joint>
+
+  </xacro:macro>
+
+</robot>

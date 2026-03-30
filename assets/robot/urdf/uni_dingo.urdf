@@ -1,0 +1,153 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- This URDF was automatically created by SolidWorks to URDF Exporter! Originally created by Stephen Brawner (brawner@gmail.com) 
+     Commit Version: 1.6.0-4-g7f85cfe  Build Version: 1.6.7995.38578
+     For more information, please see http://wiki.ros.org/sw_urdf_exporter -->
+<robot
+  name="uni_dingo">
+  <link
+    name="base_link">
+    <inertial>
+      <origin
+        xyz="-0.022862 -0.034436 0.035407"
+        rpy="0 0 0" />
+      <mass
+        value="5.3306" />
+      <inertia
+        ixx="0.059795"
+        ixy="2.6827E-06"
+        ixz="-1.8684E-07"
+        iyy="0.020279"
+        iyz="0.00018072"
+        izz="0.06071" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://uni_dingo/meshes/base_link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://uni_dingo/meshes/base_link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <link
+    name="leftarm_link">
+    <inertial>
+      <origin
+        xyz="-0.11708 0.15091 -0.57228"
+        rpy="0 0 0" />
+      <mass
+        value="1.3818" />
+      <inertia
+        ixx="0.0033131"
+        ixy="-7.0879E-05"
+        ixz="1.2357E-05"
+        iyy="0.0010277"
+        iyz="0.00028255"
+        izz="0.0033076" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="-0.11708 0.15091 -0.57228"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://uni_dingo/meshes/leftarm_link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://uni_dingo/meshes/leftarm_link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="base_leftarm_joint"
+    type="fixed">
+    <origin
+      xyz="0.11708 -0.15091 0.57228"
+      rpy="0 0 0" />
+    <parent
+      link="base_link" />
+    <child
+      link="leftarm_link" />
+    <axis
+      xyz="0 0 0" />
+  </joint>
+  <link
+    name="rightarm_link">
+    <inertial>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <mass
+        value="0" />
+      <inertia
+        ixx="0"
+        ixy="0"
+        ixz="0"
+        iyy="0"
+        iyz="0"
+        izz="0" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://uni_dingo/meshes/rightarm_link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://uni_dingo/meshes/rightarm_link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="base_rightarm_joint"
+    type="fixed">
+    <origin
+      xyz="-0.11708 -0.15091 0.57228"
+      rpy="0 0 0" />
+    <parent
+      link="base_link" />
+    <child
+      link="rightarm_link" />
+    <axis
+      xyz="0 0 0" />
+  </joint>
+</robot>

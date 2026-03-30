@@ -1,0 +1,208 @@
+<?xml version="1.0"?>
+<!--
+  Uni-Dingo 双臂机器人描述
+  包含: Dingo 底盘 + 左 Z1 机械臂 + 右 Z1 机械臂 + Pan-Tilt 云台
+-->
+<robot name="uni_dingo_dual_arm" xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <!-- 参数 -->
+  <xacro:arg name="UnitreeGripper" default="true"/>
+  <xacro:arg name="PanTilt" default="true"/>
+  <xacro:property name="arm_support_radius" value="0.02"/>
+
+  <!-- 云台挂载位置 -->
+  <xacro:property name="pan_tilt_mount_x" value="0.15091"/>
+  <xacro:property name="pan_tilt_mount_y" value="0"/>
+  <xacro:property name="pan_tilt_mount_z" value="1.0"/>
+  <xacro:property name="pan_tilt_support_length" value="${pan_tilt_mount_z - arm_support_clearance}"/>
+  <xacro:property name="arm_support_clearance" value="0.10"/>
+  <xacro:property name="left_arm_mount_x" value="0.15091"/>
+  <xacro:property name="left_arm_mount_y" value="0.11708"/>
+  <xacro:property name="left_arm_mount_z" value="0.57228"/>
+  <xacro:property name="left_arm_support_length" value="${left_arm_mount_z - arm_support_clearance}"/>
+  <xacro:property name="right_arm_mount_x" value="0.15091"/>
+  <xacro:property name="right_arm_mount_y" value="-0.11708"/>
+  <xacro:property name="right_arm_mount_z" value="0.57228"/>
+  <xacro:property name="right_arm_support_length" value="${right_arm_mount_z - arm_support_clearance}"/>
+
+  <material name="arm_support_grey">
+    <color rgba="0.3 0.3 0.3 1.0"/>
+  </material>
+
+  <!-- 引入 Z1 机械臂 macro -->
+  <xacro:include filename="$(find uni_dingo)/urdf/z1_arm.urdf.xacro"/>
+
+
+  <!-- 引入 Pan-Tilt 云台 macro -->
+  <xacro:include filename="$(find pan_tilt_description)/urdf/pan_tilt.urdf.xacro"/>
+
+  <!-- ========== Dingo 底盘（官方描述） ========== -->
+  <xacro:include filename="$(find dingo_description)/urdf/dingo.urdf.xacro"/>
+
+  <!-- Enable self-collision for base links in Gazebo -->
+  <gazebo reference="base_link">
+    <self_collide>true</self_collide>
+  </gazebo>
+  <gazebo reference="chassis_link">
+    <self_collide>true</self_collide>
+  </gazebo>
+
+  <!-- 支撑柱惯性参数（铝制圆柱，密度约 2700 kg/m³） -->
+  <xacro:property name="arm_support_mass" value="1.4"/>
+  <xacro:property name="pan_tilt_support_mass" value="2.7"/>
+
+  <!-- ========== 左臂安装座 + 支撑柱（合并为一个 link） ========== -->
+  <link name="leftarm_link">
+    <inertial>
+      <origin xyz="0 0 ${-left_arm_support_length/2.0}" rpy="0 0 0"/>
+      <mass value="${arm_support_mass}"/>
+      <inertia ixx="${arm_support_mass*(3*arm_support_radius*arm_support_radius + left_arm_support_length*left_arm_support_length)/12.0}"
+               ixy="0" ixz="0"
+               iyy="${arm_support_mass*(3*arm_support_radius*arm_support_radius + left_arm_support_length*left_arm_support_length)/12.0}"
+               iyz="0"
+               izz="${arm_support_mass*arm_support_radius*arm_support_radius/2.0}"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 ${-left_arm_support_length/2.0}" rpy="0 0 0"/>
+      <geometry>
+        <cylinder length="${left_arm_support_length}" radius="${arm_support_radius}"/>
+      </geometry>
+      <material name="arm_support_grey"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 ${-left_arm_support_length/2.0}" rpy="0 0 0"/>
+      <geometry>
+        <cylinder length="${left_arm_support_length}" radius="${arm_support_radius}"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <joint name="base_leftarm_joint" type="fixed">
+    <origin xyz="${left_arm_mount_x} ${left_arm_mount_y} ${left_arm_mount_z}" rpy="0 0 0"/>
+    <parent link="base_link"/>
+    <child link="leftarm_link"/>
+  </joint>
+
+  <!-- ========== 右臂安装座 + 支撑柱（合并为一个 link） ========== -->
+  <link name="rightarm_link">
+    <inertial>
+      <origin xyz="0 0 ${-right_arm_support_length/2.0}" rpy="0 0 0"/>
+      <mass value="${arm_support_mass}"/>
+      <inertia ixx="${arm_support_mass*(3*arm_support_radius*arm_support_radius + right_arm_support_length*right_arm_support_length)/12.0}"
+               ixy="0" ixz="0"
+               iyy="${arm_support_mass*(3*arm_support_radius*arm_support_radius + right_arm_support_length*right_arm_support_length)/12.0}"
+               iyz="0"
+               izz="${arm_support_mass*arm_support_radius*arm_support_radius/2.0}"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 ${-right_arm_support_length/2.0}" rpy="0 0 0"/>
+      <geometry>
+        <cylinder length="${right_arm_support_length}" radius="${arm_support_radius}"/>
+      </geometry>
+      <material name="arm_support_grey"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 ${-right_arm_support_length/2.0}" rpy="0 0 0"/>
+      <geometry>
+        <cylinder length="${right_arm_support_length}" radius="${arm_support_radius}"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <joint name="base_rightarm_joint" type="fixed">
+    <origin xyz="${right_arm_mount_x} ${right_arm_mount_y} ${right_arm_mount_z}" rpy="0 0 0"/>
+    <parent link="base_link"/>
+    <child link="rightarm_link"/>
+  </joint>
+
+  <!-- ========== 左 Z1 机械臂 ========== -->
+  <xacro:z1_arm prefix="left_" parent="leftarm_link" UnitreeGripper="$(arg UnitreeGripper)">
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </xacro:z1_arm>
+
+  <!-- ========== 右 Z1 机械臂 ========== -->
+  <xacro:z1_arm prefix="right_" parent="rightarm_link" UnitreeGripper="$(arg UnitreeGripper)">
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </xacro:z1_arm>
+
+  <!-- ========== Pan-Tilt 云台 ========== -->
+  <xacro:if value="$(arg PanTilt)">
+
+    <!-- 云台安装座 + 支撑柱（合并为一个 link，云台挂载到此 link） -->
+    <link name="pan_tilt_mount_link">
+      <inertial>
+        <origin xyz="0 0 ${-pan_tilt_support_length/2.0}" rpy="0 0 0"/>
+        <mass value="${pan_tilt_support_mass}"/>
+        <inertia ixx="${pan_tilt_support_mass*(3*arm_support_radius*arm_support_radius + pan_tilt_support_length*pan_tilt_support_length)/12.0}"
+                 ixy="0" ixz="0"
+                 iyy="${pan_tilt_support_mass*(3*arm_support_radius*arm_support_radius + pan_tilt_support_length*pan_tilt_support_length)/12.0}"
+                 iyz="0"
+                 izz="${pan_tilt_support_mass*arm_support_radius*arm_support_radius/2.0}"/>
+      </inertial>
+      <visual>
+        <origin xyz="0 0 ${-pan_tilt_support_length/2.0}" rpy="0 0 0"/>
+        <geometry>
+          <cylinder length="${pan_tilt_support_length}" radius="${arm_support_radius}"/>
+        </geometry>
+        <material name="arm_support_grey"/>
+      </visual>
+      <collision>
+        <origin xyz="0 0 ${-pan_tilt_support_length/2.0}" rpy="0 0 0"/>
+        <geometry>
+          <cylinder length="${pan_tilt_support_length}" radius="${arm_support_radius}"/>
+        </geometry>
+      </collision>
+    </link>
+
+    <joint name="base_pan_tilt_mount_joint" type="fixed">
+      <origin xyz="${pan_tilt_mount_x} ${pan_tilt_mount_y} ${pan_tilt_mount_z}" rpy="0 0 0"/>
+      <parent link="base_link"/>
+      <child link="pan_tilt_mount_link"/>
+    </joint>
+
+    <!-- 云台（挂载到支撑柱顶端） -->
+    <xacro:pan_tilt parent="pan_tilt_mount_link">
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+    </xacro:pan_tilt>
+
+    <!-- 相机支撑柱 -->
+    <xacro:property name="camera_mount_z" value="0.1"/>
+    <link name="camera_support_link">
+      <inertial>
+        <origin xyz="0 0 ${camera_mount_z/2.0}" rpy="0 0 0"/>
+        <mass value="0.05"/>
+        <inertia ixx="0.00005" ixy="0" ixz="0" iyy="0.00005" iyz="0" izz="0.00001"/>
+      </inertial>
+      <visual>
+        <origin xyz="0 0 ${camera_mount_z/2.0}" rpy="0 0 0"/>
+        <geometry>
+          <cylinder length="${camera_mount_z}" radius="${arm_support_radius}"/>
+        </geometry>
+        <material name="arm_support_grey"/>
+      </visual>
+      <collision>
+        <origin xyz="0 0 ${camera_mount_z/2.0}" rpy="0 0 0"/>
+        <geometry>
+          <cylinder length="${camera_mount_z}" radius="${arm_support_radius}"/>
+        </geometry>
+      </collision>
+    </link>
+
+    <joint name="pan_tilt_camera_support_joint" type="fixed">
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <parent link="pan_tilt_surface"/>
+      <child link="camera_support_link"/>
+    </joint>
+
+    <!-- D455 相机（挂载到相机支撑柱顶端） -->
+    <xacro:realsense_sensor rs_model="d455"
+                            prefix="head"
+                            parent="camera_support_link"
+                            topic="d455"
+                            include="0">
+      <origin xyz="0 0 ${camera_mount_z}" rpy="0 0 0"/>
+    </xacro:realsense_sensor>
+
+  </xacro:if>
+
+</robot>

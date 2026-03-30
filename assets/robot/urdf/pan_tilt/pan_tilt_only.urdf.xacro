@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<!--
+  Pan-Tilt 云台独立模型（不含相机）
+  用于可视化云台坐标系
+-->
+<robot name="pan_tilt_robot" xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <!-- 引入云台 macro -->
+  <xacro:include filename="$(find pan_tilt_description)/urdf/pan_tilt.urdf.xacro"/>
+
+  <!-- 虚拟基座 -->
+  <link name="base_link"/>
+
+  <!-- 挂载云台 -->
+  <xacro:pan_tilt parent="base_link">
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </xacro:pan_tilt>
+
+</robot>

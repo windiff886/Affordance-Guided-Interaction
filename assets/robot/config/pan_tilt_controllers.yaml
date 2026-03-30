@@ -1,0 +1,16 @@
+# Pan-Tilt Controller Configuration for Gazebo
+# ==============================================
+# Note: joint_state_controller removed to avoid duplicate publishing
+# dingo_joint_publisher handles all joint states
+
+# Pan (Yaw) Position Controller
+pan_controller:
+  type: position_controllers/JointPositionController
+  joint: pan_tilt_yaw_joint
+  pid: {p: 50.0, i: 0.1, d: 1.0}
+
+# Tilt (Pitch) Position Controller
+tilt_controller:
+  type: position_controllers/JointPositionController
+  joint: pan_tilt_pitch_joint
+  pid: {p: 50.0, i: 0.1, d: 1.0}

@@ -1,0 +1,231 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    doc = "Minimal room scene with a solid push door for robot interaction."
+    metersPerUnit = 1
+    kilogramsPerUnit = 1
+    upAxis = "Z"
+)
+
+def Xform "World"
+{
+    def PhysicsScene "PhysicsScene"
+    {
+        vector3f physics:gravityDirection = (0, 0, -1)
+        float physics:gravityMagnitude = 9.81
+    }
+
+    def DistantLight "KeyLight"
+    {
+        float inputs:intensity = 3500
+        color3f inputs:color = (1, 0.98, 0.94)
+        double3 xformOp:rotateXYZ = (45, 0, 135)
+        uniform token[] xformOpOrder = ["xformOp:rotateXYZ"]
+    }
+
+    def DomeLight "FillLight"
+    {
+        float inputs:intensity = 250
+        color3f inputs:color = (0.80, 0.84, 0.92)
+    }
+
+    def Camera "OverviewCamera"
+    {
+        float focalLength = 24
+        double3 xformOp:translate = (8.5, -7.5, 4.2)
+        double3 xformOp:rotateXYZ = (62, 0, 46)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
+    }
+
+    def Xform "SuggestedRobotBase"
+    {
+        double3 xformOp:translate = (4.6, 0, 0)
+        double3 xformOp:rotateXYZ = (0, 0, 180)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
+
+        def Cube "Marker"
+        {
+            color3f[] primvars:displayColor = [(0.16, 0.40, 0.82)]
+            double size = 1
+            double3 xformOp:translate = (0, 0, 0.025)
+            float3 xformOp:scale = (0.50, 0.50, 0.05)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        }
+    }
+
+    def Xform "Room"
+    {
+        def Cube "Floor" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            color3f[] primvars:displayColor = [(0.56, 0.58, 0.60)]
+            double size = 1
+            double3 xformOp:translate = (0, 0, -0.05)
+            float3 xformOp:scale = (6, 5, 0.1)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        }
+
+        def Cube "BackWall" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            color3f[] primvars:displayColor = [(0.90, 0.90, 0.88)]
+            double size = 1
+            double3 xformOp:translate = (-2.95, 0, 1.1)
+            float3 xformOp:scale = (0.1, 5, 2.2)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        }
+
+        def Cube "LeftWall" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            color3f[] primvars:displayColor = [(0.90, 0.90, 0.88)]
+            double size = 1
+            double3 xformOp:translate = (0, -2.45, 1.1)
+            float3 xformOp:scale = (6, 0.1, 2.2)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        }
+
+        def Cube "RightWall" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            color3f[] primvars:displayColor = [(0.90, 0.90, 0.88)]
+            double size = 1
+            double3 xformOp:translate = (0, 2.45, 1.1)
+            float3 xformOp:scale = (6, 0.1, 2.2)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        }
+
+        def Cube "FrontWallLeft" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            color3f[] primvars:displayColor = [(0.90, 0.90, 0.88)]
+            double size = 1
+            double3 xformOp:translate = (2.95, -1.50, 1.1)
+            float3 xformOp:scale = (0.1, 2.0, 2.2)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        }
+
+        def Cube "FrontWallRight" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            color3f[] primvars:displayColor = [(0.90, 0.90, 0.88)]
+            double size = 1
+            double3 xformOp:translate = (2.95, 1.50, 1.1)
+            float3 xformOp:scale = (0.1, 2.0, 2.2)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        }
+
+        def Cube "FrontWallHeader" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            color3f[] primvars:displayColor = [(0.90, 0.90, 0.88)]
+            double size = 1
+            double3 xformOp:translate = (2.95, 0, 2.15)
+            float3 xformOp:scale = (0.1, 1.0, 0.1)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        }
+
+        # Door frame pieces: positioned with ~5cm clearance from the door panel
+        # to avoid PhysX collision penetration at rest.
+        def Cube "DoorFrameLeft" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            color3f[] primvars:displayColor = [(0.74, 0.74, 0.72)]
+            double size = 1
+            double3 xformOp:translate = (2.93, -0.54, 1)
+            float3 xformOp:scale = (0.12, 0.06, 2.0)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        }
+
+        def Cube "DoorFrameRight" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            color3f[] primvars:displayColor = [(0.74, 0.74, 0.72)]
+            double size = 1
+            double3 xformOp:translate = (2.93, 0.54, 1)
+            float3 xformOp:scale = (0.12, 0.06, 2.0)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        }
+
+        def Cube "DoorFrameHeader" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            color3f[] primvars:displayColor = [(0.74, 0.74, 0.72)]
+            double size = 1
+            double3 xformOp:translate = (2.93, 0, 2.08)
+            float3 xformOp:scale = (0.12, 1.08, 0.06)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        }
+    }
+
+    # ── Door ──
+    # Anchor (kinematic fixed body at hinge)
+    def Xform "DoorHingeAnchor" (
+        prepend apiSchemas = ["PhysicsRigidBodyAPI"]
+    )
+    {
+        bool physics:kinematicEnabled = true
+        double3 xformOp:translate = (2.93, -0.45, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+
+    # Door leaf (dynamic rigid body)
+    # NOTE: Do NOT apply PhysicsMassAPI here. Its default schema values
+    # (diagonalInertia=0, centerOfMass=-inf) override PhysX auto-computation
+    # and prevent the body from rotating. Set density on collision shapes instead.
+    def Xform "DoorLeaf" (
+        prepend apiSchemas = ["PhysicsRigidBodyAPI"]
+    )
+    {
+        double3 xformOp:translate = (2.93, -0.45, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+
+        # Door panel geometry + collision
+        def Cube "Panel" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            color3f[] primvars:displayColor = [(0.55, 0.37, 0.21)]
+            double size = 1
+            double3 xformOp:translate = (0.02, 0.43, 0.95)
+            float3 xformOp:scale = (0.04, 0.82, 1.90)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        }
+
+        # Push plate (decorative + collision)
+        def Cube "PushPlate" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            color3f[] primvars:displayColor = [(0.72, 0.72, 0.74)]
+            double size = 1
+            double3 xformOp:translate = (0.05, 0.72, 1)
+            float3 xformOp:scale = (0.01, 0.18, 0.32)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        }
+    }
+
+    # Revolute joint (sibling to both bodies, NOT nested under either)
+    def PhysicsRevoluteJoint "DoorHingeJoint"
+    {
+        uniform token physics:axis = "Z"
+        float physics:lowerLimit = -105
+        float physics:upperLimit = 105
+        point3f physics:localPos0 = (0, 0, 0)
+        point3f physics:localPos1 = (0, 0, 0)
+        quatf physics:localRot0 = (1, 0, 0, 0)
+        quatf physics:localRot1 = (1, 0, 0, 0)
+        rel physics:body0 = </World/DoorHingeAnchor>
+        rel physics:body1 = </World/DoorLeaf>
+    }
+}

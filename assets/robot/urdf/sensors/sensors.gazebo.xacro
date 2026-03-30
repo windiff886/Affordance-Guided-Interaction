@@ -1,0 +1,120 @@
+<?xml version="1.0"?>
+<!--
+  Gazebo Sensor Plugins for Uni-Dingo
+  ===================================
+
+  Include this file in your robot URDF to add:
+  - RGB-D Camera (simulating Intel RealSense D455)
+
+  Note: Pan-Tilt transmissions and controllers are defined in
+  pan_tilt_description/urdf/pan_tilt.urdf.xacro, not here.
+
+  Usage:
+    <xacro:include filename="$(find uni_dingo_api)/urdf/sensors.gazebo.xacro"/>
+    <xacro:uni_dingo_sensors parent="pan_tilt_surface"/>
+-->
+
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <xacro:macro name="uni_dingo_sensors" params="parent:=pan_tilt_surface">
+
+    <!-- ==================== Camera Link ==================== -->
+    <link name="camera_link">
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <geometry>
+          <box size="0.02 0.09 0.025"/>
+        </geometry>
+        <material name="camera_black">
+          <color rgba="0.1 0.1 0.1 1"/>
+        </material>
+      </visual>
+      <collision>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <geometry>
+          <box size="0.02 0.09 0.025"/>
+        </geometry>
+      </collision>
+      <inertial>
+        <mass value="0.1"/>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <inertia ixx="0.0001" ixy="0" ixz="0" iyy="0.0001" iyz="0" izz="0.0001"/>
+      </inertial>
+    </link>
+
+    <joint name="camera_joint" type="fixed">
+      <origin xyz="0.01 0 0.02" rpy="0 0 0"/>
+      <parent link="${parent}"/>
+      <child link="camera_link"/>
+    </joint>
+
+    <!-- Camera optical frame (Z forward, X right, Y down) -->
+    <link name="camera_color_optical_frame"/>
+    <joint name="camera_color_optical_joint" type="fixed">
+      <origin xyz="0 0 0" rpy="${-pi/2} 0 ${-pi/2}"/>
+      <parent link="camera_link"/>
+      <child link="camera_color_optical_frame"/>
+    </joint>
+
+    <link name="camera_depth_optical_frame"/>
+    <joint name="camera_depth_optical_joint" type="fixed">
+      <origin xyz="0 -0.05 0" rpy="${-pi/2} 0 ${-pi/2}"/>
+      <parent link="camera_link"/>
+      <child link="camera_depth_optical_frame"/>
+    </joint>
+
+    <!-- ==================== Gazebo Camera Plugin ==================== -->
+    <gazebo reference="camera_link">
+      <sensor type="depth" name="camera">
+        <always_on>true</always_on>
+        <update_rate>30.0</update_rate>
+        <visualize>false</visualize>
+
+        <camera name="camera">
+          <horizontal_fov>1.2112</horizontal_fov>  <!-- ~69.4 degrees (D455 spec) -->
+          <image>
+            <width>640</width>
+            <height>480</height>
+            <format>R8G8B8</format>
+          </image>
+          <clip>
+            <near>0.1</near>
+            <far>10.0</far>
+          </clip>
+          <noise>
+            <type>gaussian</type>
+            <mean>0.0</mean>
+            <stddev>0.007</stddev>
+          </noise>
+        </camera>
+
+        <plugin name="camera_controller" filename="libgazebo_ros_openni_kinect.so">
+          <baseline>0.05</baseline>
+          <alwaysOn>true</alwaysOn>
+          <updateRate>30.0</updateRate>
+          <cameraName>camera</cameraName>
+          <imageTopicName>color/image_raw</imageTopicName>
+          <cameraInfoTopicName>color/camera_info</cameraInfoTopicName>
+          <depthImageTopicName>depth/image_raw</depthImageTopicName>
+          <depthImageCameraInfoTopicName>depth/camera_info</depthImageCameraInfoTopicName>
+          <pointCloudTopicName>depth/points</pointCloudTopicName>
+          <frameName>camera_color_optical_frame</frameName>
+          <pointCloudCutoff>0.1</pointCloudCutoff>
+          <pointCloudCutoffMax>10.0</pointCloudCutoffMax>
+          <distortionK1>0.0</distortionK1>
+          <distortionK2>0.0</distortionK2>
+          <distortionK3>0.0</distortionK3>
+          <distortionT1>0.0</distortionT1>
+          <distortionT2>0.0</distortionT2>
+          <CxPrime>0</CxPrime>
+          <Cx>0</Cx>
+          <Cy>0</Cy>
+          <focalLength>0</focalLength>
+          <hackBaseline>0</hackBaseline>
+        </plugin>
+      </sensor>
+    </gazebo>
+
+</xacro:macro>
+
+</robot>

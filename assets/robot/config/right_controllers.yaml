@@ -1,0 +1,32 @@
+# 右臂控制器配置
+
+right_joint_state_controller:
+  type: joint_state_controller/JointStateController
+  publish_rate: 200
+
+right_z1_joint_traj_controller:
+  type: position_controllers/JointTrajectoryController
+  joints:
+    - right_joint1
+    - right_joint2
+    - right_joint3
+    - right_joint4
+    - right_joint5
+    - right_joint6
+  stop_trajectory_duration: 0.5
+  state_publish_rate: 200
+  action_monitor_rate: 200
+  constraints:
+    goal_time: 2.0
+    right_joint1:
+      goal: 0.05
+    right_joint2:
+      goal: 0.05
+    right_joint3:
+      goal: 0.05
+    right_joint4:
+      goal: 0.05
+    right_joint5:
+      goal: 0.05
+    right_joint6:
+      goal: 0.05

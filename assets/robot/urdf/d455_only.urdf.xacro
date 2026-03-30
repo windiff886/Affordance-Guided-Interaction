@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<!--
+  D455 相机独立模型 - 用于可视化坐标系
+-->
+<robot name="d455_robot" xmlns:xacro="http://ros.org/wiki/xacro">
+
+  <!-- 引入 realsense 描述 -->
+  <xacro:include filename="$(find realsense2_description)/urdf/_d435.urdf.xacro"/>
+
+  <!-- 虚拟基座 -->
+  <link name="base_link"/>
+
+  <!-- D455 相机 (使用 D435 模型，因为官方暂无 D455 专用模型) -->
+  <xacro:sensor_d435 parent="base_link" name="d455">
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </xacro:sensor_d435>
+
+</robot>
