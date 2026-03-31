@@ -1,0 +1,82 @@
+#usda 1.0
+(
+    defaultPrim = "CarryTray"
+    doc = "Trainable tray asset with a canonical side-pinch grasp frame."
+    metersPerUnit = 1
+    kilogramsPerUnit = 1
+    upAxis = "Z"
+)
+
+def Xform "CarryTray" (
+    prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"]
+)
+{
+    float physics:angularDamping = 0.1
+    float physics:linearDamping = 0.1
+    float physics:mass = 0.65
+
+    def Xform "Visual"
+    {
+        def Cube "Base"
+        {
+            color3f[] primvars:displayColor = [(0.18, 0.22, 0.28)]
+            double size = 1
+            double3 xformOp:translate = (-0.125, 0, -0.012)
+            float3 xformOp:scale = (0.13, 0.09, 0.012)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        }
+
+        def Cube "FrontLip"
+        {
+            color3f[] primvars:displayColor = [(0.22, 0.26, 0.32)]
+            double size = 1
+            double3 xformOp:translate = (-0.125, 0.09, 0.008)
+            float3 xformOp:scale = (0.13, 0.008, 0.032)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        }
+
+        def Cube "BackLip"
+        {
+            color3f[] primvars:displayColor = [(0.22, 0.26, 0.32)]
+            double size = 1
+            double3 xformOp:translate = (-0.125, -0.09, 0.008)
+            float3 xformOp:scale = (0.13, 0.008, 0.032)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        }
+
+        def Cube "LeftLip"
+        {
+            color3f[] primvars:displayColor = [(0.22, 0.26, 0.32)]
+            double size = 1
+            double3 xformOp:translate = (-0.255, 0, 0.008)
+            float3 xformOp:scale = (0.008, 0.082, 0.032)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        }
+
+        def Cube "RightLip"
+        {
+            color3f[] primvars:displayColor = [(0.22, 0.26, 0.32)]
+            double size = 1
+            double3 xformOp:translate = (0.005, 0, 0.008)
+            float3 xformOp:scale = (0.008, 0.082, 0.032)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        }
+    }
+
+    def Cube "BaseCollider" (
+        prepend apiSchemas = ["PhysicsCollisionAPI"]
+    )
+    {
+        double size = 1
+        double3 xformOp:translate = (-0.125, 0, -0.012)
+        float3 xformOp:scale = (0.13, 0.09, 0.012)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+    }
+
+    def Xform "GraspFrames"
+    {
+        def Xform "SidePinch"
+        {
+        }
+    }
+}

@@ -1,0 +1,70 @@
+#usda 1.0
+(
+    defaultPrim = "CarryCup"
+    doc = "Trainable handle-free cup asset with a canonical side-pinch grasp frame."
+    metersPerUnit = 1
+    kilogramsPerUnit = 1
+    upAxis = "Z"
+)
+
+def Xform "CarryCup" (
+    prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"]
+)
+{
+    float physics:angularDamping = 0.08
+    float physics:linearDamping = 0.08
+    float physics:mass = 0.28
+
+    def Xform "Visual"
+    {
+        def Cylinder "OuterBody"
+        {
+            color3f[] primvars:displayColor = [(0.84, 0.84, 0.86)]
+            token axis = "Z"
+            double3 xformOp:translate = (0, 0, 0.06)
+            float3 xformOp:scale = (0.04, 0.04, 0.06)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        }
+
+        def Cylinder "LiquidBand"
+        {
+            color3f[] primvars:displayColor = [(0.71, 0.55, 0.32)]
+            token axis = "Z"
+            double3 xformOp:translate = (0, 0, 0.054)
+            float3 xformOp:scale = (0.034, 0.034, 0.03)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        }
+    }
+
+    def Cylinder "BodyCollider" (
+        prepend apiSchemas = ["PhysicsCollisionAPI"]
+    )
+    {
+        rel material:binding:physics = </CarryCup/GripPhysicsMaterial> (
+            bindMaterialAs = "weakerThanDescendants"
+        )
+        token axis = "Z"
+        double3 xformOp:translate = (0, 0, 0.06)
+        float3 xformOp:scale = (0.04, 0.04, 0.06)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+    }
+
+    def Material "GripPhysicsMaterial" (
+        prepend apiSchemas = ["PhysicsMaterialAPI", "PhysxMaterialAPI"]
+    )
+    {
+        float physics:dynamicFriction = 1.6
+        float physics:restitution = 0
+        float physics:staticFriction = 2.0
+        uniform token physxMaterial:frictionCombineMode = "max"
+    }
+
+    def Xform "GraspFrames"
+    {
+        def Xform "Pinch"
+        {
+            double3 xformOp:translate = (0, 0, 0.06)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+    }
+}
