@@ -1,20 +1,22 @@
 """在 actor observation 基础上追加 privileged information，构建
 critic observation。
 
-Critic observation 结构（参见 README.md §5）：
+双臂平台 critic observation 结构（参见 README.md §5）：
 
 ```
 critic_obs = {
-    "actor_obs": { ... },
+    "actor_obs": { ... },          # 完整的双臂 actor_obs
     "privileged": {
+        # 精确物体状态（actor 只有 door_embedding，不知道门的精确位姿）
         "door_pose":          (7,),   # pos(3) + quat(4)
         "door_joint_pos":     (1,),
         "door_joint_vel":     (1,),
         "cup_pose":           (7,),
         "cup_linear_vel":     (3,),
         "cup_angular_vel":    (3,),
+        # 隐藏物理参数（actor 完全不知道）
+        # cup_mass 通过随机化模拟不同装载量，本实验不使用液体仿真
         "cup_mass":           (1,),
-        "cup_fill_ratio":     (1,),
         "door_mass":          (1,),
         "door_damping":       (1,),
     },
@@ -47,7 +49,6 @@ class CriticObsBuilder:
         cup_linear_vel: np.ndarray | None = None,
         cup_angular_vel: np.ndarray | None = None,
         cup_mass: float = 0.0,
-        cup_fill_ratio: float = 0.0,
         door_mass: float = 0.0,
         door_damping: float = 0.0,
     ) -> dict:
@@ -70,9 +71,7 @@ class CriticObsBuilder:
         cup_angular_vel : (3,) | None
             杯体角速度。
         cup_mass : float
-            杯体质量 (kg)。
-        cup_fill_ratio : float
-            液体填充率 [0, 1]。
+            杯体质量 (kg)，通过随机化模拟不同装载量。
         door_mass : float
             门板质量 (kg)。
         door_damping : float
@@ -110,7 +109,6 @@ class CriticObsBuilder:
                 else _zero3.copy()
             ),
             "cup_mass": np.array([cup_mass], dtype=np.float64),
-            "cup_fill_ratio": np.array([cup_fill_ratio], dtype=np.float64),
             "door_mass": np.array([door_mass], dtype=np.float64),
             "door_damping": np.array([door_damping], dtype=np.float64),
         }

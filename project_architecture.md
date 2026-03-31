@@ -156,7 +156,7 @@ Isaac Sim 场景
 - 拼装 proprioception：`q`、`dq`、`tau(optional)`、历史动作
 - 提取 gripper pose / velocity
 - 构造稳定性 proxy：tilt、线加速度、角速度、角加速度、jerk proxy
-- 注入上下文：`occupied`、`stability_level`
+- 注入上下文：`occupied`
 - 合并 `z_aff`、`z_prog`
 - 构建可选接触摘要
 - 为 critic 额外加入 privileged information
@@ -192,7 +192,7 @@ Isaac Sim 场景
 2. **末端相关状态**
    gripper pose / velocity、stability proxies
 3. **任务上下文**
-   `occupied`、`stability_level`
+   `occupied`
 4. **上层表示**
    `z_aff`、`z_prog`
 
@@ -379,7 +379,7 @@ Affordance-Guided-Interaction/
 2. **任务配置**
    affordance 类型、goal、episode 长度、成功阈值
 3. **上下文配置**
-   `occupied` 采样比例、`stability_level` 分布
+   `occupied` 采样比例
 4. **奖励配置**
    稳定项、接触项、安全项权重
 5. **训练配置**
@@ -404,8 +404,7 @@ actor_obs = {
   "proprio": ...,
   "gripper_state": ...,
   "context": {
-    "occupied": ...,
-    "stability_level": ...
+    "occupied": ...
   },
   "stability_proxy": ...,
   "z_aff": ...,

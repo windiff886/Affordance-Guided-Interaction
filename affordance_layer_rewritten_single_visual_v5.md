@@ -1,4 +1,4 @@
-# 基于 Affordance 引导的单臂持杯门交互：问题定义与技术方案
+# 基于 Affordance 引导的双臂持杯门交互：问题定义与技术方案
 
 ## 1. 我们要解决什么问题
 
@@ -10,7 +10,9 @@
 
 这正是本文希望研究的问题。
 
-我们关注的场景是：在 **Isaac Sim** 中使用 **Franka 单臂**，研究机器人在**持杯**与**非持杯**两种上下文下，如何完成与“门”有关的交互任务。但这里的“开门”不应被过早简化为“固定的 push door”。因为在真实环境中，开门方式本身是多样的，例如：
+我们关注的场景是：在 **Isaac Sim** 中使用一个由 **双臂 Z1 + RealSense 深度相机** 组成的双臂操作平台，研究机器人在**持杯**与**非持杯**两种上下文下，如何完成与“门”有关的交互任务。本文在当前实验中只关注**双臂操作能力**以及来自 **RealSense 相机** 的 RGB-D 观测。
+
+在这一设定下，本文关心的不只是“某个单臂末端如何接触门”，而是：当一侧操作臂末端已经持杯时，系统能否综合利用**另一侧操作臂**以及**非持杯侧局部 link**，完成 door-related interaction。但这里的“开门”不应被过早简化为“固定的 push door”。因为在真实环境中，开门方式本身是多样的，例如：
 
 - 某些门可以直接推动门板；
 - 某些门需要先按压按钮，再推动门；
@@ -119,7 +121,7 @@
 
 因此，本文最终要研究的问题可以定义为：
 
-> 在 Isaac Sim 中，针对 Franka 单臂和一组具有不同交互方式的 door-related objects，构建一个 affordance-guided interaction framework。系统首先表示或预测环境中的候选交互 affordance（如 push region、press region、handle region 等），再结合机器人当前的末端占用状态与持杯稳定性约束，学习一个统一的策略去执行这些交互；当末端空闲时，系统可以自然使用 gripper；当末端持杯时，系统应尽量抑制末端剧烈扰动，并根据身体几何与接触可达性，选择更合适的身体局部区域完成交互。
+> 在 Isaac Sim 中，针对一个由 **双臂 Z1 与 RealSense 深度相机** 组成的双臂机器人平台，和一组具有不同交互方式的 door-related objects，构建一个 affordance-guided interaction framework。系统首先表示或预测环境中的候选交互 affordance（如 push region、press region、handle region 等），再结合机器人当前的末端占用状态、持杯稳定性约束，以及双臂的可达性条件，学习一个统一的策略去执行这些交互；当某个操作末端空闲时，系统可以自然使用该 gripper；当一侧末端持杯时，系统应尽量抑制持杯侧末端剧烈扰动，并根据双臂几何与接触可达性，选择更合适的执行臂或身体局部区域完成交互。
 
 这里强调一点：本文并不要求预先显式规定“持杯时必须用肘部”或“必须用前臂”。相反，我们希望系统在 affordance 与约束共同作用下，自然学出合理的身体接触分配。
 
@@ -132,51 +134,45 @@
 我们的总体方法是：
 
 > 构建一个 **affordance-guided interaction architecture**。  
-> 上层接收原始视觉输入以及当前任务目标，并将其转换为两类中间表示：一类用于描述当前任务的完成程度或交互进展，另一类用于描述环境中的对象 affordance；下层再结合机器人当前状态、末端占用情况和持杯稳定性信息，输出具体动作。
+> 上层接收原始 **RGB-D** 观测，先从视觉输入中提取门相关点云，再通过视觉 encoder 将其压缩为统一的视觉表征；下层再结合机器人当前状态、末端占用情况和持杯稳定性信息，输出具体动作。
 
-这样做的目的，是避免把问题过早收缩成“为某一种门显式写规则的控制器设计”，而是建立一套能够覆盖多种 door-related interaction 的统一表示与控制框架。
+在当前平台设定下，原始视觉输入具体来自 **RealSense RGB-D 相机**；而“机器人当前状态”主要由**双臂状态**构成。因此，本文的整体框架在当前实验中是面向**双臂操作平台**而非固定底座单臂来定义的。
+
+这样做的目的，是避免把问题过早收缩成“为某一种门显式写规则的控制器设计”，而是建立一套能够覆盖多种 door-related interaction 的统一视觉表示与控制框架。
 
 为了让结构更清晰，我们将整体方案分成两个层面：
 
-### 第一层：Affordance / Progress 表示层
-这一层以原始视觉输入和任务目标作为输入，输出两类量：
+### 第一层：Affordance 视觉表征层
+这一层以原始 **RGB-D** 观测作为输入，完成以下处理：
 
-1. **任务进展表示（task-progress representation）**  
-   用于描述当前任务完成到了什么程度，或者当前交互是否已经触发了关键状态变化。  
-   例如：
-   - 门是否已经被部分打开；
-   - 按钮是否已经被按下；
-   - 把手是否已经被触发；
-   - 顺序交互中的前置步骤是否已经完成。
+1. 从 RGB 图像中识别门相关区域；
+2. 结合深度图反投影得到门相关点云；
+3. 将门点云输入视觉 encoder，得到统一的视觉表征。
 
-2. **对象 affordance 表示（object-affordance representation）**  
-   用于描述环境中“哪里可以做什么”，例如：
-   - pushable patch
-   - pressable patch
-   - handle-like patch
-   - ordered interaction candidate
+我们将这一层的输出记为：
 
-这一层的功能不是直接输出动作，而是把原始视觉输入转化为更适合决策和控制使用的结构化表征。
+- $z_{\text{aff},t}$：当前时刻的统一视觉 affordance 表征。
+
+这里的 $z_{\text{aff},t}$ 不再被拆分为“任务进展表示”和“对象 affordance 表示”两个组分，而是作为一个单一的视觉 latent，统一编码当前场景中与门交互有关的几何与外观信息。
 
 ### 第二层：Constraint-aware 执行层
 这一层接收：
 - 机器人自身状态；
 - 末端是否被占用；
 - 当前稳定性要求；
-- 来自上层的任务进展表示；
-- 来自上层的对象 affordance 表示。
+- 来自上层的统一视觉 affordance 表征。
 
 然后输出真正的控制动作。
 
 整个系统的关键是：
 
-> 上层负责把“看到的场景”和“当前要完成的目标”转换成结构化交互表示，  
-> 下层负责在身体约束存在时，把这些表示变成可执行动作。
+> 上层负责把原始 RGB-D 观测转换为可供控制使用的门相关视觉表征，  
+> 下层负责在身体约束存在时，把这一视觉表征变成可执行动作。
 
 
 ## 2.2 问题建模：Affordance-Conditioned Interaction MDP
 
-我们将任务建模为一个包含上下文和 affordance 条件的决策问题：
+我们将任务建模为一个包含上下文和视觉 affordance 条件的决策问题：
 
 $$
 \mathcal{M} = (\mathcal{S}, \mathcal{A}, \mathcal{C}, r, \gamma)
@@ -195,100 +191,101 @@ $$
 我们定义的 context $c \in \mathcal{C}$ 主要包括：
 
 - `occupied ∈ {0,1}`：末端是否持杯；
-- `stability_level`：当前任务对末端稳定性的要求强度。
+- `task_goal`：当前交互目标或任务类型。
 
-与前一版不同，这里不再将 `task_goal` 直接作为执行策略的 context 输入。  
-相反，**task goal 被送入上层 affordance 模块**，与原始视觉输入一起生成两类表示：
+与前一版不同，这里不再要求上层模块同时显式输出“任务进展表示”和“对象 affordance 表示”。  
+相反，上层只负责从原始 **RGB-D** 输入中构造统一的视觉 affordance 表征：
 
-- $z_{\text{prog},t}$：当前任务进展表示（task-progress representation）
-- $z_{\text{aff},t}$：当前对象 affordance 表示（object-affordance representation）
+- $z_{\text{aff},t}$：当前时刻的视觉 affordance latent。
 
 于是策略可以写成：
 
 $$
-a_t = \pi_\theta(o_t, h_t, c_t, z_{\text{prog},t}, z_{\text{aff},t})
+a_t = \pi_\theta(o_t, h_t, c_t, z_{\text{aff},t})
 $$
 
 其中：
 - $o_t$：当前机器人观测；
 - $h_t$：历史隐状态；
 - $c_t$：任务上下文；
-- $z_{\text{prog},t}$：任务进展表示；
-- $z_{\text{aff},t}$：对象 affordance 表示；
+- $z_{\text{aff},t}$：统一视觉 affordance 表征；
 - $a_t$：动作。
 
 这种写法的意义是：
 
-> 策略不需要直接从原始视觉和任务目标中自己分离“当前任务做到哪一步”和“环境哪里可以操作”，  
-> 而是基于上层提供的结构化表示，在身体约束下学习如何执行交互。
+> 策略不需要直接处理高维 RGB-D 或原始点云，  
+> 而是基于上层提供的门相关视觉表征，在身体约束下学习如何执行交互。
 
 
-## 2.3 Affordance 模块如何实现
+## 2.3 Affordance 层如何实现
 
-在当前版本中，我们优先选择一条**尽量不额外训练、可直接复用现成预训练模型**的实现路线。其核心思想不是直接将整幅原生点云输入低层策略，而是先利用现成的开集视觉分割模型从 RGB-D 观测中提取与 door-related interaction 相关的对象区域，再结合深度反投影得到对应的局部点云，最后将这些几何信息压缩为结构化的 affordance 表示 $z_{\text{aff}}$，并与任务进展表示 $z_{\text{prog}}$ 一起提供给执行策略。
+在当前版本中，Affordance 层的功能被重新明确为一条**单一的视觉表征流水线**：
 
-这样做有三个直接好处：
+> 接收原始 **RGB-D** 输入，提取其中的门相关点云，再通过视觉 encoder 将该点云编码成统一的视觉表征 $z_{\text{aff}}$，供后续 policy 使用。
 
-1. **不需要自行训练门分割网络或 3D affordance 网络**，能够尽快完成系统原型搭建；
-2. **避免低层 actor 直接处理高维噪声点云**，更符合本文“上层表示、下层执行”的架构设计；
-3. **便于后续逐步升级**：当系统已经能够工作后，再考虑从 object-level 提取扩展到 point-level affordance 预测。
+这意味着，当前版本的 Affordance 层**不再划分为两个组分**，也不再分别输出 `task-progress representation` 和 `object-affordance representation`。相反，它只输出一个统一的视觉 latent，用于表示当前场景中与 door-related interaction 最相关的几何与视觉信息。
 
-因此，本节将当前版本的 Affordance 模块具体化为一条“现成模型 + 几何处理 + 结构化编码”的实现路径。
+### 2.3.1 当前版本的设计目标
 
-### 2.3.1 当前版本的设计原则
+当前版本的 Affordance 层需要满足以下要求：
 
-当前版本的 Affordance 模块应满足以下原则：
+1. **输入直接来自 RealSense 的原始 RGB-D 观测**；
+2. **能够从输入中提取门相关点云**，而不是要求策略直接处理整幅场景点云；
+3. **门点云的提取和编码尽量复用现成模型或固定算法**，避免额外训练；
+4. **最终输出是一个固定维度的视觉特征向量**，便于直接并入 actor observation。
 
-1. **尽量使用现成模型与现成权重**，避免额外的大规模监督训练；
-2. **优先从 RGB 上做开集检测 / 分割，再借助 depth 得到 3D 点云**，而不是直接从原始点云中端到端学习门分割；
-3. **上层输出应为任务相关的低维结构化表示**，而不是未经压缩的整场景点云；
-4. **优先关注可交互局部区域，而非门对象的完整重建**，因为策略真正需要的是“哪里可以做什么”，而不仅仅是“门在哪里”。
-
-基于这些原则，本文当前版本不采用“从场景原始点云端到端训练 3D 实例分割网络”的路线，而采用更现成、工程代价更低的 RGB-D 分割与投影方案。
-
-### 2.3.2 最现成的实现路线：开集分割 + 深度反投影
-
-在当前版本中，我们推荐使用如下上层处理管线：
+因此，当前版本的重点不再是把上层做成多个子模块，而是构造一条尽可能直接的：
 
 ```text
-RGB-D observation + task_goal
-    -> open-vocabulary detection / segmentation
-    -> door / handle / button mask
-    -> depth back-projection
-    -> local point clouds
-    -> geometric summarization / optional frozen encoder
-    -> z_aff
+RGB-D -> door point cloud extraction -> visual encoder -> z_aff
 ```
 
-其中，最现成的候选模型包括：
+### 2.3.2 整体处理流程
+
+在当前版本中，我们推荐将 Affordance 层实现为如下处理管线：
+
+```text
+Input:
+  RGB_t, Depth_t
+
+Affordance Layer:
+  1. Door region detection / segmentation
+  2. Depth back-projection
+  3. Door point cloud extraction
+  4. Point cloud preprocessing
+  5. Visual encoder
+
+Output:
+  z_aff_t
+```
+
+其中：
+
+- 第 1 步负责从 RGB 图像中找到门相关区域；
+- 第 2 步负责将对应深度像素反投影为三维点；
+- 第 3 步得到门点云；
+- 第 4 步对点云做采样与清理；
+- 第 5 步将门点云编码成一个固定维度的视觉特征向量 $z_{\text{aff},t}$。
+
+### 2.3.3 从 RGB-D 中提取门点云
+
+在当前版本中，门点云的提取流程如下：
+
+1. 输入当前时刻的 RGB 图像 $RGB_t$ 与深度图 $Depth_t$；
+2. 使用现成的开集视觉检测/分割模型，在 RGB 图像中识别 `door` 区域；
+3. 根据得到的门 mask，在深度图中保留对应像素；
+4. 使用相机内参将这些像素反投影到三维空间，得到门点云 $P_{\text{door},t}$；
+5. 对得到的门点云进行简单几何预处理。
+
+在当前版本中，可直接复用的现成模型包括：
 
 - **LangSAM**
 - **Grounded-SAM 2**
 - **Grounding DINO + SAM / SAM 2**
 
-这些模型都可以直接下载现成权重，并通过文本提示词对图像中的对象进行开集检测或分割。因此，在不自行训练 perception 模块的前提下，我们可以使用如下文本提示：
+它们都可以直接下载现成权重，因此符合当前版本“门点云视觉识别任务不需要自行训练”的要求。
 
-- `"door"`
-- `"door handle"`
-- `"button"`
-- `"push bar"`
-
-从当前 RGB 图像中直接获得对应的 mask 或 bounding box。然后结合深度图，将 mask 区域内的像素反投影到三维空间，得到：
-
-- 门板点云 $P_{\text{door}}$
-- 把手点云 $P_{\text{handle}}$
-- 按钮点云 $P_{\text{button}}$
-
-这种实现方式的关键优点在于：
-
-- 使用的是**现成视觉模型**而非自训网络；
-- 开集文本提示与 door-related interaction 的多样性天然匹配；
-- 容易扩展到更多对象部件与交互区域；
-- 在 Isaac Sim 中也便于和深度图、实例信息做对照验证。
-
-### 2.3.3 从 mask 到门相关点云
-
-在从现成分割模型获得 mask 之后，使用相机内参将深度图反投影为点云。设像素坐标为 $(u,v)$，深度为 $d$，相机内参为 $(f_x, f_y, c_x, c_y)$，则反投影公式为：
+如果像素坐标为 $(u,v)$，深度值为 $d$，相机内参为 $(f_x, f_y, c_x, c_y)$，则反投影公式为：
 
 $$
 x = (u-c_x)d/f_x, \qquad
@@ -296,148 +293,99 @@ y = (v-c_y)d/f_y, \qquad
 z = d
 $$
 
-在此基础上，当前版本的门相关点云提取流程如下：
+由此可得到当前时刻可见的门局部点云，而不是完整的门 CAD 模型。对于本文的交互任务而言，这种“当前视角下可见的门点云”已经足以支持后续控制。
 
-1. 根据 `door` 的 mask 保留门板区域像素，得到 $P_{\text{door}}$；
-2. 根据 `door handle` 的 mask 保留把手区域像素，得到 $P_{\text{handle}}$；
-3. 根据 `button` 的 mask 保留按钮区域像素，得到 $P_{\text{button}}$；
-4. 对上述点云做简单的几何清理，例如：
-   - voxel downsampling
-   - statistical outlier removal
-   - 半径滤波或邻域滤波
-5. 如有必要，再对门板点云做平面拟合，估计门平面法向与局部参考坐标系。
+### 2.3.4 门点云预处理
 
-需要强调的是，当前版本不要求将整扇门的所有点都输入后续网络。与其保留完整门对象的高维点集，更推荐只保留：
+在将门点云送入视觉 encoder 之前，建议先做一轮轻量级预处理，以提升编码稳定性。当前版本可采用如下处理：
 
-- 与当前相机视角中可见的门局部；
-- 与当前任务目标相关的候选交互区域；
-- 与机器人当前末端或前臂距离较近的局部区域。
+- voxel downsampling
+- statistical outlier removal
+- farthest point sampling 或随机采样
+- 统一点数到固定规模（如 256 / 512 / 1024）
+- 如有必要，估计法向量并附加为点特征
 
-也就是说，在当前框架中，点云提取的重点不是“完整重建门”，而是“保留对交互决策最有用的几何信息”。
+在这一阶段，本文不要求对门把手、按钮等局部再单独构造独立表征；这些信息可以在后续版本中扩展。当前版本的重点是：
 
-### 2.3.4 当前版本中 $z_{\text{aff}}$ 的推荐构造方式
+> 从 RGB-D 中稳定地得到门点云，并将其整理成视觉 encoder 可直接消费的标准输入格式。
 
-在当前版本中，我们不建议将原始点云直接拼接到 actor observation 中。更合适的做法是：先将门相关点云转为**低维几何摘要（geometric summary）**，再将其作为对象 affordance 表示的一部分输入策略。
+### 2.3.5 视觉 encoder 的角色
 
-推荐的几何摘要包括：
+在当前版本中，Affordance 层的最后一步是使用视觉 encoder 对门点云进行编码，得到统一的视觉表征 $z_{\text{aff}}$。
 
-- 门板中心 $c_{\text{door}}$
-- 门平面法向 $n_{\text{door}}$
-- 门板包围盒尺寸 $b_{\text{door}}$
-- 把手中心 $c_{\text{handle}}$
-- 按钮中心 $c_{\text{button}}$
-- gripper 到门平面的距离
-- gripper 到把手的距离
-- gripper 到按钮的距离
-- 当前检测 / 分割置信度
-- 当前候选交互类型 one-hot
+这里的视觉 encoder 作用不是直接输出动作，也不是显式预测不同 affordance 类型，而是把门点云压缩成一个固定维度的 latent，用于表示：
 
-因此，当前版本推荐将对象 affordance 表示写为：
+- 当前门的局部几何形状；
+- 当前视角下可见的门区域分布；
+- 与后续门交互有关的整体视觉结构。
 
-$$
-z_{\text{aff}} =
-[c_{\text{door}}, n_{\text{door}}, b_{\text{door}}, c_{\text{handle}}, c_{\text{button}},
- d_{g,door}, d_{g,handle}, d_{g,button},
- \text{affordance\_type}, \text{confidence}]
-$$
+对于视觉 encoder，有两种实现思路：
 
-其中：
+#### （1）固定几何摘要编码
+不额外使用学习型 3D backbone，而是直接从门点云中提取低维几何特征，例如：
 
-- $d_{g,door}$ 表示 gripper 到门平面的距离；
-- $d_{g,handle}$ 表示 gripper 到把手中心的距离；
-- $d_{g,button}$ 表示 gripper 到按钮中心的距离；
-- `affordance_type` 用于表示当前关注的是 push / press / handle 等哪一类交互；
-- `confidence` 表示来自上层分割模型的置信度或可见性质量估计。
+- 门点云中心；
+- 门点云主方向或平面法向；
+- 门点云包围盒尺寸；
+- 当前门点云与 active gripper 的相对距离。
 
-这种表示的优点是：
+然后将这些量拼接为一个固定维度向量，直接作为 $z_{\text{aff}}$。
 
-1. **不需要训练额外的 3D 编码器**；
-2. **对 RL 更稳定**，因为输入维度更低、语义更明确；
-3. **与当前执行策略的 observation 结构更一致**；
-4. **便于分析策略到底在利用哪些 affordance 线索**。
+#### （2）冻结的现成点云 encoder
+如果希望保留更丰富的点云表征，则可以使用一个**现成预训练、并在当前任务中冻结使用**的点云 encoder，例如：
 
-### 2.3.5 可选增强：冻结的现成点云编码器
+- Point-MAE
+- ULIP / ULIP-2
 
-如果后续希望在不自行训练 3D perception 的前提下，进一步引入更丰富的点云表征，则可以在上述几何摘要之外，再加入一个**冻结的现成点云编码器**作为辅助分支。例如：
+此时，门点云经过 encoder 后直接输出 embedding，并作为 $z_{\text{aff}}$ 或其一部分。
 
-- 使用现成预训练的 **Point-MAE** 编码门局部点云；
-- 使用现成预训练的 **ULIP / ULIP-2** 编码门局部点云；
-- 将其输出的 embedding 与前述几何摘要拼接，作为扩展后的 $z_{\text{aff}}$。
+在当前版本中，这两种方式都满足“编码任务不需要自己训练”的要求。若以工程可控性为优先，则推荐先从固定几何摘要编码开始；若更强调表征能力，则可以使用冻结的现成点云 encoder。
 
-此时可写为：
+### 2.3.6 当前版本中 $z_{\text{aff}}$ 的定义
+
+综合上述流程，当前版本的上层输出统一定义为：
 
 $$
-z_{\text{aff}} = [z_{\text{geom}}, z_{\text{pc-embed}}]
+z_{\text{aff},t} = Enc_{vis}(P_{\text{door},t})
 $$
 
 其中：
 
-- $z_{\text{geom}}$ 表示低维几何摘要；
-- $z_{\text{pc-embed}}$ 表示冻结点云基础模型输出的 embedding。
+- $P_{\text{door},t}$ 表示由当前 RGB-D 观测提取出的门点云；
+- $Enc_{vis}(\cdot)$ 表示视觉 encoder；
+- $z_{\text{aff},t}$ 表示最终送入 policy 的统一视觉表征。
 
-但在当前版本中，这一分支应视为**可选增强项**，而非系统成立的必要条件。原因是：
+也就是说，在当前版本中，Affordance 层并不再承担“任务进展估计 + affordance 类型分解”这类多头输出职责，而是只负责：
 
-- 通用点云基础模型未必针对 door-related interaction 的局部几何进行优化；
-- 如果一开始同时引入大模型 embedding 和 RL，系统调试复杂度会明显上升；
-- 从工程可控性出发，先使用几何摘要往往更稳妥。
-
-因此，当前版本推荐的优先级是：
-
-> **几何摘要优先，冻结点云编码器可选。**
-
-### 2.3.6 当前版本中 $z_{\text{prog}}$ 的实现建议
-
-由于本文的上层模块不仅要输出对象 affordance 表示，还要输出任务进展表示，因此当前版本也需要给出一个尽量现成的 $z_{\text{prog}}$ 实现方式。
-
-为了避免额外训练进展识别网络，当前版本推荐采用两类较低成本方式：
-
-#### （1）仿真状态驱动的 progress 表示
-在 Isaac Sim 中，可以直接利用环境状态构造任务进展特征，例如：
-
-- 门的开合角度或位移；
-- 按钮是否被按下；
-- 把手是否被触发；
-- 顺序任务中的前置步骤是否已完成。
-
-这种方案虽然带有 simulator 提供的便利，但非常适合作为当前版本的 progress 基线。
-
-#### （2）视觉 / 几何阈值驱动的 progress 表示
-如果希望减少对 simulator oracle 的依赖，也可以用较简单的阈值式视觉逻辑近似构造，例如：
-
-- 门平面相对初始位姿是否已发生明显变化；
-- 按钮区域是否出现持续接触并产生位移；
-- 把手局部是否发生触发状态改变。
-
-在当前版本中，$z_{\text{prog}}$ 可以是一个低维向量，用于表示当前关键状态是否被触发，以及当前任务完成进度是否推进。
+> **把原始 RGB-D 压缩成一个以门点云为核心的统一视觉特征。**
 
 ### 2.3.7 当前版本的整体接口形式
 
-基于以上设计，当前版本的 Affordance 模块可写为：
+基于以上设计，当前版本的 Affordance 层可以写为：
 
 ```text
 Input:
-  RGB_t, Depth_t, task_goal_t
+  RGB_t, Depth_t
+  (from RealSense RGB-D camera)
 
-Affordance Module:
-  1. Open-vocabulary segmentation
-  2. Door / handle / button mask extraction
-  3. Depth back-projection
-  4. Door-related local point cloud construction
-  5. Geometric summarization
-  6. Optional frozen point-cloud encoder
-  7. Progress feature construction
+Affordance Layer:
+  1. Door detection / segmentation
+  2. Depth back-projection
+  3. Door point cloud extraction
+  4. Point cloud preprocessing
+  5. Visual encoder
 
 Output:
-  z_prog_t, z_aff_t
+  z_aff_t
 ```
 
 于是当前版本的设计重点就变为：
 
-- 用现成模型解决“门及其关键局部在哪里”；
-- 用几何处理解决“这些局部在 3D 中如何表示”；
-- 用结构化编码解决“哪些信息应该真正进入策略 observation”。
+- 用现成视觉模型解决“门在哪里”；
+- 用深度反投影解决“门在三维中如何表示”；
+- 用视觉 encoder 解决“门点云如何变成 policy 可消费的 observation”。
 
-这使得本文当前版本的 Affordance 层不再是一个待定模块，而是一个**可直接落地、且尽量不依赖额外训练的上层感知与表示组件**。
+这使得本文当前版本中的 Affordance 层成为一个**单一、直接、且尽量不依赖额外训练**的上层视觉表征模块。
 
 
 ## 2.4 执行策略的输入：只使用现实中相对可获得的信息
@@ -464,34 +412,36 @@ Output:
 ### 2.4.2 Actor 观测组成
 
 #### A. 机器人本体观测（proprioception）
-- joint positions $q_t$
-- joint velocities $\dot q_t$
+对于当前的双臂平台，机器人本体观测不再只是单臂关节状态，而应至少包括：
+
+- 左臂 Z1 关节位置与速度
+- 右臂 Z1 关节位置与速度
 - joint torques / motor currents（如果可用）
 - previous actions $a_{t-k:t-1}$
 
 #### B. 明确可定义的末端状态
-在当前版本中，**优先使用 gripper / end-effector frame 作为主要参考坐标系**。
+在当前版本中，**优先使用当前执行臂或持杯臂对应的 gripper / end-effector frame 作为主要参考坐标系**。
 
 这样做的原因是：
-- 本文关心的稳定性本质上是“杯体是否稳定”，而杯体与 gripper 的关系比与 wrist 更直接；
+- 本文关心的稳定性本质上是“杯体是否稳定”，而杯体与持杯 gripper 的关系比与 wrist 更直接；
 - gripper frame 更适合表达末端相对重力方向的倾斜；
+- 在双臂平台上，显式区分“执行臂”和“持杯臂”有助于把交互任务与稳定性约束分配到正确的末端参考系；
 - 如果同时保留 gripper 和 wrist 两套末端位姿与速度表示，会带来较强冗余；
 - 对 SoFTA 风格的稳定性奖励而言，参考坐标系本身也是定义的一部分，因此不宜随意将 end-effector frame 替换为 wrist frame。
 
 因此，在当前设定下，低层策略优先接收：
-- gripper pose / velocity
+- active gripper pose / velocity
+- cup-carrying gripper pose / velocity（当持杯臂与执行臂不同时可单独保留）
 
 如果后续实验发现某些动态 proxy 用 wrist rigid body 更稳定，wrist 信息可以作为可选辅助量加入，但当前版本不将其作为主参考坐标系。
 
 #### C. 上层模块输出
-- 当前任务进展表示 $z_{\text{prog}}$
-- 当前对象 affordance 表示 $z_{\text{aff}}$
+- 当前统一视觉 affordance 表征 $z_{\text{aff}}$
 
-也就是说，低层策略不直接消费原始视觉输入中的全部信息，而是主要消费经过上层压缩后的结构化表示。
+也就是说，低层策略不直接消费原始视觉输入中的全部信息，而是主要消费经过上层压缩后的统一视觉表征。
 
 #### D. 任务上下文
 - `occupied`
-- `stability_level`
 
 #### E. 稳定性 proxy
 相比直接输入难测的液体参数，我们输入现实中更可获得的稳定性指标，并尽量围绕 **gripper / cup** 参考系来定义：
@@ -521,12 +471,13 @@ Output:
 ```text
 Actor Obs =
 {
-  q, dq, tau(optional), past actions,
-  gripper pose/vel,
-  z_prog,
+  left-arm q, dq,
+  right-arm q, dq,
+  tau(optional), past actions,
+  active gripper pose/vel,
+  cup-carrying gripper pose/vel(optional),
   z_aff,
   occupied,
-  stability_level,
   cup-tilt-to-gravity proxy,
   gripper linear acc,
   gripper angular vel,
@@ -539,9 +490,10 @@ Actor Obs =
 这个表示的关键在于：
 - 不依赖人工定义 forearm / elbow；
 - 不依赖精确环境动力学参数；
-- 使用 gripper / end-effector frame 作为主要末端参考坐标系；
-- 由上层模块先把视觉输入转换为任务进展表示和对象 affordance 表示；
-- 低层策略再围绕这些结构化表示决定具体动作。
+- 覆盖双臂平台在当前实验中实际参与控制与建模的可观测状态；
+- 使用 active gripper / cup-carrying gripper 的 end-effector frame 作为主要末端参考坐标系；
+- 由上层模块先把视觉输入转换为统一的视觉 affordance 表征；
+- 低层策略再围绕这一视觉表征决定具体动作。
 
 ---
 
@@ -735,16 +687,6 @@ m_{\text{occ}} \cdot r_{\text{carry-stability}}
 $$
 
 这样，空手时策略不会受到专门的末端平稳约束；而持杯时，这一项会显式约束策略去学习低加速度、低倾斜、低冲击的交互方式。
-
-如果进一步考虑不同程度的稳定性要求，还可以通过 `stability_level` 去调节该项的整体权重，即：
-
-$$
-\lambda_{\text{stab}}(\text{stability\_level}) \cdot m_{\text{occ}} \cdot r_{\text{carry-stability}}
-$$
-
-其中：
-- `occupied` 决定该项是否激活；
-- `stability_level` 决定激活后该项有多强。
 
 这样的写法有三个好处：
 

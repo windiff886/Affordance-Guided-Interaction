@@ -1,7 +1,13 @@
-"""End-to-end affordance pipeline: RGB-D -> (z_aff, z_prog).
+"""端到端 Affordance 管线：RGB-D -> Point-MAE Embedding + z_prog。
 
-Implements the ``AffordanceEncoder`` protocol defined in
-``perception.interfaces``.
+核心流程：
+    1. LangSAM / Grounded-SAM 2 开集分割 → 门/把手/按钮 mask
+    2. 深度反投影 → 局部点云
+    3. Voxel 降采样 + 点数对齐
+    4. Point-MAE 冻结编码器 → 高维 embedding (z_aff)
+    5. 仿真状态 → 任务进展向量 (z_prog)
+
+管线不进行任何手工几何特征提取（无 RANSAC、无包围盒、无距离计算）。
 """
 
 from __future__ import annotations
@@ -16,21 +22,11 @@ from affordance_guided_interaction.door_perception.config import (
 )
 from affordance_guided_interaction.door_perception.depth_projection import (
     backproject_depth,
+    sample_or_pad,
+    voxel_downsample,
 )
 from affordance_guided_interaction.door_perception.frozen_encoder import (
-    BaseFrozenEncoder,
-    build_frozen_encoder,
-)
-from affordance_guided_interaction.door_perception.geometric_summary import (
-    AFFORDANCE_HANDLE,
-    AFFORDANCE_PRESS,
-    AFFORDANCE_PUSH,
-    AFFORDANCE_SEQUENTIAL,
-    Z_AFF_DIM,
-    compute_z_aff,
-)
-from affordance_guided_interaction.door_perception.point_cloud_processing import (
-    clean_point_cloud,
+    PointMAEEncoder,
 )
 from affordance_guided_interaction.door_perception.segmentation import (
     OpenVocabSegmentor,
@@ -39,15 +35,7 @@ from affordance_guided_interaction.door_perception.segmentation import (
 
 logger = logging.getLogger(__name__)
 
-# Mapping from task_goal text to affordance type index
-_GOAL_TO_AFFORDANCE: dict[str, int] = {
-    "push": AFFORDANCE_PUSH,
-    "press": AFFORDANCE_PRESS,
-    "handle": AFFORDANCE_HANDLE,
-    "sequential": AFFORDANCE_SEQUENTIAL,
-}
-
-# Mapping from text prompt to dict key used internally
+# 文本提示词 → 内部 key 的映射
 _PROMPT_TO_KEY: dict[str, str] = {
     "door": "door",
     "door handle": "handle",
@@ -57,31 +45,28 @@ _PROMPT_TO_KEY: dict[str, str] = {
 
 
 class AffordancePipeline:
-    """Full pipeline: RGB-D observation -> z_aff + z_prog.
+    """端到端 Affordance 管线：RGB-D → (z_aff embedding, z_prog dict)。
 
-    Satisfies the ``AffordanceEncoder`` protocol from
-    ``perception.interfaces``.
+    管线不关心夹爪具体坐标，不计算几何距离特征，
+    所有空间关系由下游 Policy 隐式学习。
 
     Expected ``observation`` dict keys:
 
     * ``rgb`` : np.ndarray (H, W, 3) uint8
-    * ``depth`` : np.ndarray (H, W) float metres
-    * ``gripper_pos`` : np.ndarray (3,) gripper position in world frame
-    * ``extrinsic`` : np.ndarray (4, 4) camera-to-world (optional)
-    * ``door_angle`` : float  (optional, for z_prog)
-    * ``button_pressed`` : bool (optional, for z_prog)
-    * ``handle_triggered`` : bool (optional, for z_prog)
+    * ``depth`` : np.ndarray (H, W) float，单位：米
+    * ``extrinsic`` : np.ndarray (4, 4) 相机到世界变换（可选）
+    * ``door_angle`` : float  (可选，用于 z_prog)
+    * ``button_pressed`` : bool (可选，用于 z_prog)
+    * ``handle_triggered`` : bool (可选，用于 z_prog)
     """
 
     def __init__(self, config: AffordancePipelineConfig | None = None) -> None:
         self._config = config or AffordancePipelineConfig()
         self._segmentor = OpenVocabSegmentor(self._config.segmentation)
-        self._frozen_encoder: BaseFrozenEncoder | None = build_frozen_encoder(
-            self._config.frozen_encoder
-        )
+        self._encoder = PointMAEEncoder(self._config.encoder)
 
     # ------------------------------------------------------------------
-    # AffordanceEncoder protocol
+    # 核心 API
     # ------------------------------------------------------------------
 
     def encode(
@@ -89,117 +74,102 @@ class AffordancePipeline:
         *,
         observation: dict[str, Any],
         task_goal: str,
-    ) -> tuple[dict[str, Any], dict[str, Any]]:
-        """Run the full pipeline and return ``(z_aff_dict, z_prog_dict)``.
+    ) -> tuple[np.ndarray, dict[str, Any]]:
+        """执行完整管线，返回 (z_aff_embedding, z_prog_dict)。
 
-        Returns dicts so that the caller can inspect individual fields.
-        The ``"vector"`` key in each dict holds the flat numpy array
-        suitable for concatenation into actor observations.
+        Parameters
+        ----------
+        observation : dict
+            包含 rgb, depth 等键值的观测字典。
+        task_goal : str
+            当前任务目标（如 "push", "press", "handle"）。
+
+        Returns
+        -------
+        z_aff : np.ndarray
+            (embed_dim,) Point-MAE 输出的高维 embedding 向量。
+        z_prog : dict[str, Any]
+            任务进展信息，包含 "vector" 键。
         """
         rgb: np.ndarray = observation["rgb"]
         depth: np.ndarray = observation["depth"]
-        gripper_pos: np.ndarray = np.asarray(observation["gripper_pos"], dtype=np.float64)
         extrinsic: np.ndarray | None = observation.get("extrinsic")
 
-        # --- 1. Open-vocabulary segmentation ---
+        # --- 1. 开集分割 ---
         seg_results = self._segmentor.segment(rgb)
-        masks, confidences = self._unpack_seg_results(seg_results)
+        masks = self._unpack_masks(seg_results)
 
-        # --- 2. Depth back-projection per part ---
-        point_clouds: dict[str, np.ndarray] = {}
+        # --- 2. 深度反投影：mask → 局部点云 ---
+        all_points: list[np.ndarray] = []
         for key in ("door", "handle", "button"):
             mask = masks.get(key)
             if mask is not None and mask.any():
                 pts = backproject_depth(
                     depth, self._config.camera, mask=mask, extrinsic=extrinsic
                 )
-            else:
-                pts = np.zeros((0, 3), dtype=np.float64)
-            point_clouds[key] = pts
+                if len(pts) > 0:
+                    all_points.append(pts)
 
-        # --- 3. Point cloud cleaning ---
-        cleaned: dict[str, np.ndarray] = {
-            key: clean_point_cloud(pts, self._config.point_cloud)
-            for key, pts in point_clouds.items()
-        }
+        # 合并所有部件的点云为一个整体
+        if all_points:
+            merged_points = np.concatenate(all_points, axis=0)
+        else:
+            merged_points = np.zeros((0, 3), dtype=np.float64)
 
-        # --- 4. Geometric summary -> z_aff ---
-        affordance_type = _GOAL_TO_AFFORDANCE.get(task_goal.lower(), AFFORDANCE_PUSH)
-        z_aff_vec = compute_z_aff(
-            door_points=cleaned["door"],
-            handle_points=cleaned["handle"],
-            button_points=cleaned["button"],
-            gripper_pos=gripper_pos,
-            affordance_type=affordance_type,
-            door_confidence=confidences.get("door", 0.0),
-            handle_confidence=confidences.get("handle", 0.0),
-            button_confidence=confidences.get("button", 0.0),
+        # --- 3. 基础降采样 + 点数对齐 ---
+        if len(merged_points) > 0:
+            merged_points = voxel_downsample(
+                merged_points, self._config.point_cloud.voxel_size
+            )
+        aligned_points = sample_or_pad(
+            merged_points, self._config.point_cloud.max_points
         )
 
-        # --- 5. Optional frozen encoder ---
-        pc_embed: np.ndarray | None = None
-        if self._frozen_encoder is not None:
-            # Encode the door panel cloud (primary interaction surface)
-            door_pts = cleaned["door"]
-            if len(door_pts) > 0:
-                pc_embed = self._frozen_encoder.encode(door_pts)
-            else:
-                pc_embed = np.zeros(self._config.frozen_encoder.embed_dim)
+        # --- 4. Point-MAE 编码 → z_aff ---
+        z_aff = self._encoder.encode(aligned_points)
 
-        # --- 6. Assemble z_aff output ---
-        z_aff_dict: dict[str, Any] = {
-            "vector": z_aff_vec,
-            "point_clouds": cleaned,
-            "affordance_type": affordance_type,
-        }
-        if pc_embed is not None:
-            z_aff_full = np.concatenate([z_aff_vec, pc_embed])
-            z_aff_dict["vector_with_embed"] = z_aff_full
-            z_aff_dict["pc_embed"] = pc_embed
+        # --- 5. 任务进展 → z_prog ---
+        z_prog = self._build_z_prog(observation, task_goal)
 
-        # --- 7. Task progress z_prog ---
-        z_prog_dict = self._build_z_prog(observation, task_goal)
-
-        return z_aff_dict, z_prog_dict
+        return z_aff, z_prog
 
     # ------------------------------------------------------------------
-    # Internal helpers
+    # 内部辅助
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _unpack_seg_results(
+    def _unpack_masks(
         results: list[SegmentResult],
-    ) -> tuple[dict[str, np.ndarray], dict[str, float]]:
-        """Convert list of SegmentResults into keyed dicts."""
+    ) -> dict[str, np.ndarray]:
+        """将分割结果列表转换为按部件名索引的 mask 字典。"""
         masks: dict[str, np.ndarray] = {}
-        confs: dict[str, float] = {}
         for r in results:
             key = _PROMPT_TO_KEY.get(r.prompt, r.prompt)
-            masks[key] = r.mask
-            confs[key] = r.confidence
-        return masks, confs
+            # 取置信度最高的那个（如果同一 key 出现多次）
+            if key not in masks or r.confidence > 0:
+                masks[key] = r.mask
+        return masks
 
     @staticmethod
     def _build_z_prog(
         observation: dict[str, Any],
         task_goal: str,
     ) -> dict[str, Any]:
-        """Construct task-progress representation from simulator state.
+        """从仿真状态构造任务进展表示。
 
-        Current version uses privileged sim state (door_angle,
-        button_pressed, handle_triggered).  A future version can replace
-        this with vision/geometry-based heuristics.
+        当前版本直接使用 simulator 提供的特权状态信息。
         """
         door_angle = float(observation.get("door_angle", 0.0))
         button_pressed = float(observation.get("button_pressed", False))
         handle_triggered = float(observation.get("handle_triggered", False))
 
-        # Normalised progress scalar (heuristic)
-        if task_goal.lower() in ("push", "handle"):
-            progress = min(door_angle / 1.57, 1.0)  # ~90 deg
-        elif task_goal.lower() == "press":
+        # 归一化进度标量（基于启发式规则）
+        goal = task_goal.lower()
+        if goal in ("push", "handle"):
+            progress = min(door_angle / 1.57, 1.0)  # ~90 度
+        elif goal == "press":
             progress = button_pressed
-        elif task_goal.lower() == "sequential":
+        elif goal == "sequential":
             progress = 0.5 * button_pressed + 0.5 * min(door_angle / 1.57, 1.0)
         else:
             progress = 0.0

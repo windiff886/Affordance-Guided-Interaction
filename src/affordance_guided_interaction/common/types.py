@@ -11,7 +11,6 @@ RewardDict = dict[str, float]
 @dataclass(slots=True)
 class TaskContext:
     occupied: int = 0
-    stability_level: str = "medium"
 
 
 @dataclass(slots=True)
