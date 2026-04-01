@@ -28,8 +28,8 @@ from .actor import (
 # Privileged 信息维度:
 #   door_pose(7) + door_joint_pos(1) + door_joint_vel(1)
 #   + cup_pose(7) + cup_lin_vel(3) + cup_ang_vel(3)
-#   + cup_mass(1) + door_mass(1) + door_damping(1) = 25
-_PRIVILEGED_DIM = 25
+#   + cup_mass(1) + door_mass(1) + door_damping(1) + base_pos(3) = 28
+_PRIVILEGED_DIM = 28
 
 
 # ======================================================================
@@ -64,7 +64,7 @@ def flatten_privileged(privileged: dict) -> torch.Tensor:
 
     Returns
     -------
-    torch.Tensor — ``(25,)``
+    torch.Tensor — ``(28,)``
     """
     parts = [
         np.asarray(privileged["door_pose"]).ravel(),       # 7
@@ -76,6 +76,7 @@ def flatten_privileged(privileged: dict) -> torch.Tensor:
         np.asarray(privileged["cup_mass"]).ravel(),         # 1
         np.asarray(privileged["door_mass"]).ravel(),        # 1
         np.asarray(privileged["door_damping"]).ravel(),     # 1
+        np.asarray(privileged["base_pos"]).ravel(),         # 3
     ]
     return torch.from_numpy(np.concatenate(parts)).float()
 
@@ -186,7 +187,7 @@ class Critic(nn.Module):
         actor_flat : dict[str, Tensor]
             由 ``flatten_actor_obs()`` 产出的分支张量字典，
             每个值形状 ``(batch, dim)``。
-        privileged : ``(batch, 25)``
+        privileged : ``(batch, 28)``
             由 ``flatten_privileged()`` 产出的 privileged 张量。
 
         Returns

@@ -235,7 +235,8 @@ print(f"[base_link frame] EE init YPR: yaw={init_ypr[0]:.1f}° "
 # =========================================================
 #  Step 7 - UI: XYZ + YPR + Gripper sliders
 # =========================================================
-STEP_CM = 0.01  # 1 cm per click
+STEP_CM  = 0.01  # 每次平移步进 1 cm
+STEP_DEG = 2.0   # 每次旋转步进 2 度
 pos_labels = {}
 ypr_labels = {}
 
@@ -250,10 +251,18 @@ with window.frame:
             with ui.HStack(height=28, spacing=4):
                 ui.Label(lb, width=80)
                 def make_minus(a=idx):
-                    def _click(): ik_target_pos[a] -= STEP_CM
+                    def _click():
+                        # 基于当前末端真实位置叠加负增量
+                        ee_pos, _ = get_ee_in_baselink()
+                        ik_target_pos[:] = ee_pos
+                        ik_target_pos[a] -= STEP_CM
                     return _click
                 def make_plus(a=idx):
-                    def _click(): ik_target_pos[a] += STEP_CM
+                    def _click():
+                        # 基于当前末端真实位置叠加正增量
+                        ee_pos, _ = get_ee_in_baselink()
+                        ik_target_pos[:] = ee_pos
+                        ik_target_pos[a] += STEP_CM
                     return _click
                 ui.Button("  -  ", width=50, clicked_fn=make_minus())
                 vt = ui.Label(f"{ik_target_pos[idx]:.3f}", width=65)
@@ -264,22 +273,30 @@ with window.frame:
         ui.Separator(height=2)
         ui.Spacer(height=4)
 
-        # --- Orientation: YPR sliders ---
-        for idx, (lb, lo, hi) in enumerate([
-            ("Yaw",   -180, 180),
-            ("Pitch", -90,  90),
-            ("Roll",  -180, 180),
-        ]):
-            with ui.HStack(height=26, spacing=4):
+        # --- Orientation: YPR +/- 增量按钮 ---
+        for idx, lb in enumerate(["Yaw", "Pitch", "Roll"]):
+            with ui.HStack(height=28, spacing=4):
                 ui.Label(lb, width=80)
-                sl = ui.FloatSlider(min=lo, max=hi)
-                sl.model.set_value(ik_target_ypr[idx])
+                def make_ypr_minus(a=idx):
+                    def _click():
+                        # 基于当前末端真实姿态叠加负旋转增量
+                        _, ee_rot = get_ee_in_baselink()
+                        cur_ypr = list(ypr_from_rot(ee_rot))
+                        cur_ypr[a] -= STEP_DEG
+                        ik_target_ypr[:] = cur_ypr
+                    return _click
+                def make_ypr_plus(a=idx):
+                    def _click():
+                        # 基于当前末端真实姿态叠加正旋转增量
+                        _, ee_rot = get_ee_in_baselink()
+                        cur_ypr = list(ypr_from_rot(ee_rot))
+                        cur_ypr[a] += STEP_DEG
+                        ik_target_ypr[:] = cur_ypr
+                    return _click
+                ui.Button("  -  ", width=50, clicked_fn=make_ypr_minus())
                 vl = ui.Label(f"{ik_target_ypr[idx]:.1f}°", width=55)
+                ui.Button("  +  ", width=50, clicked_fn=make_ypr_plus())
                 ypr_labels[idx] = vl
-                def _on_ypr(m, a=idx, v=vl):
-                    d = m.as_float; v.text = f"{d:.1f}°"
-                    ik_target_ypr[a] = d
-                sl.model.add_value_changed_fn(_on_ypr)
 
         ui.Spacer(height=6)
         ui.Separator(height=2)

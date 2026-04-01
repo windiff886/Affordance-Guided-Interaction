@@ -19,6 +19,7 @@ critic_obs = {
         "cup_mass":           (1,),
         "door_mass":          (1,),
         "door_damping":       (1,),
+        "base_pos":           (3,),   # 机器人基座世界坐标位置（回合级随机化）
     },
 }
 ```
@@ -51,6 +52,7 @@ class CriticObsBuilder:
         cup_mass: float = 0.0,
         door_mass: float = 0.0,
         door_damping: float = 0.0,
+        base_pos: np.ndarray | None = None,
     ) -> dict:
         """构建单步 critic observation。
 
@@ -76,6 +78,8 @@ class CriticObsBuilder:
             门板质量 (kg)。
         door_damping : float
             门铰链阻尼系数。
+        base_pos : (3,) | None
+            机器人基座的世界坐标位置（回合级随机化，局限于运动学可达裕度内）。
 
         Returns
         -------
@@ -111,6 +115,11 @@ class CriticObsBuilder:
             "cup_mass": np.array([cup_mass], dtype=np.float64),
             "door_mass": np.array([door_mass], dtype=np.float64),
             "door_damping": np.array([door_damping], dtype=np.float64),
+            "base_pos": (
+                np.asarray(base_pos, dtype=np.float64)
+                if base_pos is not None
+                else _zero3.copy()
+            ),
         }
 
         return {
