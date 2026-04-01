@@ -31,12 +31,9 @@ echo ""
 echo "启动中... (Ctrl+C 退出)"
 echo ""
 
-# 读取 URDF 内容
-ROBOT_DESC=$(cat "$URDF_FILE")
-
+# 读取 URDF (不再作为大体量命令行参数传递以防解析失败)
 # 启动 robot_state_publisher (后台)
-ros2 run robot_state_publisher robot_state_publisher \
-    --ros-args -p robot_description:="$ROBOT_DESC" &
+ros2 run robot_state_publisher robot_state_publisher "$URDF_FILE" &
 RSP_PID=$!
 
 # 启动 joint_state_publisher_gui (后台, 有滑块可以操控关节)
