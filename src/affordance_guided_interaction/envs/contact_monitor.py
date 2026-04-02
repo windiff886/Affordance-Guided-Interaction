@@ -1,13 +1,14 @@
-"""接触事件汇总器 — 从 Isaac Sim Contact Sensor 提取并过滤接触信息。
+"""接触事件监控器 — 从 Isaac Lab ContactSensor 提取接触信息。
 
-职责：
-    1. 每步从物理引擎拉取原始接触数据
-    2. 按力阈值过滤微碰撞噪声
-    3. 按 link 归类接触力大小
-    4. 检测自碰撞（同一 articulation 内的 link pair）
-    5. 检测杯体脱落（杯体与末端距离超阈值）
+本模块封装 ContactSensor.data 的读取逻辑，提供以下两层抽象：
 
-输出 ContactSummary 供 rewards/safety_penalty.py 消费。
+    1. 原始接触数据 → 按 link 分组的接触力向量
+    2. 语义事件：自碰撞标志、外部碰撞力汇总、杯体脱落检测
+
+数据流：
+    ContactSensor.data.net_forces_w → _read_raw_contacts()
+    → 力阈值过滤 → 分桶（自碰撞 / 外部碰撞）→ ContactSummary
+    → 杯体脱落检测（距离法）
 """
 
 from __future__ import annotations
@@ -18,68 +19,53 @@ from typing import Any
 import numpy as np
 
 
-@dataclass
+@dataclass(slots=True)
 class ContactSummary:
-    """单步接触事件的结构化摘要。
+    """单步接触事件汇总。
 
     Attributes
     ----------
-    link_forces : dict[str, float]
-        各 link 名称到接触法向力合力大小（N）的映射。
-        仅包含超过力阈值的有效接触。
     self_collision : bool
-        机器人是否发生自碰撞（任意两个自身 link 接触）。
+        是否发生自碰撞。
     cup_dropped : bool
-        杯体是否脱落（杯体与持握末端的距离超过阈值）。
+        持杯臂的杯体是否脱落。
+    link_forces : dict[str, np.ndarray]
+        每个接触 link 的合力向量 (3,)，key = link prim name。
+    total_external_force : float
+        所有非自碰撞接触的合力大小（N）。
     max_contact_force : float
-        本步所有有效接触中力最大的那个值（N）。
+        单次接触的最大力大小（N）。
     """
 
-    link_forces: dict[str, float] = field(default_factory=dict)
     self_collision: bool = False
     cup_dropped: bool = False
+    link_forces: dict[str, np.ndarray] = field(default_factory=dict)
+    total_external_force: float = 0.0
     max_contact_force: float = 0.0
 
 
-# 机器人自身 link 名称列表（用于自碰撞检测）
-# 实际部署时根据 URDF 补全
-_ROBOT_LINK_NAMES: set[str] = {
-    "left_link0", "left_link1", "left_link2",
-    "left_link3", "left_link4", "left_link5",
-    "left_gripper_link",
-    "right_link0", "right_link1", "right_link2",
-    "right_link3", "right_link4", "right_link5",
-    "right_gripper_link",
-    "base_link", "torso_link",
-}
-
-# 不计入碰撞惩罚的 link 对（相邻关节的接触是正常物理）
-_ADJACENT_PAIRS: set[frozenset[str]] = {
-    frozenset({"left_link0", "left_link1"}),
-    frozenset({"left_link1", "left_link2"}),
-    frozenset({"left_link2", "left_link3"}),
-    frozenset({"left_link3", "left_link4"}),
-    frozenset({"left_link4", "left_link5"}),
-    frozenset({"left_link5", "left_gripper_link"}),
-    frozenset({"right_link0", "right_link1"}),
-    frozenset({"right_link1", "right_link2"}),
-    frozenset({"right_link2", "right_link3"}),
-    frozenset({"right_link3", "right_link4"}),
-    frozenset({"right_link4", "right_link5"}),
-    frozenset({"right_link5", "right_gripper_link"}),
-}
-
-
 class ContactMonitor:
-    """接触事件汇总器。
+    """接触事件监控器。
 
     Parameters
     ----------
     force_threshold : float
-        接触力过滤阈值（N），低于此值的微碰撞被忽略。
+        力阈值（N），低于此值的微碰撞被忽略。
     cup_drop_threshold : float
-        杯体脱落检测距离（m）。
+        杯体脱落判定距离阈值（m）。
+        当杯体中心与持杯末端之间的距离超过此阈值时，判定为脱落。
     """
+
+    # 自碰撞源 link 集合（机器人自身部件之间的碰撞）
+    _SELF_COLLISION_PAIRS: set[str] = {
+        "left_gripper_link",
+        "right_gripper_link",
+        "base_link",
+        "left_link1", "left_link2", "left_link3",
+        "left_link4", "left_link5", "left_link6",
+        "right_link1", "right_link2", "right_link3",
+        "right_link4", "right_link5", "right_link6",
+    }
 
     def __init__(
         self,
@@ -91,139 +77,117 @@ class ContactMonitor:
 
     def update(
         self,
-        *,
         scene_handles: Any,
-        left_ee_pos: np.ndarray | None = None,
-        right_ee_pos: np.ndarray | None = None,
+        left_ee_pos: np.ndarray,
+        right_ee_pos: np.ndarray,
         cup_pos: np.ndarray | None = None,
         left_occupied: bool = False,
         right_occupied: bool = False,
     ) -> ContactSummary:
-        """从物理引擎拉取接触数据并生成摘要。
+        """更新接触状态。
 
         Parameters
         ----------
-        scene_handles
-            SceneHandles 实例，用于访问 Isaac Sim 视图。
-        left_ee_pos : (3,) | None
-            左臂末端世界坐标位置。
-        right_ee_pos : (3,) | None
-            右臂末端世界坐标位置。
-        cup_pos : (3,) | None
-            杯体世界坐标位置（无杯体时为 None）。
+        scene_handles : SceneHandles
+            场景句柄集合。
+        left_ee_pos : (3,) ndarray
+            左臂末端世界坐标。
+        right_ee_pos : (3,) ndarray
+            右臂末端世界坐标。
+        cup_pos : (3,) ndarray | None
+            杯体世界坐标。如果无杯体则为 None。
         left_occupied : bool
             左臂是否持杯。
         right_occupied : bool
             右臂是否持杯。
-
-        Returns
-        -------
-        ContactSummary
         """
-        # ── 1. 从物理引擎读取原始接触 ────────────────────────────
-        raw_contacts = self._read_raw_contacts(scene_handles)
+        # 读取原始接触数据
+        raw_forces = self._read_raw_contacts(scene_handles)
 
-        # ── 2. 阈值过滤 + 按 link 归类 ─────────────────────────
-        link_forces: dict[str, float] = {}
+        # 初始化汇总
+        summary = ContactSummary()
+
+        # ── 力阈值过滤 + 分类 ─────────────────────────────────
+        self_collision_detected = False
+        total_external = 0.0
         max_force = 0.0
 
-        for contact in raw_contacts:
-            body_a: str = contact["body_a"]
-            body_b: str = contact["body_b"]
-            force_mag: float = contact["force_magnitude"]
+        for link_name, force_vec in raw_forces.items():
+            force_mag = float(np.linalg.norm(force_vec))
 
+            # 低于阈值的噪抖忽略
             if force_mag < self._force_threshold:
                 continue
 
-            # 记录各 link 的接触力
-            if body_a in _ROBOT_LINK_NAMES:
-                link_forces[body_a] = link_forces.get(body_a, 0.0) + force_mag
-            if body_b in _ROBOT_LINK_NAMES:
-                link_forces[body_b] = link_forces.get(body_b, 0.0) + force_mag
-
             max_force = max(max_force, force_mag)
+            summary.link_forces[link_name] = force_vec
 
-        # ── 3. 自碰撞检测 ───────────────────────────────────────
-        self_collision = self._check_self_collision(raw_contacts)
+            # 判断是否为自碰撞
+            if link_name in self._SELF_COLLISION_PAIRS:
+                self_collision_detected = True
+            else:
+                total_external += force_mag
 
-        # ── 4. 杯体脱落检测 ─────────────────────────────────────
-        cup_dropped = self._check_cup_dropped(
-            cup_pos=cup_pos,
-            left_ee_pos=left_ee_pos,
-            right_ee_pos=right_ee_pos,
-            left_occupied=left_occupied,
-            right_occupied=right_occupied,
-        )
+        summary.self_collision = self_collision_detected
+        summary.total_external_force = total_external
+        summary.max_contact_force = max_force
 
-        return ContactSummary(
-            link_forces=link_forces,
-            self_collision=self_collision,
-            cup_dropped=cup_dropped,
-            max_contact_force=max_force,
-        )
+        # ── 杯体脱落检测（距离法）──────────────────────────────
+        if cup_pos is not None:
+            if left_occupied:
+                dist = float(np.linalg.norm(cup_pos - left_ee_pos))
+                if dist > self._cup_drop_threshold:
+                    summary.cup_dropped = True
+            if right_occupied and not summary.cup_dropped:
+                dist = float(np.linalg.norm(cup_pos - right_ee_pos))
+                if dist > self._cup_drop_threshold:
+                    summary.cup_dropped = True
 
-    # ═══════════════════════════════════════════════════════════════════
-    # 内部方法
-    # ═══════════════════════════════════════════════════════════════════
+        return summary
 
-    def _read_raw_contacts(self, scene_handles: Any) -> list[dict]:
-        """从 Isaac Sim 读取原始接触对列表。
+    def _read_raw_contacts(
+        self, scene_handles: Any
+    ) -> dict[str, np.ndarray]:
+        """从 Isaac Lab ContactSensor 读取每个 link 的净接触力。
 
         Returns
         -------
-        list[dict]
-            每个元素形如：
-            {"body_a": str, "body_b": str, "force_magnitude": float}
+        dict[str, np.ndarray]
+            {link_name: force_vector_world (3,)}
         """
-        # [ISAAC_API] 实际实现：
-        #   from omni.isaac.core.utils.physics import get_contact_data
-        #   contacts = get_contact_data(...)
-        #   return [{"body_a": c.body0, "body_b": c.body1,
-        #            "force_magnitude": np.linalg.norm(c.impulse / dt)}
-        #           for c in contacts]
-        return []
+        result: dict[str, np.ndarray] = {}
 
-    def _check_self_collision(self, raw_contacts: list[dict]) -> bool:
-        """检查是否存在非相邻 link 之间的自碰撞。"""
-        for contact in raw_contacts:
-            body_a = contact["body_a"]
-            body_b = contact["body_b"]
-            force_mag = contact["force_magnitude"]
+        # 检查 Isaac Lab 可用性
+        if scene_handles is None:
+            return result
 
-            if force_mag < self._force_threshold:
-                continue
+        robot_view = scene_handles.robot_view
 
-            # 两个碰撞体都是机器人自身的 link
-            if body_a in _ROBOT_LINK_NAMES and body_b in _ROBOT_LINK_NAMES:
-                pair = frozenset({body_a, body_b})
-                # 排除相邻关节的正常接触
-                if pair not in _ADJACENT_PAIRS:
-                    return True
-        return False
+        # 占位模式：无接触数据
+        if robot_view is None or not hasattr(robot_view, 'data'):
+            return result
 
-    def _check_cup_dropped(
-        self,
-        *,
-        cup_pos: np.ndarray | None,
-        left_ee_pos: np.ndarray | None,
-        right_ee_pos: np.ndarray | None,
-        left_occupied: bool,
-        right_occupied: bool,
-    ) -> bool:
-        """检查杯体是否脱落（与持握末端距离超限）。"""
-        if cup_pos is None:
-            return False
+        # Isaac Lab ContactSensor 读取路径：
+        # robot.data.body_contact_net_forces_w → (num_instances, num_bodies, 3)
+        # 该属性在 activate_contact_sensors=True 时可用
+        try:
+            net_forces = robot_view.data.body_contact_net_forces_w
+            if net_forces is None:
+                return result
 
-        # 检查左臂持杯情况
-        if left_occupied and left_ee_pos is not None:
-            dist = float(np.linalg.norm(cup_pos - left_ee_pos))
-            if dist > self._cup_drop_threshold:
-                return True
+            # net_forces shape: (1, num_bodies, 3) → 取第一个实例
+            forces = net_forces[0]  # (num_bodies, 3)
 
-        # 检查右臂持杯情况
-        if right_occupied and right_ee_pos is not None:
-            dist = float(np.linalg.norm(cup_pos - right_ee_pos))
-            if dist > self._cup_drop_threshold:
-                return True
+            # 遍历所有 body，构建 {link_name: force_vec}
+            body_names = robot_view.body_names
+            for i, name in enumerate(body_names):
+                force_vec = forces[i].cpu().numpy().astype(np.float64)
+                # 只记录有显著力的 body
+                if np.linalg.norm(force_vec) > 0:
+                    result[name] = force_vec
 
-        return False
+        except (AttributeError, RuntimeError):
+            # Isaac Lab 版本差异或未启用 contact sensor 时 graceful fallback
+            pass
+
+        return result

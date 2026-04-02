@@ -1,4 +1,39 @@
-task_family: door_related_interaction
-default_task: push
-notes: "任务定义待补充"
+# ═══════════════════════════════════════════════════════════════════════
+# 任务定义配置
+# 对应文档：src/affordance_guided_interaction/envs/task_manager.py
+# ═══════════════════════════════════════════════════════════════════════
 
+task_family: door_related_interaction
+
+# ── 默认任务类型 ─────────────────────────────────────────────────────
+default_task: push         # 初始阶段仅训练 push 门
+
+# ── 成功条件参数 ─────────────────────────────────────────────────────
+door_angle_target: 1.2     # 门角度目标（rad, ≈69°）—— 达到即判定成功
+door_angle_tolerance: 0.05 # 角度容差（rad）
+
+# ── 失败条件参数 ─────────────────────────────────────────────────────
+cup_drop_threshold: 0.15   # 杯体脱落距离阈值（m）—— 超过即判定杯体脱落
+self_collision_penalty: true  # 是否启用自碰撞检测
+
+# ── 超时参数 ─────────────────────────────────────────────────────────
+# max_episode_steps 在 env/default.yaml 中定义
+
+# ── Affordance 映射 ──────────────────────────────────────────────────
+affordance_types:
+  push:
+    description: "推门 — 单臂直接推动门面板"
+    contact_body: "door_panel"
+    target_angle_direction: positive  # 门角度正方向增加
+  pull:
+    description: "拉门 — 单臂抓握门面板拉动"
+    contact_body: "door_panel"
+    target_angle_direction: negative
+  handle_push:
+    description: "把手推门 — 先握把手再推开"
+    contact_body: "door_handle"
+    target_angle_direction: positive
+  handle_pull:
+    description: "把手拉门 — 先握把手再拉开"
+    contact_body: "door_handle"
+    target_angle_direction: negative

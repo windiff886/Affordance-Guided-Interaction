@@ -26,7 +26,7 @@ from typing import Any
 import numpy as np
 
 from .base_env import BaseEnv, EnvConfig
-from .scene_factory import SceneFactory, SceneHandles
+from .scene_factory import SceneFactory, SceneHandles, _HAS_ISAAC_LAB
 from .contact_monitor import ContactMonitor, ContactSummary
 from .task_manager import TaskManager, TaskStatus, TerminationReason
 
@@ -37,6 +37,10 @@ from affordance_guided_interaction.observations.critic_obs_builder import (
     CriticObsBuilder,
 )
 from affordance_guided_interaction.rewards.reward_manager import RewardManager
+
+# Isaac Lab 条件导入
+if _HAS_ISAAC_LAB:
+    import torch
 
 
 class DoorInteractionEnv(BaseEnv):
@@ -50,13 +54,23 @@ class DoorInteractionEnv(BaseEnv):
     ----------
     cfg : EnvConfig | None
         环境配置。
+    sim_context : Any | None
+        Isaac Lab SimulationContext 引用（无头训练时从外部传入）。
     """
 
-    def __init__(self, cfg: EnvConfig | None = None) -> None:
+    def __init__(
+        self,
+        cfg: EnvConfig | None = None,
+        sim_context: Any = None,
+    ) -> None:
         super().__init__(cfg)
 
         # ── 内部组件 ──────────────────────────────────────────
-        self._scene = SceneFactory(physics_dt=self.cfg.physics_dt)
+        self._scene = SceneFactory(
+            physics_dt=self.cfg.physics_dt,
+            sim_context=sim_context,
+        )
+        self._sim_context = sim_context
         self._contact_monitor = ContactMonitor(
             force_threshold=self.cfg.contact_force_threshold,
             cup_drop_threshold=self.cfg.cup_drop_threshold,
@@ -199,7 +213,6 @@ class DoorInteractionEnv(BaseEnv):
 
     def close(self) -> None:
         """释放仿真资源。"""
-        # [ISAAC_API] 实际实现：清除 world / stage 资源
         self._handles = None
 
     # ═══════════════════════════════════════════════════════════════════
@@ -207,66 +220,215 @@ class DoorInteractionEnv(BaseEnv):
     # ═══════════════════════════════════════════════════════════════════
 
     def _sim_step(self, action: np.ndarray) -> None:
-        """推进 decimation 次物理仿真步。"""
-        # [ISAAC_API] 实际实现：
-        #   h = self._handles
-        #   h.robot_view.set_joint_efforts(action.reshape(1, -1))
-        #   for _ in range(self.cfg.decimation):
-        #       world.step(render=False)
-        pass
+        """推进 decimation 次物理仿真步。
+
+        通过 Isaac Lab 的 Articulation.write_joint_effort_to_sim()
+        设置关节力矩，然后调用 SimulationContext.step() 推进物理引擎。
+        """
+        if not _HAS_ISAAC_LAB or self._handles is None:
+            return
+
+        h = self._handles
+        robot = h.robot_view
+
+        # 检查是否为占位模式
+        if isinstance(robot, type(None)) or not hasattr(robot, 'write_joint_effort_to_sim'):
+            return
+
+        # 将 numpy action 转为 torch tensor
+        # action 维度: (12,) → 需要构建完整关节力矩向量
+        effort_tensor = torch.zeros(
+            (1, robot.num_joints), dtype=torch.float32, device=robot.device
+        )
+
+        # 只对双臂关节施加力矩（使用预解析的索引）
+        if h.arm_joint_indices is not None:
+            action_t = torch.tensor(
+                action, dtype=torch.float32, device=robot.device
+            ).unsqueeze(0)
+            effort_tensor[:, h.arm_joint_indices] = action_t
+
+        # 写入力矩并步进
+        robot.write_joint_effort_to_sim(effort_tensor)
+
+        # 多次物理步进（decimation）
+        sim = self._sim_context
+        if sim is not None:
+            for _ in range(self.cfg.decimation):
+                sim.step(render=False)
+
+            # 更新 Isaac Lab 内部缓存
+            robot.update(self.cfg.physics_dt * self.cfg.decimation)
+            if h.door_view is not None and hasattr(h.door_view, 'update'):
+                h.door_view.update(self.cfg.physics_dt * self.cfg.decimation)
+            if h.cup_view is not None and hasattr(h.cup_view, 'update'):
+                h.cup_view.update(self.cfg.physics_dt * self.cfg.decimation)
 
     def _read_physics_state(self) -> dict[str, Any]:
-        """从 Isaac Sim 读取所有需要的物理量。
+        """从 Isaac Lab 读取所有需要的物理量。
 
         返回一个扁平字典，包含机器人本体、末端、门、杯体的完整状态。
         """
-        # [ISAAC_API] 实际实现示例：
-        #   h = self._handles
-        #   q = h.robot_view.get_joint_positions()[0]      # (12,)
-        #   dq = h.robot_view.get_joint_velocities()[0]    # (12,)
-        #   tau = h.robot_view.get_applied_joint_efforts()[0]  # (12,)
-        #   ...
-        #
-        # 以下返回零值占位，保证接口完整
-
         n = self.cfg.joints_per_arm  # 6
 
+        # 占位模式：返回全零状态
+        if (not _HAS_ISAAC_LAB
+                or self._handles is None
+                or not hasattr(self._handles.robot_view, 'data')):
+            return self._get_zero_state(n)
+
+        h = self._handles
+        robot = h.robot_view
+
+        # ── 读取机器人关节状态 ────────────────────────────────
+        # 获取双臂 12 关节的 q / dq / tau
+        all_q = robot.data.joint_pos[0]      # (num_joints,) GPU tensor
+        all_dq = robot.data.joint_vel[0]     # (num_joints,)
+        all_tau = robot.data.applied_torque[0] if hasattr(robot.data, 'applied_torque') \
+            else torch.zeros_like(all_q)
+
+        if h.arm_joint_indices is not None:
+            arm_q = all_q[h.arm_joint_indices].cpu().numpy()
+            arm_dq = all_dq[h.arm_joint_indices].cpu().numpy()
+            arm_tau = all_tau[h.arm_joint_indices].cpu().numpy()
+        else:
+            arm_q = np.zeros(12, dtype=np.float64)
+            arm_dq = np.zeros(12, dtype=np.float64)
+            arm_tau = np.zeros(12, dtype=np.float64)
+
+        # 分为左右臂各 6 维
+        left_q, right_q = arm_q[:n], arm_q[n:]
+        left_dq, right_dq = arm_dq[:n], arm_dq[n:]
+        left_tau, right_tau = arm_tau[:n], arm_tau[n:]
+
+        # ── 读取末端执行器位姿/速度 ──────────────────────────
+        # 通过 body 索引从 robot.data 获取
+        body_pos = robot.data.body_pos_w[0]     # (num_bodies, 3)
+        body_quat = robot.data.body_quat_w[0]   # (num_bodies, 4)
+        body_lin_vel = robot.data.body_lin_vel_w[0]   # (num_bodies, 3)
+        body_ang_vel = robot.data.body_ang_vel_w[0]   # (num_bodies, 3)
+
+        if h.left_ee_body_idx >= 0:
+            left_ee_pos = body_pos[h.left_ee_body_idx].cpu().numpy()
+            left_ee_quat = body_quat[h.left_ee_body_idx].cpu().numpy()
+            left_ee_lin_vel = body_lin_vel[h.left_ee_body_idx].cpu().numpy()
+            left_ee_ang_vel = body_ang_vel[h.left_ee_body_idx].cpu().numpy()
+        else:
+            left_ee_pos = np.zeros(3, dtype=np.float64)
+            left_ee_quat = np.array([1, 0, 0, 0], dtype=np.float64)
+            left_ee_lin_vel = np.zeros(3, dtype=np.float64)
+            left_ee_ang_vel = np.zeros(3, dtype=np.float64)
+
+        if h.right_ee_body_idx >= 0:
+            right_ee_pos = body_pos[h.right_ee_body_idx].cpu().numpy()
+            right_ee_quat = body_quat[h.right_ee_body_idx].cpu().numpy()
+            right_ee_lin_vel = body_lin_vel[h.right_ee_body_idx].cpu().numpy()
+            right_ee_ang_vel = body_ang_vel[h.right_ee_body_idx].cpu().numpy()
+        else:
+            right_ee_pos = np.zeros(3, dtype=np.float64)
+            right_ee_quat = np.array([1, 0, 0, 0], dtype=np.float64)
+            right_ee_lin_vel = np.zeros(3, dtype=np.float64)
+            right_ee_ang_vel = np.zeros(3, dtype=np.float64)
+
+        # ── 读取门关节状态 ────────────────────────────────────
+        door_joint_pos = 0.0
+        door_joint_vel = 0.0
+        door_pose = np.zeros(7, dtype=np.float64)
+        door_pose[0] = 1.0  # 单位四元数
+
+        if h.door_view is not None and hasattr(h.door_view, 'data'):
+            door_data = h.door_view.data
+            if door_data.joint_pos is not None and door_data.joint_pos.numel() > 0:
+                door_joint_pos = float(door_data.joint_pos[0, 0].cpu())
+                door_joint_vel = float(door_data.joint_vel[0, 0].cpu())
+            # 门体根位姿
+            if door_data.root_pos_w is not None:
+                door_root_pos = door_data.root_pos_w[0].cpu().numpy()
+                door_root_quat = door_data.root_quat_w[0].cpu().numpy()
+                door_pose = np.concatenate([door_root_quat, door_root_pos])
+
+        # ── 读取杯体状态 ──────────────────────────────────────
+        cup_position = None
+        cup_pose = np.zeros(7, dtype=np.float64)
+        cup_pose[0] = 1.0
+        cup_lin_vel = np.zeros(3, dtype=np.float64)
+        cup_ang_vel = np.zeros(3, dtype=np.float64)
+
+        if (self._left_occupied or self._right_occupied) \
+                and h.cup_view is not None and hasattr(h.cup_view, 'data'):
+            cup_data = h.cup_view.data
+            if cup_data.root_pos_w is not None:
+                cup_pos_t = cup_data.root_pos_w[0].cpu().numpy()
+                cup_quat_t = cup_data.root_quat_w[0].cpu().numpy()
+                cup_position = cup_pos_t
+                cup_pose = np.concatenate([cup_quat_t, cup_pos_t])
+            if cup_data.root_lin_vel_w is not None:
+                cup_lin_vel = cup_data.root_lin_vel_w[0].cpu().numpy()
+            if cup_data.root_ang_vel_w is not None:
+                cup_ang_vel = cup_data.root_ang_vel_w[0].cpu().numpy()
+
+        # ── 组装状态字典 ──────────────────────────────────────
         state: dict[str, Any] = {
             # 关节状态（左右臂各 6 维）
+            "left_joint_positions": left_q.astype(np.float64),
+            "left_joint_velocities": left_dq.astype(np.float64),
+            "left_joint_torques": left_tau.astype(np.float64),
+            "right_joint_positions": right_q.astype(np.float64),
+            "right_joint_velocities": right_dq.astype(np.float64),
+            "right_joint_torques": right_tau.astype(np.float64),
+            # 左臂末端
+            "left_ee_position": left_ee_pos.astype(np.float64),
+            "left_ee_orientation": left_ee_quat.astype(np.float64),
+            "left_ee_linear_velocity": left_ee_lin_vel.astype(np.float64),
+            "left_ee_angular_velocity": left_ee_ang_vel.astype(np.float64),
+            # 右臂末端
+            "right_ee_position": right_ee_pos.astype(np.float64),
+            "right_ee_orientation": right_ee_quat.astype(np.float64),
+            "right_ee_linear_velocity": right_ee_lin_vel.astype(np.float64),
+            "right_ee_angular_velocity": right_ee_ang_vel.astype(np.float64),
+            # 门状态
+            "door_joint_pos": door_joint_pos,
+            "door_joint_vel": door_joint_vel,
+            "door_pose": door_pose,
+            # 杯体状态
+            "cup_position": cup_position,
+            "cup_pose": cup_pose,
+            "cup_linear_vel": cup_lin_vel,
+            "cup_angular_vel": cup_ang_vel,
+            # 门点云 embedding（来自 door_perception，步进时由外部注入或延迟加载）
+            "door_embedding": None,
+        }
+
+        return state
+
+    def _get_zero_state(self, n: int) -> dict[str, Any]:
+        """返回全零占位状态（无 Isaac Lab 时）。"""
+        state: dict[str, Any] = {
             "left_joint_positions": np.zeros(n, dtype=np.float64),
             "left_joint_velocities": np.zeros(n, dtype=np.float64),
             "left_joint_torques": np.zeros(n, dtype=np.float64),
             "right_joint_positions": np.zeros(n, dtype=np.float64),
             "right_joint_velocities": np.zeros(n, dtype=np.float64),
             "right_joint_torques": np.zeros(n, dtype=np.float64),
-            # 左臂末端
             "left_ee_position": np.zeros(3, dtype=np.float64),
             "left_ee_orientation": np.array([1, 0, 0, 0], dtype=np.float64),
             "left_ee_linear_velocity": np.zeros(3, dtype=np.float64),
             "left_ee_angular_velocity": np.zeros(3, dtype=np.float64),
-            # 右臂末端
             "right_ee_position": np.zeros(3, dtype=np.float64),
             "right_ee_orientation": np.array([1, 0, 0, 0], dtype=np.float64),
             "right_ee_linear_velocity": np.zeros(3, dtype=np.float64),
             "right_ee_angular_velocity": np.zeros(3, dtype=np.float64),
-            # 门状态
             "door_joint_pos": 0.0,
             "door_joint_vel": 0.0,
             "door_pose": np.zeros(7, dtype=np.float64),
-            # 杯体状态（无杯体时全零）
             "cup_position": None,
             "cup_pose": np.zeros(7, dtype=np.float64),
             "cup_linear_vel": np.zeros(3, dtype=np.float64),
             "cup_angular_vel": np.zeros(3, dtype=np.float64),
-            # 门点云 embedding（来自 door_perception，此处占位）
             "door_embedding": None,
         }
-
-        # 若本局有杯体，读取杯体位置（用于脱落检测）
         if self._left_occupied or self._right_occupied:
-            # [ISAAC_API] cup_pos = h.cup_view.get_world_poses()[0][0, :3]
             state["cup_position"] = np.zeros(3, dtype=np.float64)
-
         return state
 
     # ═══════════════════════════════════════════════════════════════════
@@ -337,14 +499,12 @@ class DoorInteractionEnv(BaseEnv):
         将环境层采集的物理真值映射为 RewardManager.step() 所需的参数。
         """
         # 为稳定性 proxy 准备简化输入
-        # （完整的 proxy 由 ActorObsBuilder 内部计算，
-        #   这里为 reward 提供原始的加速度近似值）
         left_stab_proxy = None
         right_stab_proxy = None
 
         if self._left_occupied:
             left_stab_proxy = {
-                "lin_acc": state["left_ee_linear_velocity"],  # 简化：用速度近似
+                "lin_acc": state["left_ee_linear_velocity"],
                 "ang_acc": state["left_ee_angular_velocity"],
                 "tilt_xy": np.zeros(2, dtype=np.float64),
             }

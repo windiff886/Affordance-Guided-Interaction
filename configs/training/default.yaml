@@ -1,5 +1,32 @@
-algorithm: ppo
-num_envs: 1
-total_steps: 0
-notes: "训练超参数待补充"
+# ═══════════════════════════════════════════════════════════════════════
+# 训练管线超参数配置
+# 对应文档：src/affordance_guided_interaction/training/README.md
+# ═══════════════════════════════════════════════════════════════════════
 
+# ── 基本训练参数 ─────────────────────────────────────────────────────
+algorithm: ppo
+num_envs: 64                # 并行环境数量（A100 建议 64-128，4060 建议 2-4）
+total_steps: 10_000_000     # 总训练步数
+n_steps_per_rollout: 128    # 每轮 rollout 采集步数 T
+
+# ── PPO 算法超参（§2, §6, §7.1）──────────────────────────────────────
+ppo:
+  gamma: 0.99               # 折扣因子 γ
+  lam: 0.95                 # GAE 偏差-方差权衡 λ
+  clip_eps: 0.2             # PPO-Clip 策略比率裁剪参数 ε
+  value_clip_eps: 0.2       # Value function 裁剪参数 ε_v
+  use_clipped_value_loss: true
+  entropy_coef: 0.01        # 熵正则化系数 c_e
+  value_coef: 0.5           # Critic 损失权重 c_v
+  max_grad_norm: 1.0        # 全局梯度范数上限 g_max
+  actor_lr: 3.0e-4          # Actor 学习率
+  critic_lr: 3.0e-4         # Critic 学习率
+  num_mini_batches: 4       # Mini-batch 数量 N_mb
+  num_epochs: 5             # 优化轮数 K
+  seq_length: 16            # TBPTT 截断长度 L
+  normalize_advantages: true
+
+# ── 日志与 checkpoint ────────────────────────────────────────────────
+log_interval: 1             # 每 N 轮迭代打印日志
+checkpoint_interval: 50     # 每 N 轮迭代保存 checkpoint
+eval_interval: 10           # 每 N 轮迭代执行评估（预留）

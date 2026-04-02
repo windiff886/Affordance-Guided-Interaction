@@ -1,5 +1,32 @@
-name: door_env
-sim_backend: isaac_sim
-robot: franka
-notes: "环境细节待补充"
+# ═══════════════════════════════════════════════════════════════════════
+# 环境配置
+# 对应文档：src/affordance_guided_interaction/envs/README.md
+# ═══════════════════════════════════════════════════════════════════════
 
+name: door_interaction_env
+sim_backend: isaac_lab
+
+# ── 物理仿真参数 ─────────────────────────────────────────────────────
+physics_dt: 0.008333       # 物理步长 1/120 秒
+decimation: 2              # 控制频率 = physics_dt × decimation = 60Hz
+
+# ── Episode 控制 ─────────────────────────────────────────────────────
+max_episode_steps: 500     # 最大 episode 步数（60Hz × 500 ≈ 8.3 秒）
+
+# ── 机器人参数 ───────────────────────────────────────────────────────
+robot: unitree_z1_dual     # 双臂 Z1 + Dingo 底座
+joints_per_arm: 6          # 每条 Z1 臂 6 个旋转关节
+total_joints: 12           # 双臂总关节数
+
+# ── 传感器参数 ───────────────────────────────────────────────────────
+contact_force_threshold: 0.1  # 接触力判定阈值（N）
+
+# ── 观测参数 ─────────────────────────────────────────────────────────
+action_history_length: 3   # 动作历史缓存步数
+acc_history_length: 10     # 稳定性 proxy 加速度历史窗口长度
+
+# ── USD 资产路径（Isaac Lab 仿真使用）────────────────────────────────
+assets:
+  robot_usd: "assets/robots/uni_dingo/uni_dingo.usd"
+  push_door_usd: "assets/doors/minimal_push_door/minimal_push_door.usd"
+  cup_usd: "assets/objects/cup/cup.usd"

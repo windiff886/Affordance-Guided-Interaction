@@ -1,76 +1,241 @@
-# Affordance-Guided-Interaction
+# Affordance-Guided Interaction
 
-本项目用于构建一个面向 door-related interaction 的研究与代码框架，核心关注
-affordance 引导下的交互决策，以及末端持物约束下的稳定执行。
+基于 **Isaac Lab** 仿真器与 **PPO** 强化学习算法，训练双臂机器人（Unitree Z1 × 2 + Dingo 底座）在持杯约束下完成开门任务。策略通过 affordance 视觉编码自适应选择交互方式，并在五阶段课程学习框架下逐步泛化到多种门类型。
 
-当前仓库还处于框架搭建阶段，重点是先把模块边界、目录结构和后续扩展入口整理出来，
-具体算法、Isaac Sim 接入和训练细节仍保留为占位实现。
+---
+
+## 快速开始
+
+### 环境依赖
+
+| 依赖 | 版本要求 | 说明 |
+|---|---|---|
+| Isaac Lab | ≥ 1.0 | 仿真引擎（含 Isaac Sim 4.x） |
+| Python | ≥ 3.10 | Isaac Lab 自带的 Python 环境 |
+| PyTorch | ≥ 2.0 | GPU 加速训练 |
+| TensorBoard | 可选 | 训练指标可视化 |
+
+### 安装
+
+```bash
+# 克隆仓库
+git clone https://github.com/<your-org>/Affordance-Guided-Interaction.git
+cd Affordance-Guided-Interaction
+
+# 确保 Isaac Lab 的 Python 环境已激活
+# 如果使用 conda：
+conda activate isaaclab
+
+# 将项目 src 加入 PYTHONPATH（或在已有 conda 环境中安装）
+export PYTHONPATH="${PWD}/src:${PYTHONPATH}"
+
+# 验证安装
+python -c "from affordance_guided_interaction.training import PPOTrainer; print('✅ OK')"
+```
+
+---
+
+## 训练
+
+### 本地验证（4060 Laptop）
+
+在正式训练前，使用少量环境快速验证训练管线是否能跑通：
+
+```bash
+python scripts/train.py \
+    --config configs/training/default.yaml \
+    --num-envs 2 \
+    --seed 42
+```
+
+> 预期行为：控制台每轮迭代打印 `actor_loss / critic_loss / entropy / reward / stage`，无报错即管线正常。
+
+### 服务器训练（A100）
+
+无头模式启动完整规模训练：
+
+```bash
+python scripts/train.py \
+    --config configs/training/default.yaml \
+    --headless \
+    --num-envs 64
+```
+
+### 断点续训
+
+从已有 checkpoint 恢复训练：
+
+```bash
+python scripts/train.py \
+    --resume checkpoints/ckpt_iter_1000.pt \
+    --headless
+```
+
+### 完整命令行参数
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `--config` | `configs/training/default.yaml` | 训练配置文件路径 |
+| `--num-envs` | 配置文件中的值 (64) | 覆盖并行环境数量 |
+| `--headless` | `false` | 无头模式（无 GUI 渲染，服务器训练） |
+| `--resume` | 无 | 恢复训练的 checkpoint 文件路径 |
+| `--device` | 自动检测 | 指定计算设备 (`cuda` / `cpu`) |
+| `--seed` | `42` | 随机种子 |
+| `--log-dir` | `runs/` | TensorBoard 日志目录 |
+| `--ckpt-dir` | `checkpoints/` | Checkpoint 保存目录 |
+
+### 推荐环境数配置
+
+| 硬件 | `--num-envs` | 用途 |
+|---|---|---|
+| RTX 4060 Laptop | 2 – 4 | 本地功能验证、debug |
+| RTX 4090 | 16 – 32 | 中等规模训练 |
+| A100 80GB | 64 – 128 | 正式训练 |
+
+---
+
+## 训练监控
+
+### TensorBoard
+
+```bash
+tensorboard --logdir runs/
+```
+
+记录的核心指标：
+
+| 分类 | 指标 | 含义 |
+|---|---|---|
+| **损失** | `train/actor_loss` | 策略梯度损失 |
+| | `train/critic_loss` | 价值函数损失 |
+| | `train/entropy` | 策略熵（探索度） |
+| **优化** | `train/clip_fraction` | PPO 裁剪比例 |
+| | `train/approx_kl` | 近似 KL 散度 |
+| | `train/explained_variance` | Critic 拟合质量 |
+| **环境** | `collect/mean_reward` | 平均回合奖励 |
+| | `collect/completed_episodes` | 完成的 episode 数 |
+| **课程** | `curriculum/stage` | 当前课程阶段 (1-5) |
+| | `curriculum/window_mean` | 滑动窗口平均成功率 |
+
+### Checkpoint
+
+Checkpoint 默认每 50 轮迭代自动保存至 `checkpoints/` 目录，训练中断 (`Ctrl+C`) 时也会自动保存最终状态。
+
+每个 checkpoint 包含：Actor / Critic 权重、PPO 优化器状态、课程管理器进度。
+
+---
+
+## 配置体系
+
+所有训练超参均通过 `configs/` 目录下的 YAML 文件管理：
+
+```
+configs/
+├── training/default.yaml    # PPO 超参、总步数、mini-batch 配置
+├── env/default.yaml         # 物理步长、机器人规格、USD 资产路径
+├── policy/default.yaml      # Actor/Critic 网络架构参数
+├── task/default.yaml        # 任务成功/失败判定条件
+├── curriculum/default.yaml  # 课程跃迁窗口与阈值
+└── reward/default.yaml      # SoFTA 奖励权重分配
+```
+
+修改配置后无需改动代码，`train.py` 会自动合并所有配置文件。
+
+### 关键超参速查
+
+```yaml
+# configs/training/default.yaml
+num_envs: 64               # 并行环境数
+total_steps: 10_000_000    # 总训练步数
+n_steps_per_rollout: 128   # 每轮采集步数
+
+ppo:
+  gamma: 0.99              # 折扣因子
+  lam: 0.95                # GAE λ
+  clip_eps: 0.2            # PPO 裁剪参数
+  actor_lr: 3.0e-4         # Actor 学习率
+  critic_lr: 3.0e-4        # Critic 学习率
+  num_epochs: 5            # 优化轮数
+  seq_length: 16           # TBPTT 截断长度
+```
+
+---
+
+## 课程学习
+
+训练采用五阶段课程自动跃迁，当滑动窗口（50 epoch）平均成功率 ≥ 80% 时自动进入下一阶段：
+
+| 阶段 | 门类型 | 持杯概率 | 学习目标 |
+|---|---|---|---|
+| Stage 1 | push | 0% | 基础视觉引导接触 |
+| Stage 2 | push | 100% | 力控与稳定性约束 |
+| Stage 3 | push + pull | 50% | affordance 类型视觉区分 |
+| Stage 4 | handle | 50% | 时序子任务组合 |
+| Stage 5 | 全部 | 50% | 全域泛化 + 高强度域随机化 |
+
+> 当前版本仅训练 push 门（Stage 1-2），后续阶段随任务复杂度逐步激活。
+
+---
 
 ## 项目结构
 
-```text
+```
 Affordance-Guided-Interaction/
-├── README.md
-├── project_architecture.md
-├── configs/
-├── docs/
 ├── scripts/
-├── src/
-├── tests/
-└── .gitignore
+│   ├── train.py                # 训练入口
+│   ├── evaluate.py             # 评估（开发中）
+│   ├── load_scene.py           # Isaac Sim 场景加载/调试
+│   └── rollout_demo.py         # Rollout 可视化
+├── src/affordance_guided_interaction/
+│   ├── envs/                   # Isaac Lab 环境层
+│   ├── observations/           # 观测构建（Actor/Critic 分支）
+│   ├── policy/                 # Actor-Critic 网络
+│   ├── rewards/                # SoFTA 奖励体系
+│   ├── training/               # PPO 训练组件
+│   ├── door_perception/        # 视觉感知模块
+│   └── utils/                  # 工具函数
+├── src/teleop_cup_grasp/       # 杯体抓取遥操作（独立模块）
+├── configs/                    # YAML 配置文件
+├── assets/                     # USD 仿真资产
+└── checkpoints/                # 训练 checkpoint（自动生成）
 ```
 
-## 目录说明
+---
 
-- `project_architecture.md`
-  面向工程落地的项目架构设计文档。
-- `configs/`
-  配置骨架，按环境、任务、策略、奖励、训练、课程等维度拆分。
-- `docs/`
-  目前主要存放实现计划文档。
-- `scripts/`
-  训练、评估、rollout 演示和策略导出入口脚本。
-- `src/affordance_guided_interaction/`
-  核心源码目录，当前已拆分为 `envs`、`perception`、`observations`、
-  `policy`、`rewards`、`training`、`evaluation`、`common`、`utils`。
-- `tests/`
-  当前用于验证包结构、观测构建和奖励聚合等最小骨架能力。
+## 技术架构
 
-## 当前状态
-
-目前已经完成的是：
-
-- 基础目录和模块分层
-- 观测构建与奖励聚合的最小实现
-- 可训练的 `assets/grasp_objects/` 持物资产骨架（无把杯 + 托盘）
-- 训练/评估脚本入口占位
-- 配置与测试骨架
-
-目前仍然留白的是：
-
-- Isaac Sim 场景与环境接入
-- affordance/progress 模块的真实实现
-- actor/critic 网络与 PPO 训练逻辑
-- 真实任务奖励和评估指标
-
-如果后续继续开发，建议优先补 `envs + observations + rewards + training`
-之间的最小闭环，再逐步替换上层表示模块。
-
-## Isaac Sim 持物资产
-
-新增的 `assets/grasp_objects/` 目录用于放置训练期持物相关资产定义：
-
-- `cup/carry_cup.usda`
-- `tray/carry_tray.usda`
-- `catalog.json`
-
-在 Isaac Sim 里当前有两种启动语义：
-
-```bash
-python3 scripts/load_scene.py --grasp-object cup
-python3 scripts/load_scene.py --grasp-object tray --grasp-arm right
+```
+                    ┌─────────────────────────────┐
+                    │     CurriculumManager       │
+                    │   (五阶段课程跃迁)           │
+                    └──────────┬──────────────────┘
+                               │ 阶段配置
+                    ┌──────────▼──────────────────┐
+                    │     RolloutCollector         │
+                    │   (并行轨迹采集)             │
+                    └──────────┬──────────────────┘
+                               │ 观测/动作/奖励
+              ┌────────────────┼────────────────┐
+              │                │                │
+    ┌─────────▼────┐  ┌───────▼──────┐  ┌──────▼───────┐
+    │  VecDoorEnv  │  │    Actor     │  │   Critic     │
+    │ (N并行环境)  │  │ (GRU+分支)   │  │ (非对称MLP)  │
+    └─────────┬────┘  └──────────────┘  └──────────────┘
+              │
+    ┌─────────▼────────────────────────┐
+    │     DoorInteractionEnv           │
+    │  SceneFactory + ContactMonitor   │
+    │  TaskManager + RewardManager     │
+    └──────────────────────────────────┘
+              │
+    ┌─────────▼────────────────────────┐
+    │     Isaac Lab SimulationContext  │
+    │        (GPU 物理仿真)            │
+    └──────────────────────────────────┘
 ```
 
-- `cup`: 走基座相对 scripted pickup 流程，会在 `base_link` 相对坐标下生成支撑台和竖直杯子，然后驱动左臂执行 `pregrasp -> approach -> closure -> settle -> lift -> retreat`
-- `tray`: 仍然只是把托盘生成到场景里，不执行抓取序列
-- `--attach-grasp-object`: 已废弃；为了兼容旧命令保留，但不会再创建 fixed joint
+---
+
+## License
+
+[MIT](LICENSE)
