@@ -35,7 +35,7 @@ envs/ ──→ next_state, contact_events
 
 ## 2. 总体奖励函数
 
-每步的原始分项奖励分为正向激励（Bonus）和负向惩罚（Penalty）。为了防止训练初期策略陷入局部最优，所有的惩罚项都会经过动态缩放因子 $s_t$（见 §7）的调制再送入 PPO：
+每步的原始分项奖励分为正向激励（Bonus）和负向惩罚（Penalty）。为了防止训练初期策略陷入局部最优，只有稳定性分支中的负向惩罚项会经过动态缩放因子 $s_t$（见 §7）的调制后再送入 PPO；安全惩罚始终以原值计入总奖励：
 
 $$
 r_t = r_{\text{task}} + m_L \cdot \left( r_{\text{stab\_bonus}}^L + s_t \cdot r_{\text{stab\_penalty}}^L \right) + m_R \cdot \left( r_{\text{stab\_bonus}}^R + s_t \cdot r_{\text{stab\_penalty}}^R \right) - r_{\text{safe}}
@@ -45,7 +45,8 @@ $$
 
 - $m_L, m_R \in \{0, 1\}$ 为左右臂持杯 mask，由 `left_occupied` / `right_occupied` 决定
 - 稳定性被拆分为正向高斯激励项 $r_{\text{stab\_bonus}}$ 与负向二次惩罚项 $r_{\text{stab\_penalty}}$（本身值为负）
-- 所有的惩罚信号（包括稳定性惩罚和安全惩罚 $r_{\text{safe}}$）都会被 $s_t \in (0, 1]$ 当前的课程系数缩放，鼓励智能体先关注主任务，再优化平滑与安全
+- $s_t \in (0, 1]$ 只作用于稳定性分支中的负向项 $r_{\text{stab\_penalty}}$
+- 安全惩罚 $r_{\text{safe}}$ 不受 $s_t$ 影响，始终按原值从总奖励中扣除
 
 ---
 
@@ -76,31 +77,33 @@ $$
 
 ### 4.2 推门奖励
 
-进展度量为门铰链角度增量，权重 $w(\theta_t)$ 是关于当前角度的**分段递减函数**——在到达目标角度前保持满额激励（不衰减），超过目标角度后开始逐步衰减，防止过度推门：
+进展度量为门铰链角度增量，权重 $w(\theta_t)$ 是关于当前角度的**分段递减函数**。按当前目标定义，reward 层单独维护 success bonus 阈值 $\theta_{\text{reward\_success}} = 1.2\ \text{rad}$；它**不等同于** env / TaskManager 使用的 episode 成功终止阈值 `1.57 rad`。在到达奖励目标角度前保持满额激励（不衰减），超过奖励目标角度后开始逐步衰减，防止过度推门：
 
 $$
-r_{\text{task}} = w(\theta_t) \cdot (\theta_t - \theta_{t-1}) + w_{\text{open}} \cdot \mathbf{1}[\theta_t \geq \theta_{\text{target}}]
+r_{\text{task}} = w(\theta_t) \cdot (\theta_t - \theta_{t-1}) + w_{\text{open}} \cdot \mathbf{1}[\theta_t \geq \theta_{\text{reward\_success}}]
 $$
 
 其中：
 
 $$
 w(\theta_t) = \begin{cases}
-w_{\delta} & \text{if } \theta_t \leq \theta_{\text{target}} \\
-w_{\delta} \cdot \max\!\left(\alpha,\; 1 - k_{\text{decay}}(\theta_t - \theta_{\text{target}})\right) & \text{if } \theta_t > \theta_{\text{target}}
+ w_{\delta} & \text{if } \theta_t \leq \theta_{\text{reward\_success}} \\
+ w_{\delta} \cdot \max\!\left(\alpha,\; 1 - k_{\text{decay}}(\theta_t - \theta_{\text{reward\_success}})\right) & \text{if } \theta_t > \theta_{\text{reward\_success}}
 \end{cases}
 $$
 
-- $\theta_t \leq \theta_{\text{target}}$ 时：$w = w_\delta$（满额激励，不衰减）
-- $\theta_t > \theta_{\text{target}}$ 时：权重由于超出目标角度而线性衰减，直到降至下限 $\alpha \cdot w_\delta$。$k_{\text{decay}}$ 控制衰减速率。
+- $\theta_t \leq \theta_{\text{reward\_success}}$ 时：$w = w_\delta$（满额激励，不衰减）
+- $\theta_t > \theta_{\text{reward\_success}}$ 时：权重由于超出奖励目标角度而线性衰减，直到降至下限 $\alpha \cdot w_\delta$。$k_{\text{decay}}$ 控制衰减速率。
 
 参数说明：
 
 - $w_\delta$：基准角度增量奖励
 - $\alpha \in (0, 1)$：衰减下限比例，控制到达目标后的权重保留比例
 - $k_{\text{decay}}$：超出目标角度后的衰减速率系数
-- $\theta_{\text{target}}$：任务完成目标角度
+- $\theta_{\text{reward\_success}}$：reward 层 success bonus 触发角度，目标值为 `1.2 rad`
 - $w_{\text{open}}$：完成 bonus（一次性）
+
+env / TaskManager 的 episode 成功终止角度由环境层单独维护，目标值为 `1.57 rad`。reward 文档中的成功阈值不再与 episode 终止阈值共用同一名字，以避免再次混淆。
 
 ---
 
@@ -110,7 +113,7 @@ $$
 
 参考 SoFTA 框架上半身智能体的末端稳定性奖励设计。核心思想是：杯体的稳定性由末端执行器（EE）的运动状态决定，通过**高斯核正奖励**鼓励趋近零状态，**二次惩罚**抑制过大运动量。正奖励与惩罚构成互补的双向梯度场。
 
-所有指标基于 **gripper frame**（末端执行器坐标系）定义，通过速度差分估计加速度（与真实部署保持一致）。
+所有指标基于 **gripper frame**（末端执行器坐标系）定义。`lin_acc` / `ang_acc` 由环境层直接读取 Isaac Sim / Isaac Lab 提供的末端原生加速度数据，`tilt` 由末端姿态与重力方向几何推理得到。
 
 对左右臂的计算方式完全对称，以下以单臂为例写出公式，左臂取 $(\cdot)^L$，右臂取 $(\cdot)^R$。
 
@@ -118,9 +121,9 @@ $$
 
 | 量 | 定义 |
 |----|------|
-| $\mathbf{a}_t$ | EE 线加速度，差分估计：$\mathbf{a}_t = (\mathbf{v}_t - \mathbf{v}_{t-1}) / \Delta t$ |
-| $\boldsymbol{\alpha}_t$ | EE 角加速度，差分估计：$\boldsymbol{\alpha}_t = (\boldsymbol{\omega}_t - \boldsymbol{\omega}_{t-1}) / \Delta t$ |
-| $j_t$ | Jerk proxy：$j_t = \|\mathbf{a}_t - \mathbf{a}_{t-1}\| / \Delta t$ |
+| $\mathbf{a}_t$ | EE 线加速度，由环境层直接读取 Isaac Sim / Isaac Lab 原生刚体 / link 加速度接口 |
+| $\boldsymbol{\alpha}_t$ | EE 角加速度，由环境层直接读取 Isaac Sim / Isaac Lab 原生刚体 / link 加速度接口 |
+| $j_t$ | Jerk proxy，可由环境侧共享稳定性 proxy 基于连续两步加速度进一步构造 |
 | $\text{tilt}$ | 杯体倾斜度，见 §5.3 |
 
 ### 5.3 杯体倾斜度的几何推理
@@ -234,25 +237,17 @@ $$
 
 安全惩罚项**始终激活**，不受持杯状态影响。奖励函数不鼓励危险行为，无论手中是否持杯。
 
-### 6.1 无效碰撞惩罚
+当前任务是显式接触任务，末端与门板/把手发生接触属于完成任务的必要条件。因此安全项不再直接惩罚接触力，而只保留与设备保护和持杯安全直接相关的约束。需要特别区分：仿真执行前的力矩 clip 由 env / 仿真层负责，而“力矩超限惩罚”基于 policy 原始输出的控制力矩计算，用于惩罚超限控制意图。
 
-对未落在有效 affordance 区域内的碰撞给予惩罚，鼓励策略只在任务相关区域产生接触：
-
-$$
-r_{\text{collision}} = \beta_1 \cdot \sum_{\text{link} \notin \text{affordance}} f_{\text{link}}
-$$
-
-其中 $f_{\text{link}}$ 为该 link 受到的接触力大小。
-
-### 6.2 自碰撞惩罚
+### 6.1 自碰撞惩罚
 
 机器人任意两个 link 之间发生接触时给予固定惩罚：
 
 $$
-r_{\text{self}} = \beta_2 \cdot \mathbf{1}[\text{self-collision detected}]
+r_{\text{self}} = \beta_1 \cdot \mathbf{1}[\text{self-collision detected}]
 $$
 
-### 6.3 关节限位逼近惩罚
+### 6.2 关节限位逼近惩罚
 
 当关节角度逼近物理限位时施加递增惩罚，防止机构损伤。
 
@@ -266,12 +261,12 @@ $$
 设第 $i$ 关节的角度范围为 $[q_i^{\min}, q_i^{\max}]$，中心为 $q_i^c$，半范围为 $\delta_i = (q_i^{\max} - q_i^{\min}) / 2$，惩罚项的计算公式为：
 
 $$
-r_{\text{limit}} = \beta_3 \cdot \sum_{i=1}^{12} \max\!\left(0,\ \left| q_i - q_i^c \right| - \mu \cdot \delta_i \right)^2
+r_{\text{limit}} = \beta_2 \cdot \sum_{i=1}^{12} \max\!\left(0,\ \left| q_i - q_i^c \right| - \mu \cdot \delta_i \right)^2
 $$
 
 其中 $\mu \in (0, 1)$ 为触发比例（如 0.9，即偏移量超过允许半范围的 90% 时，才开始产生向上生长的二次幂惩罚）。
 
-### 6.4 关节速度过大惩罚
+### 6.3 关节速度过大惩罚
 
 与角度极限类似，防止过快运动超出关节减速器与电机的额定承载能力。
 
@@ -283,10 +278,29 @@ $$
 在运行时，系统通过物理引擎接口（如 `ArticulationView.get_dof_max_velocities()`）直接获取这组速度上限，并以此设置速度阈值 $v_{\text{thresh}}^{(i)}$ （通常取物理极限的一个安全系数比如 0.9）。
 
 $$
-r_{\text{vel}} = \beta_4 \cdot \sum_{i=1}^{12} \max\!\left(0,\ |\dot{q}_i| - \mu \cdot \dot{q}_i^{\max} \right)^2
+r_{\text{vel}} = \beta_3 \cdot \sum_{i=1}^{12} \max\!\left(0,\ |\dot{q}_i| - \mu \cdot \dot{q}_i^{\max} \right)^2
 $$
 
 超过该动态截断阈值的部分以平方惩罚，阈值内不惩罚。这样当更换其他具有不同传动比的机械臂配置时，无需修改训练超参。
+
+### 6.4 原始控制力矩超限惩罚
+
+设 policy 在当前步输出的原始控制力矩为 $\boldsymbol{\tau}^{\text{raw}}_t$，每个关节的力矩上限为 $\boldsymbol{\tau}^{\max}$。env 会在送入物理引擎前执行：
+
+$$
+\boldsymbol{\tau}^{\text{applied}}_t = \text{clip}\!\left(\boldsymbol{\tau}^{\text{raw}}_t,\; -\boldsymbol{\tau}^{\max},\; \boldsymbol{\tau}^{\max}\right)
+$$
+
+但安全检测不会使用 $\boldsymbol{\tau}^{\text{applied}}_t$ 掩盖超限行为，而是直接对原始输出中的超限部分施加惩罚：
+
+$$
+r_{\text{torque}} = \beta_4 \cdot \sum_{i=1}^{12} \max\!\left(0,\ |\tau^{\text{raw}}_i| - \tau^{\max}_i \right)^2
+$$
+
+这样可以同时满足两点：
+
+- 物理仿真始终安全，只执行 clip 后的力矩；
+- 策略如果持续输出越界力矩，仍会在奖励层受到明确惩罚。
 
 ### 6.5 杯体脱落惩罚
 
@@ -337,11 +351,13 @@ rewards 层从以下来源获取输入，自身不维护跨步状态：
 | 数据 | 来源 | 消费者 |
 |------|------|--------|
 | $\theta_t, \theta_{t-1}$，按钮/把手状态 | `envs/` 仿真 oracle | `task_reward.py` |
-| $\mathbf{a}_t, \boldsymbol{\alpha}_t, \text{tilt}$ | `actor_obs["left/right_stability_proxy"]` | `stability_reward.py` |
-| $m_L, m_R$ | `actor_obs["context"]` | `reward_manager.py` |
-| $\boldsymbol{\tau}_t, \boldsymbol{\tau}_{t-1}$ | `policy/` 策略输出（调用方传入） | `stability_reward.py` |
+| $\mathbf{a}_t, \boldsymbol{\alpha}_t, \text{tilt}$ | `envs/` 环境侧稳定性 proxy（基于 Isaac Sim / Isaac Lab 原生加速度 + 姿态） | `stability_reward.py` |
+| $m_L, m_R$ | `envs/` 持杯状态标记（`left_occupied` / `right_occupied`） | `reward_manager.py` |
+| $\boldsymbol{\tau}^{\text{raw}}_t$ | `policy/` 原始控制力矩输出（clip 前） | `safety_penalty.py` |
+| $\boldsymbol{\tau}^{\text{applied}}_t, \boldsymbol{\tau}^{\text{applied}}_{t-1}$ | `envs/` 裁剪后实际执行的力矩 | `stability_reward.py` |
+| $\boldsymbol{\tau}^{\max}$ | `envs/` 关节力矩上限（effort limits） | `safety_penalty.py` |
 | $\mathbf{q}, \dot{\mathbf{q}}$（双臂 12 维） | `envs/` 仿真 oracle | `safety_penalty.py` |
-| 接触事件、自碰撞标志 | `envs/` 仿真 `ContactMonitor` | `safety_penalty.py` |
+| 自碰撞标志、杯体脱落标志 | `envs/` 仿真 `ContactMonitor` | `safety_penalty.py` |
 | Episode Length | `envs/` 仿真计时器 | `reward_manager.py`（动态缩放） |
 
 注意：rewards 层消费仿真地面真值（不依赖 critic 的 privileged 信息），这是因为奖励计算在训练时由仿真环境直接调用，可以访问精确状态。
@@ -354,6 +370,7 @@ rewards 层从以下来源获取输入，自身不维护跨步状态：
 
 | 参数 | 含义 | 默认值 |
 |------|------|--------|
+| $\theta_{\text{reward\_success}}$ | success bonus 触发角度 | 1.2 rad |
 | $w_\delta$ | 角度增量基准奖励 | 8.0 |
 | $\alpha$ | 权重衰减下限比例 | 0.25 |
 | $k_{\text{decay}}$ | 超出目标角度后的衰减速率 | 2.0 |
@@ -372,26 +389,24 @@ rewards 层从以下来源获取输入，自身不维护跨步状态：
 | $w_{\text{tilt}}$ | 重力倾斜惩罚系数 | 5.0 |
 | $w_{\text{smooth}}$ | 力矩平滑惩罚系数 | 0.01 |
 | $w_{\text{reg}}$ | 力矩正则惩罚系数 | 0.001 |
-| $w_{\text{term}}$ | 终止惩罚 | 100.0 |
 
 ### 9.3 安全惩罚权重
 
 | 参数 | 含义 | 默认值 |
 |------|------|--------|
-| $\beta_1$ | 无效碰撞系数 | 0.5 |
-| $\beta_2$ | 自碰撞固定惩罚 | 1.0 |
-| $\beta_3$ | 关节限位系数 | 0.1 |
+| $\beta_1$ | 自碰撞固定惩罚 | 1.0 |
+| $\beta_2$ | 关节限位系数 | 0.1 |
 | $\mu$ | 关节限位触发比例 | 0.9 |
-| $\beta_4$ | 关节速度系数 | 0.01 |
-| $v_{\text{thresh}}$ | 速度惩罚阈值（rad/s） | 5.0 |
-| $\beta_5$ | gripper 冲击系数 | 0.5 |
+| $\beta_3$ | 关节速度系数 | 0.01 |
+| $\beta_4$ | 原始控制力矩超限系数 | 0.01 |
+| $w_{\text{drop}}$ | 杯体脱落惩罚 | 100.0 |
 
 ### 9.4 动态缩放参数 (全局退火)
 
 | 参数 | 符号 | 含义 | 默认值 |
 |------|------|------|--------|
 | 退火窗口期 | $N_{\text{anneal}}$ | 惩罚因子达到最大值所需的总训练步数 | $1.0 \times 10^7$ |
-| 初始惩罚基准 | $s_{\min}$ | 训练初期的最小惩罚乘数（探索期） | 0.05 |
+| 初始惩罚基准 | $s_{\min}$ | 训练初期的最小稳定性惩罚乘数（探索期） | 0.1 |
 | 峰值惩罚乘数 | $s_{\max}$ | 训练后期的最大惩罚乘数（收敛期） | 1.0 |
 
 ---
@@ -404,8 +419,9 @@ rewards 层从以下来源获取输入，自身不维护跨步状态：
 total_reward
 ├── task_progress
 │   ├── task/door_angle_delta
-│   ├── task/contact_bonus
-│   └── task/success_bonus
+│   ├── task/success_bonus
+│   ├── task/weight
+│   └── task/theta_t
 ├── stability_total
 │   ├── stability/left_zero_acc
 │   ├── stability/left_zero_ang_acc
@@ -419,12 +435,12 @@ total_reward
 │   ├── stability/right_tilt
 │   └── stability/torque_smooth + torque_reg   ← 双臂共用
 ├── safety_total
-│   ├── safety/invalid_collision
 │   ├── safety/self_collision
 │   ├── safety/joint_limit
 │   ├── safety/velocity
-│   └── safety/gripper_impact
-└── scaling/s_current                          ← 动态缩放因子当前值
+│   ├── safety/torque_over_limit
+│   └── safety/cup_drop
+└── scaling/s_t                               ← 动态缩放因子当前值
 ```
 
 分项日志使得每个子项的贡献在训练过程中可观测，便于诊断策略行为的偏差来源。

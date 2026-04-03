@@ -169,11 +169,11 @@ ppo:
 |---|---|---|---|
 | Stage 1 | push | 0% | 基础视觉引导接触 |
 | Stage 2 | push | 100% | 力控与稳定性约束 |
-| Stage 3 | push + pull | 50% | affordance 类型视觉区分 |
-| Stage 4 | handle | 50% | 时序子任务组合 |
-| Stage 5 | 全部 | 50% | 全域泛化 + 高强度域随机化 |
+| Stage 3 | push、pull | 50% | affordance 类型视觉区分 |
+| Stage 4 | handle_push、handle_pull | 50% | 时序子任务组合 |
+| Stage 5 | push、pull、handle_push、handle_pull | 50% | 全域泛化 + 高强度域随机化 |
 
-> 当前版本仅训练 push 门（Stage 1-2），后续阶段随任务复杂度逐步激活。
+> 当前版本仅训练 push 门（Stage 1-2），Stage 3–5 随环境能力扩展后逐步激活。
 
 ---
 

@@ -71,13 +71,13 @@ class RewardManager:
         torques: np.ndarray | None = None,
         prev_torques: np.ndarray | None = None,
         # 安全事件
-        contact_forces: dict[str, float] | None = None,
-        affordance_links: set[str] | None = None,
         self_collision: bool = False,
         joint_pos: np.ndarray | None = None,
         joint_vel: np.ndarray | None = None,
         joint_limits: np.ndarray | None = None,
         joint_vel_limits: np.ndarray | None = None,
+        policy_torques: np.ndarray | None = None,
+        torque_limits: np.ndarray | None = None,
         cup_dropped: bool = False,
     ) -> tuple[float, bool, dict[str, float]]:
         """执行一步完整的奖励计算。
@@ -113,8 +113,8 @@ class RewardManager:
         stab_bonus_l, stab_penalty_l = 0.0, 0.0
         if left_occupied and left_stability_proxy is not None:
             bonus_l, penalty_l, stab_info_l = compute_stability_reward(
-                lin_acc=left_stability_proxy["lin_acc"],
-                ang_acc=left_stability_proxy["ang_acc"],
+                lin_acc=left_stability_proxy["linear_acceleration"],
+                ang_acc=left_stability_proxy["angular_acceleration"],
                 tilt_xy=left_stability_proxy["tilt_xy"],
                 torques=torques[:6],
                 prev_torques=prev_torques[:6],
@@ -130,8 +130,8 @@ class RewardManager:
         stab_bonus_r, stab_penalty_r = 0.0, 0.0
         if right_occupied and right_stability_proxy is not None:
             bonus_r, penalty_r, stab_info_r = compute_stability_reward(
-                lin_acc=right_stability_proxy["lin_acc"],
-                ang_acc=right_stability_proxy["ang_acc"],
+                lin_acc=right_stability_proxy["linear_acceleration"],
+                ang_acc=right_stability_proxy["angular_acceleration"],
                 tilt_xy=right_stability_proxy["tilt_xy"],
                 torques=torques[6:],
                 prev_torques=prev_torques[6:],
@@ -155,13 +155,13 @@ class RewardManager:
 
         # ── 4. 安全惩罚 §6 ────────────────────────────────────────────
         r_safe, should_terminate, safe_info = compute_safety_penalty(
-            contact_forces=contact_forces or {},
-            affordance_links=affordance_links or set(),
             self_collision=self_collision,
             joint_pos=joint_pos if joint_pos is not None else np.zeros(12),
             joint_vel=joint_vel if joint_vel is not None else np.zeros(12),
             joint_limits=joint_limits if joint_limits is not None else np.zeros((12, 2)),
             joint_vel_limits=joint_vel_limits if joint_vel_limits is not None else np.ones(12),
+            policy_torques=policy_torques,
+            torque_limits=torque_limits,
             cup_dropped=cup_dropped,
             cfg=self._cfg_safe,
         )

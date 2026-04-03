@@ -21,6 +21,8 @@ from typing import Protocol, runtime_checkable, Any, Callable
 import torch
 import numpy as np
 
+from .episode_stats import compute_episode_outcome_stats
+
 
 # ═══════════════════════════════════════════════════════════════════
 # 环境接口协议
@@ -176,6 +178,7 @@ class RolloutCollector:
         # 统计
         total_rewards = 0.0
         completed_episodes = 0
+        successful_episodes = 0
         total_steps = 0
 
         for step in range(n_steps):
@@ -243,8 +246,13 @@ class RolloutCollector:
             current_critic_obs = next_critic_obs
 
             # 统计
+            outcome_stats = compute_episode_outcome_stats(
+                infos=infos,
+                dones=dones_np,
+            )
             total_rewards += rewards_np.sum()
-            completed_episodes += int(dones_np.sum())
+            completed_episodes += int(outcome_stats["collect/completed_episodes"])
+            successful_episodes += int(outcome_stats["collect/successful_episodes"])
             total_steps += n_envs
 
         # ── 计算最终 bootstrap value ─────────────────────────────
@@ -266,6 +274,10 @@ class RolloutCollector:
         collect_stats = {
             "collect/mean_reward": total_rewards / max(total_steps, 1),
             "collect/completed_episodes": float(completed_episodes),
+            "collect/successful_episodes": float(successful_episodes),
+            "collect/episode_success_rate": (
+                successful_episodes / max(completed_episodes, 1)
+            ),
             "collect/total_steps": float(total_steps),
         }
 

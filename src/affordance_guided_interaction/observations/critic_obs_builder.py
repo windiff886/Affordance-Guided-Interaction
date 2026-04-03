@@ -7,7 +7,7 @@ critic observation。
 critic_obs = {
     "actor_obs": { ... },          # 完整的双臂 actor_obs
     "privileged": {
-        # 精确物体状态（actor 只有 door_embedding，不知道门的精确位姿）
+        # 精确物体状态（actor 只有 z_aff，不知道门的精确位姿）
         "door_pose":          (7,),   # pos(3) + quat(4)
         "door_joint_pos":     (1,),
         "door_joint_vel":     (1,),
@@ -61,17 +61,17 @@ class CriticObsBuilder:
         actor_obs : dict
             完整的 actor observation（由 ``ActorObsBuilder.build()`` 返回）。
         door_pose : (7,) | None
-            门板 world pose：pos(3) + quat(4)。
+            门板相对 `base_link` 的 pose：pos(3) + quat(4)。
         door_joint_pos : float
             门铰链角度 (rad)。
         door_joint_vel : float
             门铰链角速度 (rad/s)。
         cup_pose : (7,) | None
-            杯体 world pose：pos(3) + quat(4)。
+            杯体相对 `base_link` 的 pose：pos(3) + quat(4)。
         cup_linear_vel : (3,) | None
-            杯体线速度。
+            杯体在 `base_link` 坐标系下的线速度。
         cup_angular_vel : (3,) | None
-            杯体角速度。
+            杯体在 `base_link` 坐标系下的角速度。
         cup_mass : float
             杯体质量 (kg)，通过随机化模拟不同装载量。
         door_mass : float

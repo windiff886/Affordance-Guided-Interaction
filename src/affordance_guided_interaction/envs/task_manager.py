@@ -3,7 +3,7 @@
 职责：
     每步接收当前物理状态，判断是否触发 episode 终止。
     终止条件三选一（互斥）：
-        1. 成功：门铰链角度达到目标 θ_d ≥ θ_target
+        1. 成功：门铰链角度达到终止阈值 θ_d ≥ θ_episode_success
         2. 失败：杯体脱落（由 ContactMonitor 检测到）
         3. 超时：步数达到上限 T_max
 """
@@ -58,14 +58,14 @@ class TaskManager:
     Parameters
     ----------
     door_angle_target : float
-        推门成功角度阈值（rad），默认 1.2 ≈ 69°。
+        episode 成功终止角度阈值（rad），默认 1.57 ≈ 90°。
     max_episode_steps : int
         单 episode 最大步数，默认 500。
     """
 
     def __init__(
         self,
-        door_angle_target: float = 1.2,
+        door_angle_target: float = 1.57,
         max_episode_steps: int = 500,
     ) -> None:
         self._door_angle_target = door_angle_target

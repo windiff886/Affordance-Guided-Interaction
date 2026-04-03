@@ -179,11 +179,13 @@ $$
 
 | 阶段 | 持杯概率 | 门类型 | 核心学习目标 |
 |------|----------|--------|------------|
-| **Stage 1** | $P(\text{occupied}) = 0$ | 单一 Push 门 | 基础视觉引导接触，跑通网络闭环 |
-| **Stage 2** | $P(\text{occupied}) = 1$ | 单一 Push 门 | 在稳定性约束 $r_{\text{stab}}$ 与 $s_t$ 下学会力控 |
-| **Stage 3** | $P(\text{occupied}) \sim \text{Bernoulli}(0.5)$ | Push + Press 混合 | 视觉区分 affordance 类型，调整接触策略 |
-| **Stage 4** | $P(\text{occupied}) \sim \text{Bernoulli}(0.5)$ | Button+Door, Handle+Door | 学习时序子任务组合（先按再推），依靠 RNN 跨越 reward delay |
-| **Stage 5** | $P(\text{occupied}) \sim \text{Bernoulli}(p)$ | 全类型混合 | 高强度域随机化下的全域泛化 |
+| **Stage 1** | $P(\text{occupied}) = 0$ | push | 基础视觉引导接触，跑通网络闭环 |
+| **Stage 2** | $P(\text{occupied}) = 1$ | push | 在稳定性约束 $r_{\text{stab}}$ 与 $s_t$ 下学会力控 |
+| **Stage 3** | $P(\text{occupied}) \sim \text{Bernoulli}(0.5)$ | push、pull | 视觉区分 affordance 类型，调整接触策略 |
+| **Stage 4** | $P(\text{occupied}) \sim \text{Bernoulli}(0.5)$ | handle_push、handle_pull | 学习时序子任务组合，依靠 RNN 跨越 reward delay |
+| **Stage 5** | $P(\text{occupied}) \sim \text{Bernoulli}(0.5)$ | push、pull、handle_push、handle_pull | 高强度域随机化下的全域泛化 |
+
+> **当前环境仅支持 push 门（Stage 1–2），Stage 3–5 随环境能力扩展后逐步激活。**
 
 ### 4.3 跃迁条件的数学判据
 
@@ -316,8 +318,8 @@ $$
 
 | 参数 | 含义 | 默认值 |
 |------|------|--------|
-| $N_{\text{env}}$ | 并行环境数量 | 1024 |
-| $T$ | 每轮收集的步数 | 24 |
+| $N_{\text{env}}$ | 并行环境数量 | 64 |
+| $T$ | 每轮收集的步数 | 128 |
 | $L$ | TBPTT 截断长度 | 16 |
 
 ### 7.3 课程学习参数

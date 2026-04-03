@@ -19,7 +19,7 @@ from .actor import (
     ActorConfig,
     flatten_actor_obs,
     NUM_JOINTS_PER_ARM,
-    DOOR_EMBEDDING_DIM,
+    Z_AFF_DIM,
     _DUAL_EE_DIM,
     _CONTEXT_DIM,
 )
@@ -149,7 +149,7 @@ class Critic(nn.Module):
         self.proprio_encoder = _build_branch_encoder(proprio_in, ac.proprio_hidden, ac.proprio_out)
         self.ee_encoder = _build_branch_encoder(_DUAL_EE_DIM, ac.ee_hidden, ac.ee_out)
         self.stab_encoder = _build_branch_encoder(stab_in, ac.stab_hidden, ac.stab_out)
-        self.vis_encoder = _build_branch_encoder(DOOR_EMBEDDING_DIM, ac.vis_hidden, ac.vis_out)
+        self.vis_encoder = _build_branch_encoder(Z_AFF_DIM, ac.vis_hidden, ac.vis_out)
 
         actor_concat_dim = ac.proprio_out + ac.ee_out + _CONTEXT_DIM + ac.stab_out + ac.vis_out
 

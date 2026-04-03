@@ -11,7 +11,7 @@
       ├── gripper    → MLP → f_ee
       ├── context    → 直接拼接
       ├── stability  → MLP → f_stab
-      └── door_emb   → MLP → f_vis
+      └── z_aff      → MLP → f_vis
               ↓ concat
       RecurrentBackbone (GRU / LSTM)
               ↓
@@ -39,7 +39,7 @@ from .action_head import ActionHead
 
 NUM_JOINTS_PER_ARM = 6
 TOTAL_ARM_JOINTS = NUM_JOINTS_PER_ARM * 2  # 12
-DOOR_EMBEDDING_DIM = 768
+Z_AFF_DIM = 768
 
 # 每条臂的 gripper 状态维度: pos(3) + quat(4) + lin_vel(3) + ang_vel(3) = 13
 _SINGLE_EE_DIM = 13
@@ -119,7 +119,7 @@ def flatten_actor_obs(obs: dict, cfg: ActorConfig) -> dict[str, torch.Tensor]:
     - ``"ee"``      — 左右臂 gripper 状态拼接
     - ``"context"`` — left_occ + right_occ
     - ``"stability"`` — 左右臂稳定性 proxy 拼接
-    - ``"visual"``  — door_embedding
+    - ``"visual"``  — z_aff
 
     Parameters
     ----------
@@ -190,7 +190,7 @@ def flatten_actor_obs(obs: dict, cfg: ActorConfig) -> dict[str, torch.Tensor]:
 
     # -- visual --
     vis_vec = torch.from_numpy(
-        np.asarray(obs["door_embedding"]).ravel()
+        np.asarray(obs["z_aff"]).ravel()
     ).float()
 
     return {
@@ -253,7 +253,7 @@ class Actor(nn.Module):
         self.proprio_encoder = _build_branch_encoder(proprio_in, c.proprio_hidden, c.proprio_out)
         self.ee_encoder = _build_branch_encoder(_DUAL_EE_DIM, c.ee_hidden, c.ee_out)
         self.stab_encoder = _build_branch_encoder(stab_in, c.stab_hidden, c.stab_out)
-        self.vis_encoder = _build_branch_encoder(DOOR_EMBEDDING_DIM, c.vis_hidden, c.vis_out)
+        self.vis_encoder = _build_branch_encoder(Z_AFF_DIM, c.vis_hidden, c.vis_out)
 
         # -- 汇总维度 --
         concat_dim = c.proprio_out + c.ee_out + _CONTEXT_DIM + c.stab_out + c.vis_out

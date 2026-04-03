@@ -1,11 +1,10 @@
-"""端到端 Affordance 管线：RGB-D -> Point-MAE Embedding + z_prog。
+"""端到端 Affordance 管线：RGB-D -> Point-MAE Embedding。
 
 核心流程：
     1. LangSAM / Grounded-SAM 2 开集分割 → 门/把手/按钮 mask
     2. 深度反投影 → 局部点云
     3. Voxel 降采样 + 点数对齐
     4. Point-MAE 冻结编码器 → 高维 embedding (z_aff)
-    5. 仿真状态 → 任务进展向量 (z_prog)
 
 管线不进行任何手工几何特征提取（无 RANSAC、无包围盒、无距离计算）。
 """
@@ -45,7 +44,7 @@ _PROMPT_TO_KEY: dict[str, str] = {
 
 
 class AffordancePipeline:
-    """端到端 Affordance 管线：RGB-D → (z_aff embedding, z_prog dict)。
+    """端到端 Affordance 管线：RGB-D → z_aff embedding。
 
     管线不关心夹爪具体坐标，不计算几何距离特征，
     所有空间关系由下游 Policy 隐式学习。
@@ -55,9 +54,6 @@ class AffordancePipeline:
     * ``rgb`` : np.ndarray (H, W, 3) uint8
     * ``depth`` : np.ndarray (H, W) float，单位：米
     * ``extrinsic`` : np.ndarray (4, 4) 相机到世界变换（可选）
-    * ``door_angle`` : float  (可选，用于 z_prog)
-    * ``button_pressed`` : bool (可选，用于 z_prog)
-    * ``handle_triggered`` : bool (可选，用于 z_prog)
     """
 
     def __init__(self, config: AffordancePipelineConfig | None = None) -> None:
@@ -73,23 +69,21 @@ class AffordancePipeline:
         self,
         *,
         observation: dict[str, Any],
-        task_goal: str,
-    ) -> tuple[np.ndarray, dict[str, Any]]:
-        """执行完整管线，返回 (z_aff_embedding, z_prog_dict)。
+        task_goal: str | None = None,
+    ) -> np.ndarray:
+        """执行完整管线，返回 z_aff_embedding。
 
         Parameters
         ----------
         observation : dict
             包含 rgb, depth 等键值的观测字典。
-        task_goal : str
-            当前任务目标（如 "push", "press", "handle"）。
+        task_goal : str | None
+            兼容参数。当前版本不再输出 z_prog，故该参数不会参与计算。
 
         Returns
         -------
         z_aff : np.ndarray
             (embed_dim,) Point-MAE 输出的高维 embedding 向量。
-        z_prog : dict[str, Any]
-            任务进展信息，包含 "vector" 键。
         """
         rgb: np.ndarray = observation["rgb"]
         depth: np.ndarray = observation["depth"]
@@ -128,10 +122,7 @@ class AffordancePipeline:
         # --- 4. Point-MAE 编码 → z_aff ---
         z_aff = self._encoder.encode(aligned_points)
 
-        # --- 5. 任务进展 → z_prog ---
-        z_prog = self._build_z_prog(observation, task_goal)
-
-        return z_aff, z_prog
+        return z_aff
 
     # ------------------------------------------------------------------
     # 内部辅助
@@ -149,40 +140,3 @@ class AffordancePipeline:
             if key not in masks or r.confidence > 0:
                 masks[key] = r.mask
         return masks
-
-    @staticmethod
-    def _build_z_prog(
-        observation: dict[str, Any],
-        task_goal: str,
-    ) -> dict[str, Any]:
-        """从仿真状态构造任务进展表示。
-
-        当前版本直接使用 simulator 提供的特权状态信息。
-        """
-        door_angle = float(observation.get("door_angle", 0.0))
-        button_pressed = float(observation.get("button_pressed", False))
-        handle_triggered = float(observation.get("handle_triggered", False))
-
-        # 归一化进度标量（基于启发式规则）
-        goal = task_goal.lower()
-        if goal in ("push", "handle"):
-            progress = min(door_angle / 1.57, 1.0)  # ~90 度
-        elif goal == "press":
-            progress = button_pressed
-        elif goal == "sequential":
-            progress = 0.5 * button_pressed + 0.5 * min(door_angle / 1.57, 1.0)
-        else:
-            progress = 0.0
-
-        z_prog_vec = np.array(
-            [door_angle, button_pressed, handle_triggered, progress],
-            dtype=np.float64,
-        )
-
-        return {
-            "vector": z_prog_vec,
-            "door_angle": door_angle,
-            "button_pressed": button_pressed,
-            "handle_triggered": handle_triggered,
-            "progress": progress,
-        }

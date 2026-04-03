@@ -78,7 +78,7 @@ def build_env_config(cfg: dict) -> "EnvConfig":
         physics_dt=env_cfg.get("physics_dt", 1.0 / 120.0),
         decimation=env_cfg.get("decimation", 2),
         max_episode_steps=env_cfg.get("max_episode_steps", 500),
-        door_angle_target=task_cfg.get("door_angle_target", 1.2),
+        door_angle_target=task_cfg.get("door_angle_target", 1.57),
         cup_drop_threshold=task_cfg.get("cup_drop_threshold", 0.15),
         contact_force_threshold=env_cfg.get("contact_force_threshold", 0.1),
         joints_per_arm=env_cfg.get("joints_per_arm", 6),
@@ -341,6 +341,9 @@ def main() -> int:
 
     # ── 课程管理器 ────────────────────────────────────────────
     from affordance_guided_interaction.training.curriculum_manager import CurriculumManager
+    from affordance_guided_interaction.training.episode_stats import (
+        extract_curriculum_success_rate,
+    )
     cur_cfg = cfg.get("curriculum", {})
     curriculum = CurriculumManager(
         window_size=cur_cfg.get("window_size", 50),
@@ -446,10 +449,11 @@ def main() -> int:
             # ── Step 6: 课程管理器跃迁判定 ─────────────────────
             mean_reward = collect_stats.get("collect/mean_reward", 0.0)
             completed_eps = collect_stats.get("collect/completed_episodes", 0.0)
+            successful_eps = collect_stats.get("collect/successful_episodes", 0.0)
+            epoch_success_rate = extract_curriculum_success_rate(collect_stats)
 
-            # 用完成的 episode 数归一化为近似成功率
-            approx_success_rate = min(mean_reward, 1.0)
-            stage_changed = curriculum.report_epoch(approx_success_rate)
+            best_success_rate = max(best_success_rate, epoch_success_rate)
+            stage_changed = curriculum.report_epoch(epoch_success_rate)
 
             if stage_changed:
                 new_stage_cfg = curriculum.get_stage_config()
@@ -482,6 +486,7 @@ def main() -> int:
                     f"ent={update_metrics['entropy']:>7.4f} | "
                     f"clip={update_metrics['clip_fraction']:>5.3f} | "
                     f"r̄={mean_reward:>.4f} | "
+                    f"succ={epoch_success_rate:>5.3f} | "
                     f"stage={curriculum.current_stage} | "
                     f"ETA={eta_h:.1f}h"
                 )
@@ -497,6 +502,8 @@ def main() -> int:
                 writer.add_scalar("train/fps", fps, global_steps)
                 writer.add_scalar("collect/mean_reward", mean_reward, global_steps)
                 writer.add_scalar("collect/completed_episodes", completed_eps, global_steps)
+                writer.add_scalar("collect/successful_episodes", successful_eps, global_steps)
+                writer.add_scalar("collect/episode_success_rate", epoch_success_rate, global_steps)
                 writer.add_scalar("curriculum/stage", curriculum.current_stage, global_steps)
                 writer.add_scalar("curriculum/window_mean", curriculum.window_mean, global_steps)
 

@@ -37,8 +37,8 @@ class EnvConfig:
     max_episode_steps: int = 500
 
     # ── 任务判定参数 ──────────────────────────────────────────────────
-    # 推门成功角度阈值（rad）
-    door_angle_target: float = 1.2
+    # episode 成功终止角度阈值（rad）
+    door_angle_target: float = 1.57
     # 杯体脱落检测距离（m）
     cup_drop_threshold: float = 0.15
 
@@ -78,11 +78,11 @@ class EnvConfig:
             "w_reg": 0.01,
         },
         "safety": {
-            "beta_collision": 0.01,
             "beta_self": 5.0,
             "beta_limit": 1.0,
             "mu": 0.1,
             "beta_vel": 0.5,
+            "beta_torque": 0.01,
             "w_drop": 100.0,
         },
         "scaling": {

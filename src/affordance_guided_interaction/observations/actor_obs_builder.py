@@ -3,8 +3,8 @@
 双臂平台（左臂 Z1 + 右臂 Z1）actor observation 结构（参见 README.md §4）：
 
 持杯是 episode 开始时随机确定的事件，左右臂均可能持杯，故左右臂状态
-对称提供，各维护独立的稳定性 proxy，通过 left_occupied / right_occupied
-区分当前持杯情况。
+对称提供。稳定性 proxy 由环境层统一构建后传入 observations 层，
+通过 left_occupied / right_occupied 区分当前持杯情况。
 
 ```
 actor_obs = {
@@ -35,7 +35,7 @@ actor_obs = {
     },
     "left_stability_proxy":  { ... },         # 左臂末端稳定性指标
     "right_stability_proxy": { ... },         # 右臂末端稳定性指标
-    "door_embedding":          (768,),        # 冻结 Point-MAE 对门点云的编码
+    "z_aff":                   (768,),        # 冻结 Point-MAE 对门点云的编码
 }
 ```
 
@@ -47,58 +47,40 @@ from __future__ import annotations
 import numpy as np
 
 from .history_buffer import HistoryBuffer
-from .stability_proxy import (
-    StabilityProxy,
-    StabilityProxyState,
-    estimate_stability_proxy,
-)
-
 # 每条 Z1 机械臂的关节数
 NUM_JOINTS_PER_ARM = 6
 # 双臂总关节数（左臂 + 右臂）
 TOTAL_ARM_JOINTS = NUM_JOINTS_PER_ARM * 2
 
 # Point-MAE 编码器输出维度（2 × trans_dim = 2 × 384）
-DOOR_EMBEDDING_DIM = 768
+Z_AFF_DIM = 768
 
 
 class ActorObsBuilder:
     """有状态的 actor observation 构建器（双臂平台）。
 
     持杯是随机事件，左右臂均可能持杯，因此左右臂状态对称提供，
-    各维护独立的稳定性 proxy 差分状态。
+    使用环境侧共享的稳定性 proxy。
 
-    在 episode 生命周期内维护：
+    在 episode 生命周期内仅维护动作历史缓存：
 
     * 动作历史缓存 (``HistoryBuffer``)，动作维度为 ``TOTAL_ARM_JOINTS`` (12)
-    * 左臂稳定性 proxy 差分状态 (``StabilityProxyState``)
-    * 右臂稳定性 proxy 差分状态 (``StabilityProxyState``)
 
     Parameters
     ----------
     action_history_length : int
         保留最近多少步动作，默认 3。
-    acc_history_length : int
-        稳定性 proxy 中加速度历史窗口长度，默认 10。
-    dt : float
-        仿真步长（秒），默认 1/60。
     """
 
     def __init__(
         self,
         *,
         action_history_length: int = 3,
-        acc_history_length: int = 10,
-        dt: float = 1.0 / 60.0,
     ) -> None:
         self._action_history_length = action_history_length
-        self._acc_history_length = acc_history_length
-        self._dt = dt
 
         # 内部状态 —— 在 reset() 中初始化
         self._action_buffer: HistoryBuffer[np.ndarray] | None = None
-        self._left_stability_state: StabilityProxyState | None = None
-        self._right_stability_state: StabilityProxyState | None = None
         self.reset()
 
     # ------------------------------------------------------------------
@@ -111,8 +93,6 @@ class ActorObsBuilder:
         self._action_buffer = HistoryBuffer(
             self._action_history_length, fill_value=zero_action
         )
-        self._left_stability_state = StabilityProxyState()
-        self._right_stability_state = StabilityProxyState()
 
     # ------------------------------------------------------------------
     # 每步构建
@@ -131,13 +111,15 @@ class ActorObsBuilder:
         left_ee_orientation: np.ndarray,
         left_ee_linear_velocity: np.ndarray,
         left_ee_angular_velocity: np.ndarray,
+        left_stability_proxy: dict,
         right_ee_position: np.ndarray,
         right_ee_orientation: np.ndarray,
         right_ee_linear_velocity: np.ndarray,
         right_ee_angular_velocity: np.ndarray,
+        right_stability_proxy: dict,
         left_occupied: float,
         right_occupied: float,
-        door_embedding: np.ndarray | None = None,
+        z_aff: np.ndarray | None = None,
         action_taken: np.ndarray | None = None,
     ) -> dict:
         """构建单步 actor observation（双臂平台）。
@@ -172,11 +154,15 @@ class ActorObsBuilder:
             右臂 gripper 在基坐标系下的线速度。
         right_ee_angular_velocity : (3,)
             右臂 gripper 在基坐标系下的角速度。
+        left_stability_proxy : dict
+            由环境层统一生成的左臂稳定性 proxy。
+        right_stability_proxy : dict
+            由环境层统一生成的右臂稳定性 proxy。
         left_occupied : float
             左臂是否持杯：0.0 = 空闲, 1.0 = 持杯。
         right_occupied : float
             右臂是否持杯：0.0 = 空闲, 1.0 = 持杯。
-        door_embedding : (768,) | None
+        z_aff : (768,) | None
             来自 door_perception/ 的冻结 Point-MAE 编码结果。
             None 时填充零向量。
         action_taken : (12,) | None
@@ -190,8 +176,6 @@ class ActorObsBuilder:
             完整的 actor observation 字典。
         """
         assert self._action_buffer is not None
-        assert self._left_stability_state is not None
-        assert self._right_stability_state is not None
 
         # 记录动作
         if action_taken is not None:
@@ -232,38 +216,32 @@ class ActorObsBuilder:
             "right_occupied": np.array([right_occupied], dtype=np.float64),
         }
 
-        # -- 左臂稳定性 proxy（独立差分状态）--
-        left_proxy: StabilityProxy = estimate_stability_proxy(
-            quat_ee=np.asarray(left_ee_orientation, dtype=np.float64),
-            linear_velocity=np.asarray(left_ee_linear_velocity, dtype=np.float64),
-            angular_velocity=np.asarray(left_ee_angular_velocity, dtype=np.float64),
-            dt=self._dt,
-            state=self._left_stability_state,
-            acc_history_length=self._acc_history_length,
-        )
-
-        # -- 右臂稳定性 proxy（独立差分状态）--
-        right_proxy: StabilityProxy = estimate_stability_proxy(
-            quat_ee=np.asarray(right_ee_orientation, dtype=np.float64),
-            linear_velocity=np.asarray(right_ee_linear_velocity, dtype=np.float64),
-            angular_velocity=np.asarray(right_ee_angular_velocity, dtype=np.float64),
-            dt=self._dt,
-            state=self._right_stability_state,
-            acc_history_length=self._acc_history_length,
-        )
-
-        # -- door_embedding（冻结 Point-MAE 编码，来自 door_perception/）--
-        if door_embedding is not None:
-            emb = np.asarray(door_embedding, dtype=np.float64)
+        # -- z_aff（冻结 Point-MAE 编码，来自 door_perception/）--
+        if z_aff is not None:
+            emb = np.asarray(z_aff, dtype=np.float64)
         else:
-            emb = np.zeros(DOOR_EMBEDDING_DIM, dtype=np.float64)
+            emb = np.zeros(Z_AFF_DIM, dtype=np.float64)
 
         return {
             "proprio": proprio,
             "left_gripper_state": left_gripper_state,
             "right_gripper_state": right_gripper_state,
             "context": context,
-            "left_stability_proxy": left_proxy.to_dict(),
-            "right_stability_proxy": right_proxy.to_dict(),
-            "door_embedding": emb,
+            "left_stability_proxy": _normalize_stability_proxy(left_stability_proxy),
+            "right_stability_proxy": _normalize_stability_proxy(right_stability_proxy),
+            "z_aff": emb,
         }
+
+
+def _normalize_stability_proxy(proxy: dict) -> dict:
+    """将环境侧稳定性 proxy 规范化为 observations 使用的 numpy 字典。"""
+    return {
+        "tilt": float(proxy["tilt"]),
+        "tilt_xy": np.asarray(proxy["tilt_xy"], dtype=np.float64),
+        "linear_velocity_norm": float(proxy["linear_velocity_norm"]),
+        "linear_acceleration": np.asarray(proxy["linear_acceleration"], dtype=np.float64),
+        "angular_velocity_norm": float(proxy["angular_velocity_norm"]),
+        "angular_acceleration": np.asarray(proxy["angular_acceleration"], dtype=np.float64),
+        "jerk_proxy": float(proxy["jerk_proxy"]),
+        "recent_acc_history": np.asarray(proxy["recent_acc_history"], dtype=np.float64),
+    }

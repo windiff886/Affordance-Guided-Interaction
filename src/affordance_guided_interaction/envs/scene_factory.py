@@ -109,6 +109,7 @@ class SceneHandles:
     arm_joint_indices: Any = None  # Tensor 或 None
 
     # 末端执行器 body 索引
+    base_body_idx: int = -1
     left_ee_body_idx: int = -1
     right_ee_body_idx: int = -1
 
@@ -144,6 +145,7 @@ class SceneFactory:
         self._scene_built: bool = False
 
         # 末端执行器 link 名称（与 URDF 中定义一致）
+        self._base_link = "base_link"
         self._left_ee_link = "left_gripper_link"
         self._right_ee_link = "right_gripper_link"
 
@@ -246,9 +248,12 @@ class SceneFactory:
         handles.arm_joint_indices = joint_indices
 
         # 解析末端执行器 body 索引
+        base_indices, _ = robot.find_bodies([self._base_link])
         left_ee_indices, _ = robot.find_bodies([self._left_ee_link])
         right_ee_indices, _ = robot.find_bodies([self._right_ee_link])
 
+        if base_indices is not None and len(base_indices) > 0:
+            handles.base_body_idx = int(base_indices[0])
         if left_ee_indices is not None and len(left_ee_indices) > 0:
             handles.left_ee_body_idx = int(left_ee_indices[0])
         if right_ee_indices is not None and len(right_ee_indices) > 0:

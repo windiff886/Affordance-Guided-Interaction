@@ -6,7 +6,7 @@
  door_perception/ (Frozen Point-MAE)       observations/ (actor_obs / critic_obs)
         │                                         │
         ▼                                         ▼
-  门点云特征 (door_embedding)                  双臂状态与稳定性 proxy
+  门点云特征 (z_aff)                           双臂状态与稳定性 proxy
         │                                         │
         └────────────────────┬────────────────────┘
                              ▼
@@ -24,7 +24,7 @@
                      仿真执行层 (envs/)
 ```
 
-policy 层是整个框架的决策核心。它接收来自 `door_perception/` 的环境高维视觉 affordance 特征，并结合 `observations/` 输出的双臂物理状态，在持杯等身体约束存在的情况下，学习如何完成门相关的交互任务（door-related interaction）。
+policy 层是整个框架的决策核心。它接收来自 `door_perception/` 的高维视觉 affordance latent `z_aff`，并结合 `observations/` 输出的双臂物理状态，在持杯等身体约束存在的情况下，学习如何完成门相关的交互任务（door-related interaction）。
 
 **本层不做的事情**：
 - 不处理原始图像或原始点云，视觉降维工作全部交由上游冻结编码器完成。
@@ -46,7 +46,7 @@ $$a_t = \pi_\theta(o_t,\; h_t,\; c_t,\; z_{\text{aff}, t})$$
 | $o_t$ | 当前机器人本体观测，包括双臂关节状态、双臂末端位姿与速度，以及双臂独立的稳定性 proxy。 |
 | $h_t$ | 循环网络隐状态（GRU / LSTM cell），用于隐式编码历史交互信息并辨识隐藏物理参数。 |
 | $c_t$ | 任务上下文，包括左/右臂的 `occupied` 标志。 |
-| $z_{\text{aff}, t}$ | 统一视觉 affordance 表征，即当前帧门点云对应的 `door_embedding` $(768,)$。 |
+| $z_{\text{aff}, t}$ | 统一视觉 affordance 表征，即当前帧门点云对应的 `z_aff` $(768,)$。 |
 | $a_t$ | 输出动作：双臂总计 12 维的关节力矩向量 $\tau \in \mathbb{R}^{12}$。 |
 
 策略依然采用 **PPO + recurrent actor**。使用循环层（RNN）的核心目的是：使策略在随机化的仿真环境中，通过局部交互反馈潜移默化地推断出当前的重量、阻尼等环境特征。
@@ -64,7 +64,7 @@ actor_obs
   ├── gripper_states (左/右臂位姿、速度)            → MLP encoder → f_ee
   ├── context (left/right_occupied, stability)   → 直接拼接
   ├── stability_proxies (左/右臂 acc, tilt...)      → MLP encoder → f_stab
-  └── door_embedding (768维冻结特征)               → MLP encoder → f_vis
+  └── z_aff (768维冻结特征)                        → MLP encoder → f_vis
                                                         │
                       ┌─────────────────────────────────┘
                       │  concat([f_proprio, f_ee, context, f_stab, f_vis])
@@ -95,9 +95,10 @@ actor_obs
 - **不包含任何循环结构**，直接通过 MLP 拟合状态价值 $V(s)$。
 - 凭借 privileged information 提供的精确杯具状态与门铰链参数，能在训练时提供更准的梯度方向。
 
-#### `action_head.py` — 动作映射与裁剪
+#### `action_head.py` — 动作映射
 - 将高斯特征解码为物理需要的 **12 维关节力矩**（左臂 6 维 + 右臂 6 维）。
-- 执行力矩截断操作（clip），防范越界力矩撕裂物理仿真。
+- 只输出 policy 的**原始控制力矩**，不在 policy 层执行 clip。
+- 力矩裁剪由 env / 仿真层在执行前完成；若原始输出超限，则安全检测会基于 policy 原始力矩施加超限惩罚。
 
 ---
 
@@ -105,7 +106,7 @@ actor_obs
 
 在 v5 版本中，为了解耦视觉特征抽取与强化学习训练，Policy 层将点云处理逻辑剥离至 `door_perception/` 模块。
 
-- **输入形式**：当前 `actor_obs["door_embedding"]` 是一条大小为 $(768,)$ 的一维向量。
+- **输入形式**：当前 `actor_obs["z_aff"]` 是一条大小为 $(768,)$ 的一维向量。
 - **上游来源**：该特征由 `frozen_encoder.py` 中冻结权重的 Point-MAE 推理得出，融合了 mean_pooling 和 max_pooling 以涵盖全局与局部空间语义。
 - **优势**：消除了训练初期因视觉表征不稳定导致的梯度爆炸问题，且不再需要昂贵的在线点卷积运算。
 
@@ -119,6 +120,11 @@ actor_obs
 - 它天生适合解决与环境频繁发生碰撞和物理摩擦的任务。
 - 难以准确预估门推力时，力矩控制允许机器人呈现柔顺接触。
 - 配合我们施加的力矩平滑度正则化惩罚项，能够更好地避免持杯臂产生破坏稳定性的突变冲击力。
+
+补充约定：
+- `policy` 输出的是 raw torque command。
+- `envs/door_env.py` 在送入物理引擎前执行 `clip(raw_action, -effort_limit, effort_limit)`。
+- 安全项中的“力矩超限惩罚”使用 raw torque 与力矩上限比较，因此 clip 不会抹掉策略的超限意图。
 
 ---
 

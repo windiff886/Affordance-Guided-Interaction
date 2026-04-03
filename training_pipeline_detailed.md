@@ -171,8 +171,8 @@ critic = Critic(critic_cfg)          # 非对称 MLP
 buffer = RolloutBuffer(
     n_envs=N, n_steps=T,
     actor_branch_dims={"proprio": 60, "ee": 26, "context": 2,
-                       "stability": 24, "visual": 768},
-    privileged_dim=30, action_dim=12,
+                       "stability": 40, "visual": 768},
+    privileged_dim=28, action_dim=12,
     rnn_hidden_dim=512, rnn_num_layers=1,
 )
 collector = RolloutCollector(actor, critic, buffer,
@@ -373,8 +373,8 @@ critic_obs = {
 | `proprio` | 关节状态 + 历史动作 | ~60 |
 | `ee` | 左右末端位姿与速度 | ~26 |
 | `context` | occupied 标志 | 2 |
-| `stability` | 左右稳定性代理 | ~24 |
-| `visual` | door_embedding | 768 |
+| `stability` | 左右稳定性代理 | 40 |
+| `visual` | z_aff | 768 |
 
 ---
 

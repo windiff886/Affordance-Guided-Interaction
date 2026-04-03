@@ -220,7 +220,6 @@ total_reward =
   r_task_progress
 + m_occ * lambda_stab * r_carry_stability
 + r_effective_contact
-- r_invalid_collision
 - r_self_collision
 - r_joint_limit
 - r_torque_penalty
@@ -434,7 +433,6 @@ reward_info = {
   "task_progress": ...,
   "carry_stability": ...,
   "effective_contact": ...,
-  "invalid_collision": ...,
   "safety_penalty": ...,
   "total_reward": ...
 }

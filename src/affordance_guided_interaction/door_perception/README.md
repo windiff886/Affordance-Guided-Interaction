@@ -1,6 +1,6 @@
 # Door Perception Pipeline
 
-从单帧 RGB-D 中提取门相关点云，并通过**开箱即用、完全冻结的视觉点云编码器（Vision Encoder）**，直接将其编码为 policy 可用的高维 affordance embedding（`z_aff`）。
+从单帧 RGB-D 中提取门相关点云，并通过**开箱即用、完全冻结的视觉点云编码器（Vision Encoder）**，直接将其编码为 policy 可用的高维 affordance latent（`z_aff`）。
 全流程严格坚持**现成预训练大模型直出，绝对不包含任何训练感知/分割模型的步骤**。
 
 ## 管线概览 (端到端新范式)
@@ -21,7 +21,7 @@ RGB-D + task_goal
   │     输出高维的深层语义 Embeddings
   │
   └─ 4. 传输给下游 Policy
-        Embeddings 拼接任务进展 (z_prog) 等上下文 -> 进入控制策略网络
+        Embeddings 作为 `z_aff` 进入控制策略网络
 ```
 
 ## 为什么要砍掉过往的手工几何特征？
@@ -63,30 +63,26 @@ observation = {
     "rgb": rgb_image,           # (H, W, 3) uint8
     "depth": depth_map,         # (H, W) float, metres
     # ... 其余信息留给低层 Policy 处理，Pipeline 内不主动关心夹爪具体坐标距离 ...
-    
-    # 仿真状态留作判断任务进展 (z_prog)
-    "door_angle": 0.0,
-    "button_pressed": False,
-    "handle_triggered": False,
 }
 
 # 真正的一步直出：SAM 开集分割 -> 局部点云化 -> 预训练 3D 网络推理 -> 输出 Embeddings
-z_aff_embedding, z_prog_dict = pipeline.encode(observation=observation, task_goal="push")
+z_aff_embedding = pipeline.encode(observation=observation, task_goal="push")
 
 # Policy 将直接接收这份深维隐含特征
-z_aff_feature = z_aff_embedding  # 比如 (512,) 维度的 torch tensor
+z_aff_feature = z_aff_embedding  # 比如 (768,) 维度的 torch tensor
 ```
 
-## z_prog 任务进展特征 (保留)
+## 接口边界：`z_prog` 不属于本模块
 
-无论视觉端多高级，我们仍需极简的外部逻辑来反馈任务的“物理进展”以作为关键上下文：
+按当前确认的目标架构，`door_perception` 只负责输出门相关视觉 affordance 表征，不负责输出任务进展向量。
 
-| 索引 | 字段 | 说明 |
-|------|------|------|
-| 0 | `door_angle` | 门当前真实开合角度 (rad) |
-| 1 | `button_pressed` | 按钮是否被按下 (0/1) |
-| 2 | `handle_triggered` | 把手是否被触发 (0/1) |
-| 3 | `progress` | 对任务总目标的完成度 [0, 1] |
+这意味着：
+
+1. 对外目标接口只保留 `z_aff`
+2. `door_angle`、`button_pressed`、`handle_triggered`、`progress` 等任务进展量不属于 perception 职责
+3. 若系统仍需要任务进展信号，应由 `envs/`、`task_manager.py` 或 `rewards/` 等非感知层维护
+
+说明：若在历史分支或旧文档中看到 `z_prog`，应将其视为已废弃的历史残留，而不是本 README 定义的目标接口。
 
 ## 外部依赖标准
 
