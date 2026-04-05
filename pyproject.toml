@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68", "setuptools-scm"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "affordance-guided-interaction"
+version = "0.1.0"
+description = "Affordance-guided bimanual door interaction with stability-aware RL"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+
+dependencies = [
+    "numpy>=1.24",
+    "torch>=2.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+train = [
+    "tensorboard>=2.14",
+]
+export = [
+    "onnx>=1.14",
+    "onnxruntime>=1.16",
+]
+viz = [
+    "imageio[ffmpeg]>=2.31",
+]
+dev = [
+    "pytest>=7.4",
+    "affordance-guided-interaction[train,export,viz]",
+]
+all = [
+    "affordance-guided-interaction[dev]",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

@@ -2,11 +2,11 @@
 
 主场景：
 
-- `asserts/minimal_push_door/minimal_push_door.usda`
+- `assets/minimal_push_door/minimal_push_door.usda`
 
 门资产：
 
-- `asserts/minimal_push_door/solid_push_door.usda`
+- `assets/minimal_push_door/solid_push_door.usda`
 
 使用方式：
 

@@ -3,7 +3,7 @@
 # 对应文档：src/affordance_guided_interaction/training/README.md §4
 # ═══════════════════════════════════════════════════════════════════════
 
-# ── 当前初始阶段 ─────────────────────────────────────────────────────
+# ── 当前初始阶段（stage_1 / stage_2 / stage_3）───────────────────────
 initial_stage: stage_1
 
 # ── 跃迁判定参数（§4.3）─────────────────────────────────────────────
@@ -11,26 +11,18 @@ window_size: 50            # 滑动窗口长度 M（计算平均成功率的 epo
 threshold: 0.8             # 跃迁阈值 η_thresh
 manual_override: false     # 是否允许手动控制阶段跃迁
 
-# ── 五阶段定义（§4.2）─────────────────────────────────────────────
+# ── 三阶段定义（§4.2）─────────────────────────────────────────────
 # 阶段跃迁的核心逻辑在 CurriculumManager 中硬编码
 # 此处记录各阶段的设计意图供参考：
 #
 # Stage 1 — push 门 / 无杯
-#   学习目标：基础视觉引导接触，跑通网络闭环
-#   P(occupied) = 0.0, door_types = [push]
+#   学习目标：基础视觉引导接触，先跑通视觉-控制闭环
+#   context_probs = {none: 1.0}, door_types = [push]
 #
-# Stage 2 — push 门 / 必须持杯
-#   学习目标：在稳定性约束 r_stab 与 s_t 下学会力控
-#   P(occupied) = 1.0, door_types = [push]
+# Stage 2 — push 门 / 单臂持杯
+#   学习目标：在单臂持杯约束下学会稳定推门
+#   context_probs = {left_only: 0.5, right_only: 0.5}, door_types = [push]
 #
-# Stage 3 — push/pull 门 / 50% 持杯
-#   学习目标：视觉区分 affordance 类型，调整接触策略
-#   P(occupied) = 0.5, door_types = [push, pull]
-#
-# Stage 4 — handle 门 / 50% 持杯
-#   学习目标：学习时序子任务组合，依靠 RNN 跨越 reward delay
-#   P(occupied) = 0.5, door_types = [handle_push, handle_pull]
-#
-# Stage 5 — 所有门类型 / 50% 持杯 + 高强度域随机化
-#   学习目标：全域泛化
-#   P(occupied) = 0.5, door_types = [push, pull, handle_push, handle_pull]
+# Stage 3 — push 门 / 最终混合分布
+#   学习目标：统一覆盖无杯、单臂持杯、双臂持杯
+#   context_probs = {none: 0.25, left_only: 0.25, right_only: 0.25, both: 0.25}

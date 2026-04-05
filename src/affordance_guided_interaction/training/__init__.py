@@ -6,11 +6,12 @@
 - :class:`PPOConfig`           — PPO 超参配置
 - :class:`RolloutBuffer`       — GAE + TBPTT 轨迹缓存
 - :class:`RolloutCollector`    — 并行轨迹采集器
-- :class:`CurriculumManager`   — 五阶段课程管理器
+- :class:`CurriculumManager`   — push-only 三阶段课程管理器
 - :class:`StageConfig`         — 课程阶段配置
 - :class:`DomainRandomizer`    — 域随机化采样器
 - :class:`RandomizationConfig` — 域随机化超参
 - :class:`TrainingMetrics`     — 训练指标聚合器
+- :class:`PerceptionRuntime`   — 训练侧固定频率视觉缓存运行时
 """
 
 from .ppo_trainer import PPOTrainer, PPOConfig
@@ -19,6 +20,7 @@ from .rollout_collector import RolloutCollector
 from .curriculum_manager import CurriculumManager, StageConfig, STAGE_CONFIGS
 from .domain_randomizer import DomainRandomizer, RandomizationConfig
 from .metrics import TrainingMetrics
+from .perception_runtime import PerceptionRuntime
 
 __all__ = [
     "PPOTrainer",
@@ -31,4 +33,5 @@ __all__ = [
     "DomainRandomizer",
     "RandomizationConfig",
     "TrainingMetrics",
+    "PerceptionRuntime",
 ]

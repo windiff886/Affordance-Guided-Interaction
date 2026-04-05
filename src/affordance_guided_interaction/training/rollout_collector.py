@@ -121,6 +121,7 @@ class RolloutCollector:
         buffer,
         batch_actor_flatten_fn: BatchActorFlattenFn,
         priv_flatten_fn: PrivFlattenFn,
+        perception_runtime=None,
         device: str | torch.device = "cpu",
     ) -> None:
         self.actor = actor
@@ -128,6 +129,7 @@ class RolloutCollector:
         self.buffer = buffer
         self.batch_actor_flatten_fn = batch_actor_flatten_fn
         self.priv_flatten_fn = priv_flatten_fn
+        self.perception_runtime = perception_runtime
         self.device = torch.device(device)
 
         # 隐状态缓存
@@ -180,6 +182,25 @@ class RolloutCollector:
         completed_episodes = 0
         successful_episodes = 0
         total_steps = 0
+        context_totals = {
+            "none": 0,
+            "left_only": 0,
+            "right_only": 0,
+            "both": 0,
+        }
+        context_successes = {
+            "none": 0,
+            "left_only": 0,
+            "right_only": 0,
+            "both": 0,
+        }
+
+        current_actor_obs, current_critic_obs = self._prepare_visual_batch(
+            envs=envs,
+            actor_obs_list=current_actor_obs,
+            critic_obs_list=current_critic_obs,
+            force_refresh_mask=[True] * n_envs,
+        )
 
         for step in range(n_steps):
             # ── 1. 展平观测为分支张量字典 ────────────────────────
@@ -241,19 +262,26 @@ class RolloutCollector:
             self._hidden = hidden_new
             self._reset_hidden_for_dones(dones)
 
-            # ── 8. 推进观测 ──────────────────────────────────────
-            current_actor_obs = next_actor_obs
-            current_critic_obs = next_critic_obs
-
             # 统计
-            outcome_stats = compute_episode_outcome_stats(
-                infos=infos,
-                dones=dones_np,
-            )
+            outcome_stats = compute_episode_outcome_stats(infos=infos, dones=dones_np)
             total_rewards += rewards_np.sum()
             completed_episodes += int(outcome_stats["collect/completed_episodes"])
             successful_episodes += int(outcome_stats["collect/successful_episodes"])
             total_steps += n_envs
+            self._accumulate_context_stats(
+                infos=infos,
+                dones=dones_np,
+                context_totals=context_totals,
+                context_successes=context_successes,
+            )
+
+            # ── 8. 推进观测 ──────────────────────────────────────
+            current_actor_obs, current_critic_obs = self._prepare_visual_batch(
+                envs=envs,
+                actor_obs_list=next_actor_obs,
+                critic_obs_list=next_critic_obs,
+                force_refresh_mask=[bool(x) for x in dones_np],
+            )
 
         # ── 计算最终 bootstrap value ─────────────────────────────
         last_actor_branches = self.batch_actor_flatten_fn(current_actor_obs)
@@ -277,6 +305,21 @@ class RolloutCollector:
             "collect/successful_episodes": float(successful_episodes),
             "collect/episode_success_rate": (
                 successful_episodes / max(completed_episodes, 1)
+            ),
+            "collect/success_mixed": (
+                successful_episodes / max(completed_episodes, 1)
+            ),
+            "collect/success_none": self._safe_rate(
+                context_successes["none"], context_totals["none"]
+            ),
+            "collect/success_left_only": self._safe_rate(
+                context_successes["left_only"], context_totals["left_only"]
+            ),
+            "collect/success_right_only": self._safe_rate(
+                context_successes["right_only"], context_totals["right_only"]
+            ),
+            "collect/success_both": self._safe_rate(
+                context_successes["both"], context_totals["both"]
             ),
             "collect/total_steps": float(total_steps),
         }
@@ -329,3 +372,51 @@ class RolloutCollector:
     def reset_hidden(self, n_envs: int) -> None:
         """完全重置所有环境的隐状态（外部调用接口）。"""
         self._init_hidden(n_envs)
+        if self.perception_runtime is not None:
+            self.perception_runtime.reset(n_envs)
+
+    def _prepare_visual_batch(
+        self,
+        *,
+        envs,
+        actor_obs_list: list[dict],
+        critic_obs_list: list[dict],
+        force_refresh_mask: list[bool],
+    ) -> tuple[list[dict], list[dict]]:
+        if self.perception_runtime is None:
+            return actor_obs_list, critic_obs_list
+
+        visual_observations = None
+        if hasattr(envs, "get_visual_observations"):
+            visual_observations = envs.get_visual_observations()
+
+        return self.perception_runtime.prepare_batch(
+            actor_obs_list=actor_obs_list,
+            critic_obs_list=critic_obs_list,
+            visual_observations=visual_observations,
+            force_refresh_mask=force_refresh_mask,
+        )
+
+    @staticmethod
+    def _accumulate_context_stats(
+        *,
+        infos: list[dict],
+        dones: np.ndarray,
+        context_totals: dict[str, int],
+        context_successes: dict[str, int],
+    ) -> None:
+        for done, info in zip(dones, infos, strict=False):
+            if not bool(done):
+                continue
+            context_name = str(info.get("episode_context", ""))
+            if context_name not in context_totals:
+                continue
+            context_totals[context_name] += 1
+            if bool(info.get("success", False)):
+                context_successes[context_name] += 1
+
+    @staticmethod
+    def _safe_rate(successes: int, totals: int) -> float:
+        if totals <= 0:
+            return 0.0
+        return float(successes / totals)

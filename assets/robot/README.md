@@ -14,7 +14,7 @@
 ## 目录结构
 
 ```
-asserts/robot/
+assets/robot/
 ├── README.md                          # 本文件
 ├── urdf/                              # URDF / Xacro 描述文件
 │   ├── uni_dingo_dual_arm.urdf.xacro  # ★ 主入口：整机描述（底盘+双臂+云台+相机）

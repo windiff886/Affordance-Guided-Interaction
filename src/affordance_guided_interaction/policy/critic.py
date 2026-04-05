@@ -19,7 +19,7 @@ from .actor import (
     ActorConfig,
     flatten_actor_obs,
     NUM_JOINTS_PER_ARM,
-    Z_AFF_DIM,
+    DOOR_EMBEDDING_DIM,
     _DUAL_EE_DIM,
     _CONTEXT_DIM,
 )
@@ -27,9 +27,9 @@ from .actor import (
 
 # Privileged 信息维度:
 #   door_pose(7) + door_joint_pos(1) + door_joint_vel(1)
-#   + cup_pose(7) + cup_lin_vel(3) + cup_ang_vel(3)
-#   + cup_mass(1) + door_mass(1) + door_damping(1) + base_pos(3) = 28
-_PRIVILEGED_DIM = 28
+#   + cup_mass(1) + door_mass(1) + door_damping(1) + base_pos(3)
+#   + cup_dropped(1) = 16
+_PRIVILEGED_DIM = 16
 
 
 # ======================================================================
@@ -64,19 +64,17 @@ def flatten_privileged(privileged: dict) -> torch.Tensor:
 
     Returns
     -------
-    torch.Tensor — ``(28,)``
+    torch.Tensor — ``(16,)``
     """
     parts = [
         np.asarray(privileged["door_pose"]).ravel(),       # 7
         np.asarray(privileged["door_joint_pos"]).ravel(),   # 1
         np.asarray(privileged["door_joint_vel"]).ravel(),   # 1
-        np.asarray(privileged["cup_pose"]).ravel(),         # 7
-        np.asarray(privileged["cup_linear_vel"]).ravel(),   # 3
-        np.asarray(privileged["cup_angular_vel"]).ravel(),  # 3
         np.asarray(privileged["cup_mass"]).ravel(),         # 1
         np.asarray(privileged["door_mass"]).ravel(),        # 1
         np.asarray(privileged["door_damping"]).ravel(),     # 1
         np.asarray(privileged["base_pos"]).ravel(),         # 3
+        np.asarray(privileged["cup_dropped"]).ravel(),      # 1
     ]
     return torch.from_numpy(np.concatenate(parts)).float()
 
@@ -142,14 +140,14 @@ class Critic(nn.Module):
         proprio_in = (
             NUM_JOINTS_PER_ARM * 4
             + (NUM_JOINTS_PER_ARM * 2 if ac.include_torques else 0)
-            + ac.action_history_length * (NUM_JOINTS_PER_ARM * 2)
+            + (NUM_JOINTS_PER_ARM * 2)
         )
-        stab_in = (1 + 1 + 3 + 1 + 3 + 1 + ac.acc_history_length) * 2
+        stab_in = 2
 
         self.proprio_encoder = _build_branch_encoder(proprio_in, ac.proprio_hidden, ac.proprio_out)
         self.ee_encoder = _build_branch_encoder(_DUAL_EE_DIM, ac.ee_hidden, ac.ee_out)
         self.stab_encoder = _build_branch_encoder(stab_in, ac.stab_hidden, ac.stab_out)
-        self.vis_encoder = _build_branch_encoder(Z_AFF_DIM, ac.vis_hidden, ac.vis_out)
+        self.vis_encoder = _build_branch_encoder(DOOR_EMBEDDING_DIM, ac.vis_hidden, ac.vis_out)
 
         actor_concat_dim = ac.proprio_out + ac.ee_out + _CONTEXT_DIM + ac.stab_out + ac.vis_out
 
@@ -187,7 +185,7 @@ class Critic(nn.Module):
         actor_flat : dict[str, Tensor]
             由 ``flatten_actor_obs()`` 产出的分支张量字典，
             每个值形状 ``(batch, dim)``。
-        privileged : ``(batch, 28)``
+        privileged : ``(batch, 16)``
             由 ``flatten_privileged()`` 产出的 privileged 张量。
 
         Returns

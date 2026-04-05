@@ -1,6 +1,6 @@
 # Affordance-Guided Interaction
 
-基于 **Isaac Lab** 仿真器与 **PPO** 强化学习算法，训练双臂机器人（Unitree Z1 × 2 + Dingo 底座）在持杯约束下完成开门任务。策略通过 affordance 视觉编码自适应选择交互方式，并在五阶段课程学习框架下逐步泛化到多种门类型。
+基于 **Isaac Lab** 仿真器与 **PPO** 强化学习算法，训练双臂机器人（Unitree Z1 × 2 + Dingo 底座）在持杯约束下完成推门任务。策略通过 affordance 视觉编码提取门相关特征，并在当前的三阶段 push-only 课程中逐步引入持杯约束。
 
 ---
 
@@ -114,7 +114,7 @@ tensorboard --logdir runs/
 | | `train/explained_variance` | Critic 拟合质量 |
 | **环境** | `collect/mean_reward` | 平均回合奖励 |
 | | `collect/completed_episodes` | 完成的 episode 数 |
-| **课程** | `curriculum/stage` | 当前课程阶段 (1-5) |
+| **课程** | `curriculum/stage` | 当前课程阶段 (1-3) |
 | | `curriculum/window_mean` | 滑动窗口平均成功率 |
 
 ### Checkpoint
@@ -163,17 +163,15 @@ ppo:
 
 ## 课程学习
 
-训练采用五阶段课程自动跃迁，当滑动窗口（50 epoch）平均成功率 ≥ 80% 时自动进入下一阶段：
+训练采用三阶段课程自动跃迁，当滑动窗口（50 epoch）平均成功率 ≥ 80% 时自动进入下一阶段：
 
 | 阶段 | 门类型 | 持杯概率 | 学习目标 |
 |---|---|---|---|
 | Stage 1 | push | 0% | 基础视觉引导接触 |
 | Stage 2 | push | 100% | 力控与稳定性约束 |
-| Stage 3 | push、pull | 50% | affordance 类型视觉区分 |
-| Stage 4 | handle_push、handle_pull | 50% | 时序子任务组合 |
-| Stage 5 | push、pull、handle_push、handle_pull | 50% | 全域泛化 + 高强度域随机化 |
+| Stage 3 | push | 50% | 有杯 / 无杯混合场景下的稳定推门 |
 
-> 当前版本仅训练 push 门（Stage 1-2），Stage 3–5 随环境能力扩展后逐步激活。
+> 当前课程只针对 push 任务调度训练难度；阶段变化只影响持杯采样概率，门类型保持为 `push`。
 
 ---
 
@@ -207,7 +205,7 @@ Affordance-Guided-Interaction/
 ```
                     ┌─────────────────────────────┐
                     │     CurriculumManager       │
-                    │   (五阶段课程跃迁)           │
+                    │   (三阶段课程跃迁)           │
                     └──────────┬──────────────────┘
                                │ 阶段配置
                     ┌──────────▼──────────────────┐

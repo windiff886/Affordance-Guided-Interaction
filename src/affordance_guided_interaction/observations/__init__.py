@@ -11,14 +11,14 @@
 - :func:`build_stability_proxy` — 单步稳定性 proxy 构建
 - ``NUM_JOINTS_PER_ARM``    — 每条 Z1 臂的关节数 (6)
 - ``TOTAL_ARM_JOINTS``      — 双臂总关节数 (12)
-- ``Z_AFF_DIM``             — Point-MAE 门点云 affordance latent 维度 (768)
+- ``DOOR_EMBEDDING_DIM``   — Point-MAE 门点云 embedding 维度 (768)
 """
 
 from .actor_obs_builder import (
     ActorObsBuilder,
     NUM_JOINTS_PER_ARM,
     TOTAL_ARM_JOINTS,
-    Z_AFF_DIM,
+    DOOR_EMBEDDING_DIM,
 )
 from .critic_obs_builder import CriticObsBuilder
 from .history_buffer import HistoryBuffer
@@ -41,5 +41,5 @@ __all__ = [
     "compute_tilt_xy",
     "NUM_JOINTS_PER_ARM",
     "TOTAL_ARM_JOINTS",
-    "Z_AFF_DIM",
+    "DOOR_EMBEDDING_DIM",
 ]

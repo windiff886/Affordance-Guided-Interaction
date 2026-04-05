@@ -35,6 +35,8 @@ class TrainingMetrics:
         self._success_count: int = 0
         self._cup_drop_count: int = 0
         self._episode_lengths: list[int] = []
+        self._context_totals: dict[str, int] = defaultdict(int)
+        self._context_successes: dict[str, int] = defaultdict(int)
 
         # 分项奖励累加器
         self._reward_sums: dict[str, float] = defaultdict(float)
@@ -51,6 +53,7 @@ class TrainingMetrics:
         self,
         *,
         success: bool,
+        context_name: str | None = None,
         cup_dropped: bool = False,
         episode_length: int = 0,
         reward_info: dict[str, float] | None = None,
@@ -61,6 +64,8 @@ class TrainingMetrics:
         ----------
         success : bool
             本回合是否完成任务。
+        context_name : str | None
+            本回合的上下文标识：``none`` / ``left_only`` / ``right_only`` / ``both``。
         cup_dropped : bool
             是否发生杯体脱落。
         episode_length : int
@@ -71,6 +76,10 @@ class TrainingMetrics:
         self._episode_count += 1
         if success:
             self._success_count += 1
+        if context_name is not None:
+            self._context_totals[context_name] += 1
+            if success:
+                self._context_successes[context_name] += 1
         if cup_dropped:
             self._cup_drop_count += 1
         self._episode_lengths.append(episode_length)
@@ -135,8 +144,25 @@ class TrainingMetrics:
         # ── Episode 级 ────────────────────────────────────────────────
         n = max(self._episode_count, 1)
         summary["episode/success_rate"] = self._success_count / n
+        summary["episode/success_mixed"] = self._success_count / n
         summary["episode/cup_drop_rate"] = self._cup_drop_count / n
         summary["episode/count"] = float(self._episode_count)
+        summary["episode/success_none"] = _safe_rate(
+            self._context_successes["none"],
+            self._context_totals["none"],
+        )
+        summary["episode/success_left_only"] = _safe_rate(
+            self._context_successes["left_only"],
+            self._context_totals["left_only"],
+        )
+        summary["episode/success_right_only"] = _safe_rate(
+            self._context_successes["right_only"],
+            self._context_totals["right_only"],
+        )
+        summary["episode/success_both"] = _safe_rate(
+            self._context_successes["both"],
+            self._context_totals["both"],
+        )
 
         if self._episode_lengths:
             summary["episode/mean_length"] = (
@@ -165,3 +191,9 @@ class TrainingMetrics:
         if self._episode_count == 0:
             return 0.0
         return self._success_count / self._episode_count
+
+
+def _safe_rate(successes: int, totals: int) -> float:
+    if totals <= 0:
+        return 0.0
+    return successes / totals

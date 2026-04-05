@@ -132,8 +132,8 @@ $$
 
 | 角色 | 输入 | 说明 |
 |------|------|------|
-| **Actor** | 本体状态、双臂 gripper pose、稳定性 proxy、$z_{\text{aff}}$、context | 仅部署时可得的信号 |
-| **Critic** | actor 观测 $\cup$ 精确物体状态、隐藏物理参数 | 额外获得仿真 oracle 提供的 privileged information |
+| **Actor** | `proprio + ee + context + stability + visual` | 仅部署时可得的信号；其中 `stability` 只保留左右倾斜程度，`visual` 的正式结果是 `door_embedding` |
+| **Critic** | `actor_obs + privileged` | 额外获得门真实状态、关键隐藏物理参数与 `cup_dropped` 等训练期 privileged information |
 
 ### 3.2 信息不对称的收敛意义
 
@@ -173,19 +173,21 @@ $$
 
 直接在全约束环境下训练会导致策略陷入局部最优——例如为了规避持杯加速度惩罚而选择完全不运动。课程学习通过逐步引入任务复杂度和约束强度，引导策略在**先学会任务本身，再学会在约束下完成任务**的路径上收敛。
 
-### 4.2 五阶段自动跃迁
+### 4.2 三阶段自动跃迁
 
-课程管理器实现 5 阶段训练，每个阶段定义了不同的任务复杂度与约束组合：
+课程管理器实现 3 阶段 push-only 训练。阶段变化的核心不是简单改变一个 `P(occupied)`，而是显式切换 episode 上下文分布：
 
-| 阶段 | 持杯概率 | 门类型 | 核心学习目标 |
-|------|----------|--------|------------|
-| **Stage 1** | $P(\text{occupied}) = 0$ | push | 基础视觉引导接触，跑通网络闭环 |
-| **Stage 2** | $P(\text{occupied}) = 1$ | push | 在稳定性约束 $r_{\text{stab}}$ 与 $s_t$ 下学会力控 |
-| **Stage 3** | $P(\text{occupied}) \sim \text{Bernoulli}(0.5)$ | push、pull | 视觉区分 affordance 类型，调整接触策略 |
-| **Stage 4** | $P(\text{occupied}) \sim \text{Bernoulli}(0.5)$ | handle_push、handle_pull | 学习时序子任务组合，依靠 RNN 跨越 reward delay |
-| **Stage 5** | $P(\text{occupied}) \sim \text{Bernoulli}(0.5)$ | push、pull、handle_push、handle_pull | 高强度域随机化下的全域泛化 |
+| 阶段 | 上下文分布 | 门类型 | 核心学习目标 |
+|------|------------|--------|------------|
+| **Stage 1** | `none: 1.0` | push | 学会基础推门交互，先跑通视觉-控制闭环 |
+| **Stage 2** | `left_only: 0.5, right_only: 0.5` | push | 在单臂持杯约束下学会稳定推门 |
+| **Stage 3** | `none / left_only / right_only / both` 各 `0.25` | push | 在最终混合分布下统一覆盖无杯、单臂持杯和双臂持杯 |
 
-> **当前环境仅支持 push 门（Stage 1–2），Stage 3–5 随环境能力扩展后逐步激活。**
+几个关键约束如下：
+
+- `door_types` 在三个阶段都固定为 `push`
+- Stage 2 故意不引入 `both`，避免在策略尚未掌握单臂持杯稳定推门前就进入双臂高约束场景
+- Stage 3 采用最终目标分布，而不是简单的“50% 持杯”
 
 ### 4.3 跃迁条件的数学判据
 
@@ -207,8 +209,8 @@ $$
 课程阶段的推进与 rewards 层的动态缩放因子 $s_t$（见 `rewards/README.md` §7）协同工作：
 
 - **阶段 1**（无持杯）：$s_t$ 不影响策略（无稳定性惩罚项被激活）
-- **阶段 2**（引入持杯）：$s_t$ 从低值开始线性退火，策略先探索推门方式，再逐步被要求动作平滑
-- **阶段 3-5**：$s_t$ 持续增长至 $1.0$，全额惩罚促使策略打磨出顺滑的操作风格
+- **阶段 2**（单臂持杯）：$s_t$ 从低值开始线性退火，策略先适应“只有一侧必须稳定”的受限交互
+- **阶段 3**（最终混合分布）：单一策略同时覆盖无杯、单臂持杯、双臂持杯三类正式目标场景，打磨切换鲁棒性
 
 两套机制互为补充：课程控制**任务复杂度的离散跃迁**，$s_t$ 控制**约束强度的连续增长**。
 
@@ -279,7 +281,7 @@ $$
 
 **Step 4 — 课程判定**：统计本轮成功率 $\eta$，更新滑动窗口，判断是否满足阶段跃迁条件（§4.3）。
 
-**Step 5 — 指标记录**：分项奖励、成功率（按 affordance 类别）、杯体脱落率、平均 $s_t$ 值等关键指标送入 TensorBoard / WandB。
+**Step 5 — 指标记录**：分项奖励、混合成功率、`success_none / success_left_only / success_right_only / success_both`、杯体脱落率、平均 $s_t$ 值等关键指标送入 TensorBoard / WandB。
 
 ### 6.2 梯度裁剪
 
@@ -328,7 +330,7 @@ $$
 |------|------|--------|
 | $M$ | 跃迁判据滑动窗口（epoch 数） | 50 |
 | $\eta_{\text{thresh}}$ | 成功率跃迁阈值 | 0.8 |
-| 总阶段数 | 课程阶段总数 | 5 |
+| 总阶段数 | 课程阶段总数 | 3 |
 
 ### 7.4 域随机化范围
 

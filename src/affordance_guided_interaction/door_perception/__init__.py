@@ -1,4 +1,4 @@
-"""Door Perception Pipeline：RGB-D → Point-MAE Embedding (z_aff)。"""
+"""Door Perception Pipeline：RGB-D → Point-MAE door_embedding。"""
 
 from affordance_guided_interaction.door_perception.config import (
     AffordancePipelineConfig,

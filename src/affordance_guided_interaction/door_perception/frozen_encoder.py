@@ -417,9 +417,15 @@ class PointMAEEncoder:
         """
         import torch as _torch
 
-        logger.info("正在加载 Point-MAE 权重: %s", self._config.checkpoint_path)
+        # 支持相对路径：相对于项目根目录解析
+        from pathlib import Path as _Path
+        ckpt_path = _Path(self._config.checkpoint_path)
+        if not ckpt_path.is_absolute():
+            _project_root = _Path(__file__).resolve().parents[3]  # door_perception → src → project root
+            ckpt_path = _project_root / ckpt_path
+        logger.info("正在加载 Point-MAE 权重: %s", ckpt_path)
         ckpt = _torch.load(
-            self._config.checkpoint_path, map_location="cpu", weights_only=False
+            str(ckpt_path), map_location="cpu", weights_only=False
         )
 
         # 提取 state_dict（兼容多种存储格式）

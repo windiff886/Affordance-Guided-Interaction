@@ -8,10 +8,10 @@
 
     actor_obs
       ├── proprio   → MLP → f_proprio
-      ├── gripper    → MLP → f_ee
+      ├── ee         → MLP → f_ee
       ├── context    → 直接拼接
       ├── stability  → MLP → f_stab
-      └── z_aff      → MLP → f_vis
+      └── visual     → MLP → f_vis
               ↓ concat
       RecurrentBackbone (GRU / LSTM)
               ↓
@@ -39,22 +39,20 @@ from .action_head import ActionHead
 
 NUM_JOINTS_PER_ARM = 6
 TOTAL_ARM_JOINTS = NUM_JOINTS_PER_ARM * 2  # 12
-Z_AFF_DIM = 768
+DOOR_EMBEDDING_DIM = 768
 
-# 每条臂的 gripper 状态维度: pos(3) + quat(4) + lin_vel(3) + ang_vel(3) = 13
-_SINGLE_EE_DIM = 13
-_DUAL_EE_DIM = _SINGLE_EE_DIM * 2  # 26
+# 每条臂的末端状态维度:
+# pos(3) + quat(4) + lin_vel(3) + ang_vel(3) + lin_acc(3) + ang_acc(3) = 19
+_SINGLE_EE_DIM = 19
+_DUAL_EE_DIM = _SINGLE_EE_DIM * 2  # 38
 
 # context 维度: left_occ(1) + right_occ(1) = 2
 _CONTEXT_DIM = 2
 
-# 单臂稳定性 proxy 维度:
-#   tilt(1) + lin_vel_norm(1) + lin_acc(3) + ang_vel_norm(1)
-#   + ang_acc(3) + jerk(1) + recent_acc_history(k)
-# 默认 k = 10 → 单臂 20，双臂 40
+# 单臂稳定性仅保留 tilt
 _DEFAULT_ACC_HISTORY_LEN = 10
-_SINGLE_STAB_DIM = 1 + 1 + 3 + 1 + 3 + 1 + _DEFAULT_ACC_HISTORY_LEN  # 20
-_DUAL_STAB_DIM = _SINGLE_STAB_DIM * 2  # 40
+_SINGLE_STAB_DIM = 1
+_DUAL_STAB_DIM = _SINGLE_STAB_DIM * 2  # 2
 
 
 # ======================================================================
@@ -115,11 +113,11 @@ def flatten_actor_obs(obs: dict, cfg: ActorConfig) -> dict[str, torch.Tensor]:
 
     返回的字典包含以下 key，各值均为 ``(feature_dim,)`` 的 1-D 张量：
 
-    - ``"proprio"`` — 关节位姿 + 速度 + [力矩] + 动作历史
-    - ``"ee"``      — 左右臂 gripper 状态拼接
+    - ``"proprio"`` — 双臂关节位姿 + 速度 + [力矩] + 上一步动作
+    - ``"ee"``      — 左右臂末端状态拼接
     - ``"context"`` — left_occ + right_occ
-    - ``"stability"`` — 左右臂稳定性 proxy 拼接
-    - ``"visual"``  — z_aff
+    - ``"stability"`` — 左右臂 tilt 拼接
+    - ``"visual"``  — door_embedding
 
     Parameters
     ----------
@@ -132,36 +130,35 @@ def flatten_actor_obs(obs: dict, cfg: ActorConfig) -> dict[str, torch.Tensor]:
 
     # -- proprio --
     parts = [
-        np.asarray(proprio["left_joint_positions"]).ravel(),
-        np.asarray(proprio["left_joint_velocities"]).ravel(),
-        np.asarray(proprio["right_joint_positions"]).ravel(),
-        np.asarray(proprio["right_joint_velocities"]).ravel(),
+        np.asarray(proprio["joint_positions"]).ravel(),
+        np.asarray(proprio["joint_velocities"]).ravel(),
     ]
     if cfg.include_torques:
         parts.append(
-            np.asarray(proprio.get("left_joint_torques", np.zeros(NUM_JOINTS_PER_ARM))).ravel()
+            np.asarray(
+                proprio.get("joint_torques", np.zeros(TOTAL_ARM_JOINTS))
+            ).ravel()
         )
-        parts.append(
-            np.asarray(proprio.get("right_joint_torques", np.zeros(NUM_JOINTS_PER_ARM))).ravel()
-        )
-    # 动作历史: (k, 12) → 展平为 (k*12,)
-    prev_actions = np.asarray(proprio["previous_actions"])
-    parts.append(prev_actions.ravel())
+    parts.append(np.asarray(proprio["prev_action"]).ravel())
 
     proprio_vec = torch.from_numpy(np.concatenate(parts)).float()
 
     # -- ee --
-    left_ee = obs["left_gripper_state"]
-    right_ee = obs["right_gripper_state"]
+    left_ee = obs["ee"]["left"]
+    right_ee = obs["ee"]["right"]
     ee_vec = torch.from_numpy(np.concatenate([
         np.asarray(left_ee["position"]).ravel(),
         np.asarray(left_ee["orientation"]).ravel(),
         np.asarray(left_ee["linear_velocity"]).ravel(),
         np.asarray(left_ee["angular_velocity"]).ravel(),
+        np.asarray(left_ee["linear_acceleration"]).ravel(),
+        np.asarray(left_ee["angular_acceleration"]).ravel(),
         np.asarray(right_ee["position"]).ravel(),
         np.asarray(right_ee["orientation"]).ravel(),
         np.asarray(right_ee["linear_velocity"]).ravel(),
         np.asarray(right_ee["angular_velocity"]).ravel(),
+        np.asarray(right_ee["linear_acceleration"]).ravel(),
+        np.asarray(right_ee["angular_acceleration"]).ravel(),
     ])).float()
 
     # -- context --
@@ -172,26 +169,14 @@ def flatten_actor_obs(obs: dict, cfg: ActorConfig) -> dict[str, torch.Tensor]:
     ])).float()
 
     # -- stability --
-    def _flatten_proxy(proxy: dict) -> np.ndarray:
-        return np.concatenate([
-            np.atleast_1d(proxy["tilt"]).ravel(),
-            np.atleast_1d(proxy["linear_velocity_norm"]).ravel(),
-            np.asarray(proxy["linear_acceleration"]).ravel(),
-            np.atleast_1d(proxy["angular_velocity_norm"]).ravel(),
-            np.asarray(proxy["angular_acceleration"]).ravel(),
-            np.atleast_1d(proxy["jerk_proxy"]).ravel(),
-            np.asarray(proxy["recent_acc_history"]).ravel(),
-        ])
-
+    stab = obs["stability"]
     stab_vec = torch.from_numpy(np.concatenate([
-        _flatten_proxy(obs["left_stability_proxy"]),
-        _flatten_proxy(obs["right_stability_proxy"]),
+        np.asarray(stab["left_tilt"]).ravel(),
+        np.asarray(stab["right_tilt"]).ravel(),
     ])).float()
 
     # -- visual --
-    vis_vec = torch.from_numpy(
-        np.asarray(obs["z_aff"]).ravel()
-    ).float()
+    vis_vec = torch.from_numpy(np.asarray(obs["visual"]["door_embedding"]).ravel()).float()
 
     return {
         "proprio": proprio_vec,
@@ -243,17 +228,17 @@ class Actor(nn.Module):
 
         # -- 计算各分支输入维度 --
         proprio_in = (
-            NUM_JOINTS_PER_ARM * 4  # 左右 q + dq = 4 × 6 = 24
-            + (NUM_JOINTS_PER_ARM * 2 if c.include_torques else 0)  # tau
-            + c.action_history_length * TOTAL_ARM_JOINTS  # prev_actions
+            TOTAL_ARM_JOINTS * 2  # q + dq
+            + (TOTAL_ARM_JOINTS if c.include_torques else 0)  # tau
+            + TOTAL_ARM_JOINTS  # prev_action
         )
-        stab_in = (1 + 1 + 3 + 1 + 3 + 1 + c.acc_history_length) * 2  # 双臂
+        stab_in = _DUAL_STAB_DIM
 
         # -- 分支 encoder --
         self.proprio_encoder = _build_branch_encoder(proprio_in, c.proprio_hidden, c.proprio_out)
         self.ee_encoder = _build_branch_encoder(_DUAL_EE_DIM, c.ee_hidden, c.ee_out)
         self.stab_encoder = _build_branch_encoder(stab_in, c.stab_hidden, c.stab_out)
-        self.vis_encoder = _build_branch_encoder(Z_AFF_DIM, c.vis_hidden, c.vis_out)
+        self.vis_encoder = _build_branch_encoder(DOOR_EMBEDDING_DIM, c.vis_hidden, c.vis_out)
 
         # -- 汇总维度 --
         concat_dim = c.proprio_out + c.ee_out + _CONTEXT_DIM + c.stab_out + c.vis_out

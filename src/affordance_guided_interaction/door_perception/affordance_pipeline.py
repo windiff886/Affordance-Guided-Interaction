@@ -4,7 +4,7 @@
     1. LangSAM / Grounded-SAM 2 开集分割 → 门/把手/按钮 mask
     2. 深度反投影 → 局部点云
     3. Voxel 降采样 + 点数对齐
-    4. Point-MAE 冻结编码器 → 高维 embedding (z_aff)
+    4. Point-MAE 冻结编码器 → 高维 embedding (door_embedding)
 
 管线不进行任何手工几何特征提取（无 RANSAC、无包围盒、无距离计算）。
 """
@@ -44,7 +44,7 @@ _PROMPT_TO_KEY: dict[str, str] = {
 
 
 class AffordancePipeline:
-    """端到端 Affordance 管线：RGB-D → z_aff embedding。
+    """端到端 Affordance 管线：RGB-D → door_embedding。
 
     管线不关心夹爪具体坐标，不计算几何距离特征，
     所有空间关系由下游 Policy 隐式学习。
@@ -71,7 +71,7 @@ class AffordancePipeline:
         observation: dict[str, Any],
         task_goal: str | None = None,
     ) -> np.ndarray:
-        """执行完整管线，返回 z_aff_embedding。
+        """执行完整管线，返回 door_embedding。
 
         Parameters
         ----------
@@ -82,7 +82,7 @@ class AffordancePipeline:
 
         Returns
         -------
-        z_aff : np.ndarray
+        door_embedding : np.ndarray
             (embed_dim,) Point-MAE 输出的高维 embedding 向量。
         """
         rgb: np.ndarray = observation["rgb"]
@@ -119,10 +119,10 @@ class AffordancePipeline:
             merged_points, self._config.point_cloud.max_points
         )
 
-        # --- 4. Point-MAE 编码 → z_aff ---
-        z_aff = self._encoder.encode(aligned_points)
+        # --- 4. Point-MAE 编码 → door_embedding ---
+        door_embedding = self._encoder.encode(aligned_points)
 
-        return z_aff
+        return door_embedding
 
     # ------------------------------------------------------------------
     # 内部辅助

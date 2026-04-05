@@ -202,6 +202,10 @@ class VecDoorEnv:
         self._right_occupied = right_occupied_list
         self._domain_params_list = domain_params_list
 
+    def get_visual_observations(self) -> list[dict[str, Any] | None]:
+        """返回每个子环境当前的原始视觉观测。"""
+        return [env.get_visual_observation() for env in self._envs]
+
     # ═══════════════════════════════════════════════════════════════════
     # 资源释放
     # ═══════════════════════════════════════════════════════════════════

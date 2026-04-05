@@ -8,12 +8,17 @@
 )
 
 def Xform "CarryCup" (
-    prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"]
+    prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI", "PhysxRigidBodyAPI"]
 )
 {
-    float physics:angularDamping = 0.08
-    float physics:linearDamping = 0.08
+    # 大幅提高阻尼: 杯子接触后迅速停下来, 不会弹飞
+    float physics:angularDamping = 5.0
+    float physics:linearDamping = 5.0
     float physics:mass = 0.28
+
+    # 限制最大速度: 即使被弹也飞不远
+    float physxRigidBody:maxLinearVelocity = 0.5
+    float physxRigidBody:maxAngularVelocity = 2.0
 
     def Xform "Visual"
     {
@@ -22,7 +27,7 @@ def Xform "CarryCup" (
             color3f[] primvars:displayColor = [(0.84, 0.84, 0.86)]
             token axis = "Z"
             double3 xformOp:translate = (0, 0, 0.06)
-            float3 xformOp:scale = (0.04, 0.04, 0.06)
+            float3 xformOp:scale = (0.018, 0.018, 0.06)
             uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
         }
 
@@ -31,21 +36,24 @@ def Xform "CarryCup" (
             color3f[] primvars:displayColor = [(0.71, 0.55, 0.32)]
             token axis = "Z"
             double3 xformOp:translate = (0, 0, 0.054)
-            float3 xformOp:scale = (0.034, 0.034, 0.03)
+            float3 xformOp:scale = (0.015, 0.015, 0.03)
             uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
         }
     }
 
     def Cylinder "BodyCollider" (
-        prepend apiSchemas = ["PhysicsCollisionAPI"]
+        prepend apiSchemas = ["PhysicsCollisionAPI", "PhysxCollisionAPI"]
     )
     {
         rel material:binding:physics = </CarryCup/GripPhysicsMaterial> (
             bindMaterialAs = "weakerThanDescendants"
         )
+        # contactOffset 稍大一点让 PhysX 有缓冲空间, 不会硬碰硬
+        float physxCollision:contactOffset = 0.005
+        float physxCollision:restOffset = 0.001
         token axis = "Z"
         double3 xformOp:translate = (0, 0, 0.06)
-        float3 xformOp:scale = (0.04, 0.04, 0.06)
+        float3 xformOp:scale = (0.018, 0.018, 0.06)
         uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
     }
 
@@ -53,10 +61,11 @@ def Xform "CarryCup" (
         prepend apiSchemas = ["PhysicsMaterialAPI", "PhysxMaterialAPI"]
     )
     {
-        float physics:dynamicFriction = 1.6
-        float physics:restitution = 0
-        float physics:staticFriction = 2.0
-        uniform token physxMaterial:frictionCombineMode = "max"
+        # 降低摩擦力: 接触瞬间不会产生巨大切向力把杯子弹走
+        float physics:dynamicFriction = 0.6
+        float physics:staticFriction = 0.8
+        float physics:restitution = 0.0
+        uniform token physxMaterial:frictionCombineMode = "average"
     }
 
     def Xform "GraspFrames"

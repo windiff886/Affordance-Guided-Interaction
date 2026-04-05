@@ -25,6 +25,7 @@ import numpy as np
 # 当 Isaac Lab 不可用时（如纯 CPU 开发/测试），使用占位模式
 
 _HAS_ISAAC_LAB = False
+_HAS_ISAAC_CAMERA = False
 
 try:
     import omni.isaac.lab.sim as sim_utils
@@ -37,6 +38,12 @@ try:
     from omni.isaac.lab.sim import SimulationContext
     from pxr import Usd, UsdGeom, UsdPhysics, Sdf, Gf
     _HAS_ISAAC_LAB = True
+    try:
+        from omni.isaac.sensor import Camera
+
+        _HAS_ISAAC_CAMERA = True
+    except ImportError:
+        Camera = None
 except ImportError:
     try:
         # Isaac Lab 2024+ 使用 isaaclab 命名空间
@@ -50,6 +57,12 @@ except ImportError:
         from isaaclab.sim import SimulationContext
         from pxr import Usd, UsdGeom, UsdPhysics, Sdf, Gf
         _HAS_ISAAC_LAB = True
+        try:
+            from omni.isaac.sensor import Camera
+
+            _HAS_ISAAC_CAMERA = True
+        except ImportError:
+            Camera = None
     except ImportError:
         pass
 
@@ -98,6 +111,8 @@ class SceneHandles:
     door_panel_view: Any = None
     # 杯体 RigidObject 句柄（None 表示本局无杯体）
     cup_view: Any = None
+    # 第一人称深度相机句柄
+    camera_view: Any = None
 
     # 当前场景元信息
     door_type: str = "push"
@@ -203,6 +218,7 @@ class SceneFactory:
         # 4. 读取末端执行器视图
         left_ee_view = self._get_ee_view("left")
         right_ee_view = self._get_ee_view("right")
+        camera_view = self._spawn_camera()
 
         # 5. 按需加载杯体
         cup_view = None
@@ -214,6 +230,7 @@ class SceneFactory:
             robot_view=robot_view,
             left_ee_view=left_ee_view,
             right_ee_view=right_ee_view,
+            camera_view=camera_view,
             door_view=door_view,
             door_panel_view=door_panel_view,
             cup_view=cup_view,
@@ -447,6 +464,35 @@ class SceneFactory:
 
         cup = RigidObject(cup_cfg)
         return cup
+
+    def _spawn_camera(self) -> Any:
+        """初始化头部 D455 相机句柄。"""
+        if not _HAS_ISAAC_CAMERA:
+            return None
+
+        cam_prim_path = "/World/Robot/base_link/head_d455_link/Camera"
+        try:
+            camera = Camera(
+                prim_path=cam_prim_path,
+                frequency=30,
+                resolution=(640, 480),
+            )
+            camera.initialize()
+            camera.add_distance_to_image_plane_to_frame()
+
+            import omni.usd
+
+            stage = omni.usd.get_context().get_stage()
+            if stage is not None:
+                cam_geom = UsdGeom.Camera(stage.GetPrimAtPath(cam_prim_path))
+                if cam_geom:
+                    cam_geom.GetFocalLengthAttr().Set(11.2)
+                    cam_geom.GetHorizontalApertureAttr().Set(20.955)
+                    cam_geom.GetVerticalApertureAttr().Set(15.716)
+                    cam_geom.GetClippingRangeAttr().Set(Gf.Vec2f(0.01, 100.0))
+            return camera
+        except Exception:
+            return None
 
     def _set_rigid_body_mass(self, view: Any, mass: float) -> None:
         """修改刚体的质量属性。"""

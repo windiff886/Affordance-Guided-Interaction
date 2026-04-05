@@ -51,7 +51,7 @@ class PointMAEEncoderConfig:
     权重文件使用 Point-MAE 官方发布的 pretrain.pth。
     """
 
-    checkpoint_path: str = ""
+    checkpoint_path: str = "model/pretrain.pth"
     # Point-MAE 网络超参（需与预训练权重一致）
     trans_dim: int = 384
     encoder_dims: int = 384

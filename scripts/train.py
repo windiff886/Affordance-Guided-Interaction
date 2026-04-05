@@ -150,12 +150,27 @@ def build_ppo_trainer(actor, critic, cfg: dict, device: torch.device):
     return PPOTrainer(actor, critic, ppo_cfg, device), ppo_cfg
 
 
+def build_curriculum_reset_batch(
+    stage_cfg: Any,
+    randomizer: Any,
+    n_envs: int,
+) -> tuple[list[Any], list[str], list[bool], list[bool]]:
+    """根据当前课程阶段生成一批 reset 参数。"""
+    domain_params_list = randomizer.sample_batch_episode_params(n_envs)
+    door_types = [str(np.random.choice(stage_cfg.door_types)) for _ in range(n_envs)]
+    left_occupied, right_occupied = stage_cfg.sample_occupancy_batch(n_envs)
+    return domain_params_list, door_types, left_occupied, right_occupied
+
+
 def build_collector(
     actor, critic, actor_cfg, cfg: dict, ppo_cfg, device: torch.device
 ):
     """创建轨迹采集器和 RolloutBuffer 实例。"""
     from affordance_guided_interaction.training.rollout_buffer import RolloutBuffer
     from affordance_guided_interaction.training.rollout_collector import RolloutCollector
+    from affordance_guided_interaction.training.perception_runtime import (
+        PerceptionRuntime,
+    )
     from affordance_guided_interaction.policy import (
         batch_flatten_actor_obs,
         flatten_privileged,
@@ -168,16 +183,17 @@ def build_collector(
     # 计算各分支维度（与 Actor 网络输入一致）
     n = 6  # joints_per_arm
     proprio_dim = (
-        n * 4                                              # 左右 q + dq
-        + (n * 2 if actor_cfg.include_torques else 0)      # 左右 tau
-        + actor_cfg.action_history_length * 12              # prev_actions
+        12                                               # q
+        + 12                                             # dq
+        + (12 if actor_cfg.include_torques else 0)       # tau
+        + 12                                             # prev_action
     )
 
     actor_branch_dims = {
         "proprio": proprio_dim,
-        "ee": 26,                                           # 双臂各 13
+        "ee": 38,                                           # 双臂各 19
         "context": 2,                                       # left_occ + right_occ
-        "stability": (1 + 1 + 3 + 1 + 3 + 1 + actor_cfg.acc_history_length) * 2,
+        "stability": 2,                                     # left/right tilt
         "visual": 768,                                      # Point-MAE 编码
     }
 
@@ -185,7 +201,7 @@ def build_collector(
         n_envs=n_envs,
         n_steps=n_steps,
         actor_branch_dims=actor_branch_dims,
-        privileged_dim=28,
+        privileged_dim=16,
         action_dim=12,
         rnn_hidden_dim=actor_cfg.rnn_hidden,
         rnn_num_layers=actor_cfg.rnn_layers,
@@ -194,6 +210,11 @@ def build_collector(
 
     # partial 绑定展平函数
     batch_flatten_fn = partial(batch_flatten_actor_obs, cfg=actor_cfg)
+    visual_cfg = t_cfg.get("visual", {})
+    perception_runtime = PerceptionRuntime(
+        refresh_interval=visual_cfg.get("refresh_interval", 4),
+        embedding_dim=actor_branch_dims["visual"],
+    )
 
     collector = RolloutCollector(
         actor=actor,
@@ -201,6 +222,7 @@ def build_collector(
         buffer=buffer,
         batch_actor_flatten_fn=batch_flatten_fn,
         priv_flatten_fn=flatten_privileged,
+        perception_runtime=perception_runtime,
         device=device,
     )
 
@@ -348,6 +370,7 @@ def main() -> int:
     curriculum = CurriculumManager(
         window_size=cur_cfg.get("window_size", 50),
         threshold=cur_cfg.get("threshold", 0.8),
+        initial_stage=cur_cfg.get("initial_stage"),
     )
 
     # ── 域随机化器 ────────────────────────────────────────────
@@ -384,10 +407,11 @@ def main() -> int:
             print(f"⚠️ Checkpoint 文件不存在: {resume_path}，从头开始训练")
 
     # ── 初始化环境 ────────────────────────────────────────────
-    domain_params_list = randomizer.sample_batch_episode_params(n_envs)
-    door_types = ["push"] * n_envs
-    left_occupied = [False] * n_envs
-    right_occupied = [False] * n_envs
+    initial_stage_cfg = curriculum.get_stage_config()
+    print(f"✅ 初始课程阶段: {initial_stage_cfg.name} ({initial_stage_cfg.description})")
+    domain_params_list, door_types, left_occupied, right_occupied = (
+        build_curriculum_reset_batch(initial_stage_cfg, randomizer, n_envs)
+    )
 
     actor_obs_list, critic_obs_list = envs.reset(
         domain_params_list=domain_params_list,
@@ -459,11 +483,9 @@ def main() -> int:
                 new_stage_cfg = curriculum.get_stage_config()
                 print(f"\n📈 课程阶段跃迁 → {new_stage_cfg.name}: {new_stage_cfg.description}")
                 # 更新环境课程参数
-                door_types = [new_stage_cfg.door_types[0]] * n_envs
-                cup_prob = new_stage_cfg.cup_probability
-                left_occupied = [np.random.random() < cup_prob for _ in range(n_envs)]
-                right_occupied = [False] * n_envs
-                domain_params_list = randomizer.sample_batch_episode_params(n_envs)
+                domain_params_list, door_types, left_occupied, right_occupied = (
+                    build_curriculum_reset_batch(new_stage_cfg, randomizer, n_envs)
+                )
                 envs.set_curriculum(
                     door_types=door_types,
                     left_occupied_list=left_occupied,
@@ -504,6 +526,31 @@ def main() -> int:
                 writer.add_scalar("collect/completed_episodes", completed_eps, global_steps)
                 writer.add_scalar("collect/successful_episodes", successful_eps, global_steps)
                 writer.add_scalar("collect/episode_success_rate", epoch_success_rate, global_steps)
+                writer.add_scalar(
+                    "collect/success_mixed",
+                    collect_stats.get("collect/success_mixed", epoch_success_rate),
+                    global_steps,
+                )
+                writer.add_scalar(
+                    "collect/success_none",
+                    collect_stats.get("collect/success_none", 0.0),
+                    global_steps,
+                )
+                writer.add_scalar(
+                    "collect/success_left_only",
+                    collect_stats.get("collect/success_left_only", 0.0),
+                    global_steps,
+                )
+                writer.add_scalar(
+                    "collect/success_right_only",
+                    collect_stats.get("collect/success_right_only", 0.0),
+                    global_steps,
+                )
+                writer.add_scalar(
+                    "collect/success_both",
+                    collect_stats.get("collect/success_both", 0.0),
+                    global_steps,
+                )
                 writer.add_scalar("curriculum/stage", curriculum.current_stage, global_steps)
                 writer.add_scalar("curriculum/window_mean", curriculum.window_mean, global_steps)
 

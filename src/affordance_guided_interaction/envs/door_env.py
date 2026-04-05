@@ -80,6 +80,16 @@ def _quat_to_rotation_matrix(quat: np.ndarray) -> np.ndarray:
     ], dtype=np.float64)
 
 
+def _context_name(left_occupied: bool, right_occupied: bool) -> str:
+    if left_occupied and right_occupied:
+        return "both"
+    if left_occupied:
+        return "left_only"
+    if right_occupied:
+        return "right_only"
+    return "none"
+
+
 class DoorInteractionEnv(BaseEnv):
     """门交互任务单环境实现。
 
@@ -113,7 +123,8 @@ class DoorInteractionEnv(BaseEnv):
             cup_drop_threshold=self.cfg.cup_drop_threshold,
         )
         self._task_manager = TaskManager(
-            door_angle_target=self.cfg.door_angle_target,
+            success_angle_threshold=float(self.cfg.reward_cfg["task"]["theta_target"]),
+            episode_end_angle_threshold=self.cfg.door_angle_target,
             max_episode_steps=self.cfg.max_episode_steps,
         )
         self._actor_obs_builder = ActorObsBuilder(
@@ -126,6 +137,7 @@ class DoorInteractionEnv(BaseEnv):
         self._domain_params: dict[str, Any] = {}
         self._left_occupied: bool = False
         self._right_occupied: bool = False
+        self._episode_context: str = "none"
         self._prev_action: np.ndarray = np.zeros(
             self.cfg.total_joints, dtype=np.float64
         )
@@ -149,6 +161,7 @@ class DoorInteractionEnv(BaseEnv):
         self._domain_params = domain_params or {}
         self._left_occupied = left_occupied
         self._right_occupied = right_occupied
+        self._episode_context = _context_name(left_occupied, right_occupied)
         self._prev_action = np.zeros(self.cfg.total_joints, dtype=np.float64)
         self._left_stability_state = StabilityProxyState()
         self._right_stability_state = StabilityProxyState()
@@ -171,7 +184,7 @@ class DoorInteractionEnv(BaseEnv):
 
         # 4. 构建初始观测
         actor_obs = self._build_actor_obs(state, action_taken=None)
-        critic_obs = self._build_critic_obs(actor_obs, state)
+        critic_obs = self._build_critic_obs(actor_obs, state, cup_dropped=0.0)
 
         return actor_obs, critic_obs
 
@@ -218,7 +231,11 @@ class DoorInteractionEnv(BaseEnv):
 
         # ── 6. 构建观测 ───────────────────────────────────────
         actor_obs = self._build_actor_obs(state, action_taken=clipped_action)
-        critic_obs = self._build_critic_obs(actor_obs, state)
+        critic_obs = self._build_critic_obs(
+            actor_obs,
+            state,
+            cup_dropped=float(contact_summary.cup_dropped),
+        )
 
         # ── 7. 计算奖励 ───────────────────────────────────────
         reward, should_terminate, reward_info = self._compute_reward(
@@ -236,9 +253,13 @@ class DoorInteractionEnv(BaseEnv):
         # ── 9. 组装 info ──────────────────────────────────────
         info: dict[str, Any] = {
             "success": task_status.success,
+            "success_reached": task_status.success_reached,
+            "success_time_step": task_status.success_time_step,
             "termination_reason": task_status.reason.name,
             "step_count": task_status.step_count,
             "door_angle": task_status.door_angle,
+            "episode_context": self._episode_context,
+            "cup_dropped": contact_summary.cup_dropped,
             **reward_info,
         }
 
@@ -522,7 +543,7 @@ class DoorInteractionEnv(BaseEnv):
             "cup_linear_vel": cup_lin_vel,
             "cup_angular_vel": cup_ang_vel,
             # 感知视觉 latent（来自 door_perception，步进时由外部注入或延迟加载）
-            "z_aff": None,
+            "door_embedding": None,
         }
 
         self._attach_stability_proxies(state)
@@ -556,7 +577,7 @@ class DoorInteractionEnv(BaseEnv):
             "cup_pose": np.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0], dtype=np.float64),
             "cup_linear_vel": np.zeros(3, dtype=np.float64),
             "cup_angular_vel": np.zeros(3, dtype=np.float64),
-            "z_aff": None,
+            "door_embedding": None,
         }
         if self._left_occupied or self._right_occupied:
             state["cup_position"] = np.zeros(3, dtype=np.float64)
@@ -584,15 +605,19 @@ class DoorInteractionEnv(BaseEnv):
             left_ee_orientation=state["left_ee_orientation"],
             left_ee_linear_velocity=state["left_ee_linear_velocity"],
             left_ee_angular_velocity=state["left_ee_angular_velocity"],
+            left_ee_linear_acceleration=state["left_ee_linear_acceleration"],
+            left_ee_angular_acceleration=state["left_ee_angular_acceleration"],
             left_stability_proxy=state["left_stability_proxy"],
             right_ee_position=state["right_ee_position"],
             right_ee_orientation=state["right_ee_orientation"],
             right_ee_linear_velocity=state["right_ee_linear_velocity"],
             right_ee_angular_velocity=state["right_ee_angular_velocity"],
+            right_ee_linear_acceleration=state["right_ee_linear_acceleration"],
+            right_ee_angular_acceleration=state["right_ee_angular_acceleration"],
             right_stability_proxy=state["right_stability_proxy"],
             left_occupied=float(self._left_occupied),
             right_occupied=float(self._right_occupied),
-            z_aff=state.get("z_aff"),
+            door_embedding=state.get("door_embedding"),
             action_taken=action_taken,
         )
 
@@ -600,6 +625,8 @@ class DoorInteractionEnv(BaseEnv):
         self,
         actor_obs: dict,
         state: dict[str, Any],
+        *,
+        cup_dropped: float = 0.0,
     ) -> dict:
         """调用 CriticObsBuilder 追加 privileged 信息。"""
         return CriticObsBuilder.build(
@@ -607,14 +634,98 @@ class DoorInteractionEnv(BaseEnv):
             door_pose=state["door_pose"],
             door_joint_pos=state["door_joint_pos"],
             door_joint_vel=state["door_joint_vel"],
-            cup_pose=state["cup_pose"],
-            cup_linear_vel=state["cup_linear_vel"],
-            cup_angular_vel=state["cup_angular_vel"],
             cup_mass=self._domain_params.get("cup_mass", 0.0),
             door_mass=self._domain_params.get("door_mass", 0.0),
             door_damping=self._domain_params.get("door_damping", 0.0),
             base_pos=self._domain_params.get("base_pos"),
+            cup_dropped=cup_dropped,
         )
+
+    def get_visual_observation(self) -> dict[str, Any] | None:
+        """返回当前环境可用于视觉编码的原始观测。
+
+        当 Isaac 相机不可用或当前帧读取失败时返回 ``None``，
+        训练侧 ``PerceptionRuntime`` 会退化为缓存零向量。
+        """
+        handles = self._handles
+        if handles is None:
+            return None
+
+        camera = getattr(handles, "camera_view", None)
+        if camera is None:
+            return None
+
+        try:
+            rgba = camera.get_rgba()
+            frame = camera.get_current_frame()
+        except Exception:
+            return None
+
+        if rgba is None or np.size(rgba) == 0:
+            return None
+        if not frame or "distance_to_image_plane" not in frame:
+            return None
+
+        depth = frame["distance_to_image_plane"]
+        if depth is None or np.size(depth) == 0:
+            return None
+
+        extrinsic = self._camera_to_base_extrinsic()
+        if extrinsic is None:
+            extrinsic = np.eye(4, dtype=np.float64)
+
+        return {
+            "rgb": np.asarray(rgba, dtype=np.uint8)[..., :3].copy(),
+            "depth": np.asarray(depth, dtype=np.float32).copy(),
+            "extrinsic": extrinsic,
+        }
+
+    def _camera_to_base_extrinsic(self) -> np.ndarray | None:
+        """计算相机坐标系到 ``base_link`` 的变换矩阵。"""
+        if not _HAS_ISAAC_LAB or self._handles is None:
+            return None
+
+        camera = getattr(self._handles, "camera_view", None)
+        if camera is None:
+            return None
+
+        try:
+            import omni.usd
+            from pxr import UsdGeom
+
+            stage = omni.usd.get_context().get_stage()
+            if stage is None:
+                return None
+
+            cam_prim_path = getattr(camera, "prim_path", None)
+            if not cam_prim_path:
+                return None
+
+            cam_prim = stage.GetPrimAtPath(cam_prim_path)
+            if not cam_prim.IsValid():
+                return None
+
+            cam_to_world = np.array(
+                UsdGeom.Xformable(cam_prim).ComputeLocalToWorldTransform(0.0),
+                dtype=np.float64,
+            )
+
+            h = self._handles
+            robot = h.robot_view
+            if robot is None or h.base_body_idx < 0:
+                return None
+
+            base_pos_w = robot.data.body_pos_w[0][h.base_body_idx].cpu().numpy()
+            base_quat_w = robot.data.body_quat_w[0][h.base_body_idx].cpu().numpy()
+
+            base_to_world = np.eye(4, dtype=np.float64)
+            base_to_world[:3, :3] = _quat_to_rotation_matrix(base_quat_w)
+            base_to_world[:3, 3] = base_pos_w
+
+            world_to_base = np.linalg.inv(base_to_world)
+            return world_to_base @ cam_to_world
+        except Exception:
+            return None
 
     # ═══════════════════════════════════════════════════════════════════
     # 内部方法 — 奖励计算

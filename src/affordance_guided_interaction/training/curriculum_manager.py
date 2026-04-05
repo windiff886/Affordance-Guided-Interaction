@@ -1,8 +1,8 @@
-"""课程管理器 — 五阶段自动跃迁与配置分发。
+"""课程管理器 — push-only 三阶段自动跃迁与配置分发。
 
 实现 training/README.md §4 中定义的课程学习机制：
 
-- §4.2 五阶段自动跃迁：从基础视觉引导接触到全域泛化
+- §4.2 三阶段自动跃迁：从无杯 push 到单臂持杯，再到最终混合分布
 - §4.3 跃迁条件数学判据：滑动窗口平均成功率 ≥ η_thresh
 - §4.4 课程与奖励缩放 s_t 的协同
 
@@ -12,7 +12,13 @@
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+import math
+
+import numpy as np
+
+
+_OCCUPANCY_CONTEXTS = ("none", "left_only", "right_only", "both")
 
 
 @dataclass
@@ -21,54 +27,98 @@ class StageConfig:
 
     name: str
     stage_id: int
-    cup_probability: float          # P(occupied)
-    door_types: list[str]           # 允许的门类型
+    context_probabilities: dict[str, float]
+    door_types: list[str]           # 当前阶段允许的门类型
     description: str                # 核心学习目标
 
+    def __post_init__(self) -> None:
+        invalid = set(self.context_probabilities) - set(_OCCUPANCY_CONTEXTS)
+        if invalid:
+            raise ValueError(f"未知 occupancy context: {sorted(invalid)}")
 
-# ── 五阶段定义（对齐 README §4.2）──────────────────────────────────
+        total = float(sum(self.context_probabilities.values()))
+        if total <= 0.0:
+            raise ValueError("context_probabilities 必须包含正概率")
+        if not math.isclose(total, 1.0, rel_tol=1e-6, abs_tol=1e-6):
+            raise ValueError(
+                f"context_probabilities 概率和必须为 1.0，当前为 {total}"
+            )
+
+        for context, prob in self.context_probabilities.items():
+            if prob < 0.0:
+                raise ValueError(
+                    f"context_probabilities[{context!r}] 不能为负数，当前为 {prob}"
+                )
+
+    def sample_occupancy_batch(
+        self,
+        n_envs: int,
+        rng: object | None = None,
+    ) -> tuple[list[bool], list[bool]]:
+        """按当前阶段的上下文分布采样一批左右持杯标记。"""
+        chooser = np.random if rng is None else rng
+        contexts = list(self.context_probabilities.keys())
+        probs = [self.context_probabilities[c] for c in contexts]
+        sampled = chooser.choice(contexts, size=n_envs, p=probs)
+
+        left_occupied: list[bool] = []
+        right_occupied: list[bool] = []
+        for context in sampled.tolist():
+            if context == "none":
+                left_occupied.append(False)
+                right_occupied.append(False)
+            elif context == "left_only":
+                left_occupied.append(True)
+                right_occupied.append(False)
+            elif context == "right_only":
+                left_occupied.append(False)
+                right_occupied.append(True)
+            elif context == "both":
+                left_occupied.append(True)
+                right_occupied.append(True)
+            else:
+                raise ValueError(f"未知采样结果: {context}")
+
+        return left_occupied, right_occupied
+
+
+# ── 三阶段定义（对齐 README §4.2）──────────────────────────────────
 
 STAGE_CONFIGS: list[StageConfig] = [
     StageConfig(
         name="stage_1",
         stage_id=1,
-        cup_probability=0.0,
+        context_probabilities={"none": 1.0},
         door_types=["push"],
         description="基础视觉引导接触，跑通网络闭环",
     ),
     StageConfig(
         name="stage_2",
         stage_id=2,
-        cup_probability=1.0,
+        context_probabilities={
+            "left_only": 0.5,
+            "right_only": 0.5,
+        },
         door_types=["push"],
-        description="在稳定性约束 r_stab 与 s_t 下学会力控",
+        description="在单臂持杯约束下学会稳定推门",
     ),
     StageConfig(
         name="stage_3",
         stage_id=3,
-        cup_probability=0.5,
-        door_types=["push", "pull"],
-        description="视觉区分 affordance 类型，调整接触策略",
-    ),
-    StageConfig(
-        name="stage_4",
-        stage_id=4,
-        cup_probability=0.5,
-        door_types=["handle_push", "handle_pull"],
-        description="学习时序子任务组合，依靠 RNN 跨越 reward delay",
-    ),
-    StageConfig(
-        name="stage_5",
-        stage_id=5,
-        cup_probability=0.5,
-        door_types=["push", "pull", "handle_push", "handle_pull"],
-        description="高强度域随机化下的全域泛化",
+        context_probabilities={
+            "none": 0.25,
+            "left_only": 0.25,
+            "right_only": 0.25,
+            "both": 0.25,
+        },
+        door_types=["push"],
+        description="在最终混合分布下统一覆盖无杯、单臂持杯和双臂持杯",
     ),
 ]
 
 
 class CurriculumManager:
-    """五阶段课程管理器。
+    """push-only 三阶段课程管理器。
 
     通过滑动窗口平均成功率判断阶段跃迁：
 
@@ -83,7 +133,9 @@ class CurriculumManager:
     threshold : float
         成功率跃迁阈值 η_thresh，默认 0.8。
     stages : list[StageConfig] | None
-        自定义阶段配置列表。为 None 时使用默认五阶段。
+        自定义阶段配置列表。为 None 时使用默认三阶段。
+    initial_stage : str | int | None
+        初始阶段名或阶段编号。为 None 时从第一个阶段开始。
     """
 
     def __init__(
@@ -91,14 +143,32 @@ class CurriculumManager:
         window_size: int = 50,
         threshold: float = 0.8,
         stages: list[StageConfig] | None = None,
+        initial_stage: str | int | None = None,
     ) -> None:
         self._stages = stages or STAGE_CONFIGS
         self._window_size = window_size
         self._threshold = threshold
 
-        self._current_idx: int = 0
+        self._current_idx = self._resolve_initial_index(initial_stage)
         self._success_window: deque[float] = deque(maxlen=window_size)
         self._total_epochs: int = 0
+
+    def _resolve_initial_index(self, initial_stage: str | int | None) -> int:
+        """解析初始阶段配置。"""
+        if initial_stage is None:
+            return 0
+
+        if isinstance(initial_stage, int):
+            for idx, stage in enumerate(self._stages):
+                if stage.stage_id == initial_stage:
+                    return idx
+            raise ValueError(f"未知初始阶段编号: {initial_stage}")
+
+        for idx, stage in enumerate(self._stages):
+            if stage.name == initial_stage:
+                return idx
+
+        raise ValueError(f"未知初始阶段名称: {initial_stage}")
 
     # ═══════════════════════════════════════════════════════════════════
     # 状态查询
@@ -189,7 +259,7 @@ class CurriculumManager:
 
     def load_state_dict(self, state: dict) -> None:
         """恢复状态（用于 checkpoint 加载）。"""
-        self._current_idx = state["current_idx"]
+        self._current_idx = max(0, min(state["current_idx"], len(self._stages) - 1))
         self._success_window = deque(
             state["success_window"], maxlen=self._window_size
         )
