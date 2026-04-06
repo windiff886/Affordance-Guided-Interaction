@@ -33,6 +33,8 @@ class PerceptionRuntime:
         refresh_interval: int = 4,
         embedding_dim: int = 768,
         pipeline: Any | None = None,
+        visualize_detections: bool = False,
+        strict_mode: bool = False,
     ) -> None:
         if refresh_interval <= 0:
             raise ValueError("refresh_interval must be positive")
@@ -40,11 +42,13 @@ class PerceptionRuntime:
         self.embedding_dim = embedding_dim
         self._pipeline = pipeline
         self._pipeline_initialized = pipeline is not None
+        self._visualize_detections = visualize_detections
+        self._strict_mode = strict_mode
         self._cache: list[VisualCacheEntry] = []
 
     def reset(self, n_envs: int) -> None:
         """完全重置所有环境的视觉缓存。"""
-        zero = np.zeros(self.embedding_dim, dtype=np.float64)
+        zero = np.zeros(self.embedding_dim, dtype=np.float32)
         self._cache = [
             VisualCacheEntry(
                 door_embedding=zero.copy(),
@@ -99,7 +103,7 @@ class PerceptionRuntime:
             self.reset(n_envs)
 
     def _encode(self, observation: dict[str, Any] | None) -> tuple[np.ndarray, bool]:
-        zero = np.zeros(self.embedding_dim, dtype=np.float64)
+        zero = np.zeros(self.embedding_dim, dtype=np.float32)
         if observation is None:
             return zero, False
 
@@ -112,7 +116,7 @@ class PerceptionRuntime:
         except Exception:
             return zero, False
 
-        arr = np.asarray(embedding, dtype=np.float64).ravel()
+        arr = np.asarray(embedding, dtype=np.float32).ravel()
         if arr.shape != (self.embedding_dim,):
             return zero, False
         return arr, True
@@ -123,10 +127,23 @@ class PerceptionRuntime:
 
         self._pipeline_initialized = True
         try:
-            from affordance_guided_interaction.door_perception import AffordancePipeline
+            from affordance_guided_interaction.door_perception import (
+                AffordancePipeline,
+                AffordancePipelineConfig,
+            )
 
-            self._pipeline = AffordancePipeline()
-        except Exception:
+            config = AffordancePipelineConfig(
+                visualize_detections=self._visualize_detections,
+            )
+            self._pipeline = AffordancePipeline(config)
+        except Exception as exc:
+            if self._strict_mode:
+                raise RuntimeError(
+                    "strict_mode=true 但视觉管线初始化失败。"
+                    "请确保 LangSAM / Point-MAE 等依赖已正确安装。"
+                    "若需要在无视觉依赖环境下开发调试，请设置 "
+                    "training.debug.strict_mode: false"
+                ) from exc
             self._pipeline = None
         return self._pipeline
 
@@ -139,17 +156,13 @@ class PerceptionRuntime:
         actor_obs.setdefault("visual", {})
         actor_obs["visual"]["door_embedding"] = entry.door_embedding.copy()
         actor_obs["visual"]["visual_valid"] = np.array(
-            [1.0 if entry.visual_valid else 0.0], dtype=np.float64
+            [1.0 if entry.visual_valid else 0.0], dtype=np.float32
         )
 
         critic_actor_obs = critic_obs.get("actor_obs")
         if isinstance(critic_actor_obs, dict):
             critic_actor_obs.setdefault("visual", {})
-            critic_actor_obs["door_embedding"] = critic_actor_obs.get(
-                "door_embedding",
-                entry.door_embedding.copy(),
-            )
             critic_actor_obs["visual"]["door_embedding"] = entry.door_embedding.copy()
             critic_actor_obs["visual"]["visual_valid"] = np.array(
-                [1.0 if entry.visual_valid else 0.0], dtype=np.float64
+                [1.0 if entry.visual_valid else 0.0], dtype=np.float32
             )

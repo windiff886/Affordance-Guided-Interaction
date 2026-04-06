@@ -1,19 +1,14 @@
 """PPO 训练主入口 — 完整的采集-优化-课程-日志循环。
 
 用法:
-    # Isaac Lab 本地验证（4060 Laptop，少量环境快速跑通）
-    python scripts/train.py --config configs/training/default.yaml --num-envs 2
+    python scripts/train.py
 
-    # A100 服务器无头训练（完整规模）
-    python scripts/train.py --config configs/training/default.yaml --headless
-
-    # 从 checkpoint 恢复训练
-    python scripts/train.py --resume checkpoints/ckpt_iter_1000.pt
+训练运行参数统一从 ``configs/training/default.yaml`` 读取。
+如需切换本地验证 / A100 训练配置，请直接修改 YAML 中的生效值。
 """
 
 from __future__ import annotations
 
-import argparse
 import os
 import sys
 import time
@@ -32,23 +27,40 @@ _SRC_ROOT = _PROJECT_ROOT / "src"
 if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
+from affordance_guided_interaction.utils.sim_runtime import (
+    launch_simulation_app,
+)
+from affordance_guided_interaction.utils.runtime_env import resolve_headless_mode
+from affordance_guided_interaction.utils.train_runtime_config import (
+    resolve_train_runtime_config,
+)
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # 配置加载
 # ═══════════════════════════════════════════════════════════════════════
 
-def load_config(config_path: str) -> dict[str, Any]:
-    """加载并合并所有 YAML 配置文件。"""
-    base_dir = Path(config_path).resolve().parent.parent  # configs/
+def load_config(configs_dir: str | Path | None = None) -> dict[str, Any]:
+    """加载并合并所有 YAML 配置文件。
+
+    默认从项目根目录下的 ``configs/`` 目录读取各子目录中的
+    ``default.yaml``，无需手动指定路径。
+
+    Parameters
+    ----------
+    configs_dir:
+        配置根目录，默认为 ``<project_root>/configs``。
+    """
+    configs_dir = _resolve_configs_root(configs_dir)
+
     merged: dict[str, Any] = {}
 
     config_files = {
-        "training": base_dir / "training/default.yaml",
-        "env": base_dir / "env/default.yaml",
-        "policy": base_dir / "policy/default.yaml",
-        "task": base_dir / "task/default.yaml",
-        "curriculum": base_dir / "curriculum/default.yaml",
-        "reward": base_dir / "reward/default.yaml",
+        "training": configs_dir / "training/default.yaml",
+        "env": configs_dir / "env/default.yaml",
+        "policy": configs_dir / "policy/default.yaml",
+        "task": configs_dir / "task/default.yaml",
+        "curriculum": configs_dir / "curriculum/default.yaml",
     }
 
     for key, path in config_files.items():
@@ -62,32 +74,31 @@ def load_config(config_path: str) -> dict[str, Any]:
     return merged
 
 
+def _resolve_configs_root(configs_dir: str | Path | None) -> Path:
+    """将配置根解析为 ``configs/`` 目录。
+
+    兼容两种输入：
+    1. 配置根目录本身，如 ``configs/``
+    2. 其中任一 YAML 文件，如 ``configs/training/default.yaml``
+    """
+    if configs_dir is None:
+        return (_PROJECT_ROOT / "configs").resolve()
+
+    path = Path(configs_dir).resolve()
+    if path.is_file():
+        return path.parents[1]
+
+    if path.name in {"training", "env", "policy", "task", "curriculum"}:
+        default_yaml = path / "default.yaml"
+        if default_yaml.exists():
+            return path.parent
+
+    return path
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # 组件工厂
 # ═══════════════════════════════════════════════════════════════════════
-
-def build_env_config(cfg: dict) -> "EnvConfig":
-    """从合并配置构建 EnvConfig 实例。"""
-    from affordance_guided_interaction.envs.base_env import EnvConfig
-
-    env_cfg = cfg.get("env", {})
-    task_cfg = cfg.get("task", {})
-    reward_cfg = cfg.get("reward", {})
-
-    return EnvConfig(
-        physics_dt=env_cfg.get("physics_dt", 1.0 / 120.0),
-        decimation=env_cfg.get("decimation", 2),
-        max_episode_steps=env_cfg.get("max_episode_steps", 500),
-        door_angle_target=task_cfg.get("door_angle_target", 1.57),
-        cup_drop_threshold=task_cfg.get("cup_drop_threshold", 0.15),
-        contact_force_threshold=env_cfg.get("contact_force_threshold", 0.1),
-        joints_per_arm=env_cfg.get("joints_per_arm", 6),
-        total_joints=env_cfg.get("total_joints", 12),
-        reward_cfg=reward_cfg if reward_cfg else None,
-        action_history_length=env_cfg.get("action_history_length", 3),
-        acc_history_length=env_cfg.get("acc_history_length", 10),
-    )
-
 
 def build_models(cfg: dict, device: torch.device):
     """创建 Actor 和 Critic 网络实例。"""
@@ -106,8 +117,6 @@ def build_models(cfg: dict, device: torch.device):
         rnn_type=actor_section.get("rnn_type", "gru"),
         action_dim=actor_section.get("action_dim", 12),
         log_std_init=actor_section.get("log_std_init", -0.5),
-        action_history_length=actor_section.get("action_history_length", 3),
-        acc_history_length=actor_section.get("acc_history_length", 10),
         include_torques=actor_section.get("include_torques", True),
     )
 
@@ -145,9 +154,50 @@ def build_ppo_trainer(actor, critic, cfg: dict, device: torch.device):
         num_epochs=ppo_section.get("num_epochs", 5),
         seq_length=ppo_section.get("seq_length", 16),
         normalize_advantages=ppo_section.get("normalize_advantages", True),
+        lr_decay=ppo_section.get("lr_decay", False),
+        lr_total_steps=ppo_section.get("lr_total_steps", 10_000_000),
     )
 
     return PPOTrainer(actor, critic, ppo_cfg, device), ppo_cfg
+
+
+def build_env_cfg(
+    cfg: dict[str, Any],
+    n_envs: int,
+    *,
+    device: str | None = None,
+    seed: int | None = None,
+    enable_cameras: bool = True,
+):
+    """基于 YAML 配置构建 DoorPushEnvCfg。"""
+    from affordance_guided_interaction.envs.door_push_env_cfg import DoorPushEnvCfg
+
+    env_cfg = DoorPushEnvCfg()
+    env_cfg.scene.num_envs = int(n_envs)
+    env_cfg.sim.render_interval = int(env_cfg.decimation)
+
+    if device is not None:
+        env_cfg.sim.device = str(device)
+    if seed is not None:
+        env_cfg.seed = int(seed)
+
+    env_cfg_yaml = cfg.get("env", {})
+    if "physics_dt" in env_cfg_yaml:
+        env_cfg.sim.dt = float(env_cfg_yaml["physics_dt"])
+    if "decimation" in env_cfg_yaml:
+        env_cfg.decimation = int(env_cfg_yaml["decimation"])
+        env_cfg.sim.render_interval = env_cfg.decimation
+
+    if not enable_cameras:
+        env_cfg.scene.tiled_camera = None
+
+    task_cfg = cfg.get("task", {})
+    if "door_angle_target" in task_cfg:
+        env_cfg.door_angle_target = float(task_cfg["door_angle_target"])
+    if "cup_drop_threshold" in task_cfg:
+        env_cfg.cup_drop_threshold = float(task_cfg["cup_drop_threshold"])
+
+    return env_cfg
 
 
 def build_curriculum_reset_batch(
@@ -157,7 +207,7 @@ def build_curriculum_reset_batch(
 ) -> tuple[list[Any], list[str], list[bool], list[bool]]:
     """根据当前课程阶段生成一批 reset 参数。"""
     domain_params_list = randomizer.sample_batch_episode_params(n_envs)
-    door_types = [str(np.random.choice(stage_cfg.door_types)) for _ in range(n_envs)]
+    door_types = [str(randomizer._rng.choice(stage_cfg.door_types)) for _ in range(n_envs)]
     left_occupied, right_occupied = stage_cfg.sample_occupancy_batch(n_envs)
     return domain_params_list, door_types, left_occupied, right_occupied
 
@@ -181,9 +231,8 @@ def build_collector(
     n_steps = t_cfg.get("n_steps_per_rollout", 128)
 
     # 计算各分支维度（与 Actor 网络输入一致）
-    n = 6  # joints_per_arm
     proprio_dim = (
-        12                                               # q
+        12                                               # q (TOTAL_ARM_JOINTS)
         + 12                                             # dq
         + (12 if actor_cfg.include_torques else 0)       # tau
         + 12                                             # prev_action
@@ -194,7 +243,7 @@ def build_collector(
         "ee": 38,                                           # 双臂各 19
         "context": 2,                                       # left_occ + right_occ
         "stability": 2,                                     # left/right tilt
-        "visual": 768,                                      # Point-MAE 编码
+        "visual": 769,                                      # Point-MAE 编码(768) + visual_valid(1)
     }
 
     buffer = RolloutBuffer(
@@ -211,9 +260,12 @@ def build_collector(
     # partial 绑定展平函数
     batch_flatten_fn = partial(batch_flatten_actor_obs, cfg=actor_cfg)
     visual_cfg = t_cfg.get("visual", {})
+    debug_cfg = t_cfg.get("debug", {})
     perception_runtime = PerceptionRuntime(
         refresh_interval=visual_cfg.get("refresh_interval", 4),
-        embedding_dim=actor_branch_dims["visual"],
+        embedding_dim=768,  # Point-MAE embedding dim（不含 visual_valid）
+        visualize_detections=debug_cfg.get("visualize_detections", False),
+        strict_mode=debug_cfg.get("strict_mode", False),
     )
 
     collector = RolloutCollector(
@@ -286,25 +338,12 @@ def load_checkpoint(
 
 def main() -> int:
     """训练主入口。"""
-    parser = argparse.ArgumentParser(
-        description="Affordance-Guided Interaction PPO 训练"
-    )
-    parser.add_argument(
-        "--config", default="configs/training/default.yaml",
-        help="训练配置文件路径",
-    )
-    parser.add_argument("--num-envs", type=int, default=None, help="覆盖并行环境数")
-    parser.add_argument("--headless", action="store_true", help="无头模式（服务器训练）")
-    parser.add_argument("--resume", type=str, default=None, help="恢复训练的 checkpoint 路径")
-    parser.add_argument("--device", type=str, default=None, help="计算设备 (cuda/cpu)")
-    parser.add_argument("--seed", type=int, default=42, help="随机种子")
-    parser.add_argument("--log-dir", type=str, default="runs", help="TensorBoard 日志目录")
-    parser.add_argument("--ckpt-dir", type=str, default="checkpoints", help="Checkpoint 保存目录")
-    args = parser.parse_args()
+    cfg = load_config()
+    runtime_cfg = resolve_train_runtime_config(cfg, project_root=_PROJECT_ROOT)
 
     # ── 设备选择 ─────────────────────────────────────────────
-    if args.device:
-        device = torch.device(args.device)
+    if runtime_cfg.device:
+        device = torch.device(runtime_cfg.device)
     elif torch.cuda.is_available():
         device = torch.device("cuda")
     else:
@@ -312,38 +351,57 @@ def main() -> int:
     print(f"🖥️  计算设备: {device}")
 
     # ── 随机种子 ─────────────────────────────────────────────
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
+    torch.manual_seed(runtime_cfg.seed)
+    np.random.seed(runtime_cfg.seed)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
-
-    # ── 加载配置 ─────────────────────────────────────────────
-    config_path = str(_PROJECT_ROOT / args.config)
-    cfg = load_config(config_path)
-
-    # 命令行覆盖
-    if args.num_envs is not None:
-        cfg["training"]["num_envs"] = args.num_envs
+        torch.cuda.manual_seed_all(runtime_cfg.seed)
 
     t_cfg = cfg.get("training", {})
-    n_envs = t_cfg.get("num_envs", 4)
+    debug_cfg = t_cfg.get("debug", {})
+
+    n_envs = runtime_cfg.num_envs or t_cfg.get("num_envs", 4)
     total_steps = t_cfg.get("total_steps", 10_000_000)
     n_steps_per_rollout = t_cfg.get("n_steps_per_rollout", 128)
     ckpt_interval = t_cfg.get("checkpoint_interval", 50)
     log_interval = t_cfg.get("log_interval", 1)
+    requested_headless = runtime_cfg.headless or ("--headless" in sys.argv[1:])
+    headless = resolve_headless_mode(requested_headless, os.environ)
+    enable_cameras = device.type == "cuda"
 
     print(f"📋 训练配置:")
     print(f"   并行环境数: {n_envs}")
     print(f"   总步数: {total_steps:,}")
     print(f"   每轮采集步数: {n_steps_per_rollout}")
-    print(f"   无头模式: {args.headless}")
+    print(f"   无头模式: {headless}")
+    print(f"   随机种子: {runtime_cfg.seed}")
+    print(f"   启用视觉传感器: {enable_cameras}")
+
+    simulation_app = launch_simulation_app(
+        headless=headless,
+        enable_cameras=enable_cameras,
+        import_error_message=(
+            "未检测到 isaacsim 运行时，train.py 将继续使用当前 Python 环境。"
+        ),
+    )
+    if simulation_app is not None:
+        mode = "headless" if headless else "windowed"
+        print(f"✅ Isaac Sim 已启动 ({mode})")
 
     # ── 构建环境 ─────────────────────────────────────────────
-    env_config = build_env_config(cfg)
+    # GPU 批量并行环境（DirectRLEnv）— 唯一训练路径
+    from affordance_guided_interaction.envs.door_push_env import DoorPushEnv
+    from affordance_guided_interaction.envs.direct_rl_env_adapter import DirectRLEnvAdapter
 
-    from affordance_guided_interaction.envs.vec_env import VecDoorEnv
-    envs = VecDoorEnv(n_envs=n_envs, cfg=env_config)
-    print(f"✅ 已创建 {n_envs} 个并行环境")
+    env_cfg = build_env_cfg(
+        cfg,
+        n_envs,
+        device=str(device),
+        seed=runtime_cfg.seed,
+        enable_cameras=enable_cameras,
+    )
+    _direct_env = DoorPushEnv(cfg=env_cfg)
+    envs = DirectRLEnvAdapter(_direct_env)
+    print(f"✅ 已创建 {n_envs} 个 GPU 批量并行环境 (DirectRLEnv)")
 
     # ── 构建模型 ─────────────────────────────────────────────
     actor, critic, actor_cfg = build_models(cfg, device)
@@ -375,7 +433,24 @@ def main() -> int:
 
     # ── 域随机化器 ────────────────────────────────────────────
     from affordance_guided_interaction.training.domain_randomizer import DomainRandomizer
-    randomizer = DomainRandomizer(seed=args.seed)
+    randomizer = DomainRandomizer(seed=runtime_cfg.seed)
+
+    # ── 注入 episode 重采样回调 ─────────────────────────────────
+    # 让 auto-reset 时每个 done 的环境都能独立重新采样域参数和课程上下文，
+    # 而不是复用旧缓存（修复 episode 级域随机化）。
+    def _episode_reset_fn(env_idx: int):
+        stage_cfg = curriculum.get_stage_config()
+        domain_params = randomizer.sample_episode_params()
+        door_type = str(randomizer._rng.choice(stage_cfg.door_types))
+        left_occ, right_occ = stage_cfg.sample_occupancy_batch(1)
+        return domain_params, door_type, left_occ[0], right_occ[0]
+
+    envs.set_episode_reset_fn(_episode_reset_fn)
+
+    # ── 兼容旧接口（no-op）─────────────────────────────────────
+    # DoorPushEnv 内部已内置 action_noise_std 和 obs_noise_std，
+    # 不依赖外部 randomizer 注入步级噪声。保留调用以兼容接口。
+    envs.set_randomizer(randomizer)
 
     # ── 指标聚合器 ────────────────────────────────────────────
     from affordance_guided_interaction.training.metrics import TrainingMetrics
@@ -386,8 +461,8 @@ def main() -> int:
     try:
         from torch.utils.tensorboard import SummaryWriter
         run_name = f"ppo_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        writer = SummaryWriter(log_dir=str(_PROJECT_ROOT / args.log_dir / run_name))
-        print(f"📊 TensorBoard 日志: {args.log_dir}/{run_name}")
+        writer = SummaryWriter(log_dir=str(runtime_cfg.log_dir / run_name))
+        print(f"📊 TensorBoard 日志: {runtime_cfg.log_dir / run_name}")
     except ImportError:
         print("⚠️ TensorBoard 不可用，跳过日志记录")
 
@@ -395,10 +470,10 @@ def main() -> int:
     start_iter = 0
     global_steps = 0
     best_success_rate = 0.0
-    ckpt_dir = Path(_PROJECT_ROOT / args.ckpt_dir)
+    ckpt_dir = runtime_cfg.ckpt_dir
 
-    if args.resume:
-        resume_path = Path(args.resume)
+    if runtime_cfg.resume is not None:
+        resume_path = runtime_cfg.resume
         if resume_path.exists():
             start_iter, global_steps, best_success_rate = load_checkpoint(
                 resume_path, actor, critic, ppo_trainer, curriculum, device
@@ -453,9 +528,10 @@ def main() -> int:
             # ── Step 3: PPO 参数更新 ──────────────────────────
             update_metrics = ppo_trainer.update(buffer)
 
-            # ── Step 4: 更新全局步数计数器 ─────────────────────
+            # ── Step 4: 更新全局步数计数器 & 学习率衰减 ──────────
             steps_this_iter = n_envs * n_steps
             global_steps += steps_this_iter
+            ppo_trainer.step_lr(global_steps)
 
             # ── Step 5: 指标更新 ──────────────────────────────
             metrics.update_ppo(
@@ -482,16 +558,8 @@ def main() -> int:
             if stage_changed:
                 new_stage_cfg = curriculum.get_stage_config()
                 print(f"\n📈 课程阶段跃迁 → {new_stage_cfg.name}: {new_stage_cfg.description}")
-                # 更新环境课程参数
-                domain_params_list, door_types, left_occupied, right_occupied = (
-                    build_curriculum_reset_batch(new_stage_cfg, randomizer, n_envs)
-                )
-                envs.set_curriculum(
-                    door_types=door_types,
-                    left_occupied_list=left_occupied,
-                    right_occupied_list=right_occupied,
-                    domain_params_list=domain_params_list,
-                )
+                # 新阶段参数通过 _episode_reset_fn 在各 env 下一次 reset 时逐 env 注入，
+                # 无需立即覆盖正在运行的 episode（H3 修复）
 
             # ── Step 7: 控制台日志 ────────────────────────────
             if iteration % log_interval == 0:
@@ -554,6 +622,14 @@ def main() -> int:
                 writer.add_scalar("curriculum/stage", curriculum.current_stage, global_steps)
                 writer.add_scalar("curriculum/window_mean", curriculum.window_mean, global_steps)
 
+                # 写入聚合指标
+                summary = metrics.summarize()
+                for key, val in summary.items():
+                    writer.add_scalar(f"metrics/{key}", val, global_steps)
+
+            # metrics 无论是否有 writer 都必须重置，否则列表无限增长（H4 修复）
+            metrics.reset()
+
             # ── Step 9: Checkpoint 保存 ───────────────────────
             if iteration > 0 and iteration % ckpt_interval == 0:
                 save_checkpoint(
@@ -608,6 +684,8 @@ def main() -> int:
     envs.close()
     if writer is not None:
         writer.close()
+    if simulation_app is not None:
+        simulation_app.close()
 
     return 0
 

@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import warnings
 from typing import Iterator
 
 import torch
@@ -32,9 +33,9 @@ class RolloutBuffer:
         每轮 rollout 的采集步数 T。
     actor_branch_dims : dict[str, int]
         Actor 各分支的维度映射，例如：
-        ``{"proprio": 60, "ee": 26, "context": 2, "stability": 40, "visual": 768}``
+        ``{"proprio": 60, "ee": 26, "context": 2, "stability": 40, "visual": 769}``
     privileged_dim : int
-        展平后的 privileged 信息总维度（28）。
+        展平后的 privileged 信息总维度（16）。
     action_dim : int
         动作维度（默认 12）。
     rnn_hidden_dim : int
@@ -88,6 +89,10 @@ class RolloutBuffer:
         self.hidden_states = torch.zeros(
             n_steps, rnn_num_layers, n_envs, rnn_hidden_dim, device=self.device
         )
+        # LSTM cell state（如果使用 GRU 则保持全零不影响）
+        self.cell_states = torch.zeros(
+            n_steps, rnn_num_layers, n_envs, rnn_hidden_dim, device=self.device
+        )
 
         # ── GAE 计算结果 ─────────────────────────────────────────
         self.advantages = torch.zeros(n_steps, n_envs, device=self.device)
@@ -109,6 +114,7 @@ class RolloutBuffer:
         rewards: torch.Tensor,
         dones: torch.Tensor,
         hidden_states: torch.Tensor,
+        cell_states: torch.Tensor | None = None,
     ) -> None:
         """写入第 step_idx 步的 transition 数据。
 
@@ -127,6 +133,8 @@ class RolloutBuffer:
         dones : ``(n_envs,)``
         hidden_states : ``(num_layers, n_envs, hidden_dim)``
             当前步开始时的 RNN 隐状态（在 actor forward 之前缓存）。
+        cell_states : ``(num_layers, n_envs, hidden_dim)`` | None
+            LSTM cell state（GRU 时传 None）。
         """
         for name, tensor in actor_obs_branches.items():
             self.actor_obs_branches[name][step_idx] = tensor
@@ -138,6 +146,8 @@ class RolloutBuffer:
         self.rewards[step_idx] = rewards
         self.dones[step_idx] = dones
         self.hidden_states[step_idx] = hidden_states
+        if cell_states is not None:
+            self.cell_states[step_idx] = cell_states
 
     # ═══════════════════════════════════════════════════════════════════
     # §2.2 GAE 优势估计
@@ -177,7 +187,7 @@ class RolloutBuffer:
                 next_non_terminal = 1.0 - last_dones
             else:
                 next_values = self.values[t + 1]
-                next_non_terminal = 1.0 - self.dones[t + 1]
+                next_non_terminal = 1.0 - self.dones[t]
 
             # TD 残差 δ_t
             delta = (
@@ -186,13 +196,13 @@ class RolloutBuffer:
                 - self.values[t]
             )
 
-            # GAE 递推：A_t = δ_t + γλ(1-d_{t+1}) A_{t+1}
+            # GAE 递推：A_t = δ_t + γλ(1-d_t) A_{t+1}
             last_gae = delta + gamma * lam * next_non_terminal * last_gae
 
             self.advantages[t] = last_gae
 
-        # 回报目标 R_t = A_t + V(s_t)
-        self.returns = self.advantages + self.values
+        # 回报目标 R_t = A_t + V(s_t)（原地写入，避免重新分配预分配缓存）
+        torch.add(self.advantages, self.values, out=self.returns)
 
     # ═══════════════════════════════════════════════════════════════════
     # §3.4 TBPTT 序列分割 mini-batch 生成器
@@ -228,6 +238,7 @@ class RolloutBuffer:
             - ``advantages``:  ``(batch, L)``
             - ``returns``:     ``(batch, L)``
             - ``hidden_init``: ``(num_layers, batch, hidden_dim)``
+            - ``cell_init``:   ``(num_layers, batch, hidden_dim)``
         """
         # 计算可切分的序列片段数（沿时间维度）
         num_seqs_per_env = self.n_steps // seq_length
@@ -238,8 +249,23 @@ class RolloutBuffer:
                 f"无法切分序列片段"
             )
 
+        tail = self.n_steps % seq_length
+        if tail > 0:
+            warnings.warn(
+                f"TBPTT: n_steps={self.n_steps} 不能被 seq_length={seq_length} "
+                f"整除，末尾 {tail} 步数据将被丢弃。"
+                f"建议选择 n_steps 为 seq_length 的整数倍。",
+                stacklevel=2,
+            )
+
         # 总序列片段数
         total_seqs = num_seqs_per_env * self.n_envs
+
+        if total_seqs < num_mini_batches:
+            raise ValueError(
+                f"total_seqs ({total_seqs}) < num_mini_batches ({num_mini_batches})，"
+                f"会产生空 mini-batch。请减小 num_mini_batches 或增大 n_envs/n_steps。"
+            )
 
         # 构建序列索引：(seq_start_step, env_idx)
         seq_indices = []
@@ -271,6 +297,7 @@ class RolloutBuffer:
             adv_seqs: list[torch.Tensor] = []
             ret_seqs: list[torch.Tensor] = []
             hid_seqs: list[torch.Tensor] = []
+            cell_seqs: list[torch.Tensor] = []
 
             for idx in mb_indices:
                 t_start, env_idx = seq_indices[idx.item()]
@@ -289,6 +316,7 @@ class RolloutBuffer:
                 ret_seqs.append(self.returns[t_start:t_end, env_idx])
                 # 隐状态：取片段开始时刻的缓存
                 hid_seqs.append(self.hidden_states[t_start, :, env_idx, :])
+                cell_seqs.append(self.cell_states[t_start, :, env_idx, :])
 
             result: dict[str, torch.Tensor] = {}
             # Actor 分支
@@ -302,6 +330,7 @@ class RolloutBuffer:
             result["advantages"] = torch.stack(adv_seqs)        # (B, L)
             result["returns"] = torch.stack(ret_seqs)           # (B, L)
             result["hidden_init"] = torch.stack(hid_seqs, dim=1)  # (layers, B, H)
+            result["cell_init"] = torch.stack(cell_seqs, dim=1)    # (layers, B, H)
 
             yield result
 
@@ -320,5 +349,6 @@ class RolloutBuffer:
         self.rewards.zero_()
         self.dones.zero_()
         self.hidden_states.zero_()
+        self.cell_states.zero_()
         self.advantages.zero_()
         self.returns.zero_()

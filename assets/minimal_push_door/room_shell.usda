@@ -1,0 +1,100 @@
+#usda 1.0
+(
+    defaultPrim = "RoomShell"
+    doc = """Static room geometry (walls + floor) for the push-door training scene.
+
+    Extracted from minimal_push_door.usda Room group.
+    Does NOT include door frame pieces -- those are part of solid_push_door.usda
+    and will be positioned correctly when the door is placed at (2.93, 0, 0).
+    """
+    metersPerUnit = 1
+    kilogramsPerUnit = 1
+    upAxis = "Z"
+)
+
+def Xform "RoomShell"
+{
+    # ── Floor: 6m x 5m, 10cm thick ──────────────────────────────────
+    def Cube "Floor" (
+        prepend apiSchemas = ["PhysicsCollisionAPI"]
+    )
+    {
+        color3f[] primvars:displayColor = [(0.56, 0.58, 0.60)]
+        double size = 1
+        double3 xformOp:translate = (0, 0, -0.05)
+        float3 xformOp:scale = (6, 5, 0.1)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+    }
+
+    # ── Back wall (x = -2.95) ────────────────────────────────────────
+    def Cube "BackWall" (
+        prepend apiSchemas = ["PhysicsCollisionAPI"]
+    )
+    {
+        color3f[] primvars:displayColor = [(0.90, 0.90, 0.88)]
+        double size = 1
+        double3 xformOp:translate = (-2.95, 0, 1.1)
+        float3 xformOp:scale = (0.1, 5, 2.2)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+    }
+
+    # ── Left wall (y = -2.45) ────────────────────────────────────────
+    def Cube "LeftWall" (
+        prepend apiSchemas = ["PhysicsCollisionAPI"]
+    )
+    {
+        color3f[] primvars:displayColor = [(0.90, 0.90, 0.88)]
+        double size = 1
+        double3 xformOp:translate = (0, -2.45, 1.1)
+        float3 xformOp:scale = (6, 0.1, 2.2)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+    }
+
+    # ── Right wall (y = +2.45) ───────────────────────────────────────
+    def Cube "RightWall" (
+        prepend apiSchemas = ["PhysicsCollisionAPI"]
+    )
+    {
+        color3f[] primvars:displayColor = [(0.90, 0.90, 0.88)]
+        double size = 1
+        double3 xformOp:translate = (0, 2.45, 1.1)
+        float3 xformOp:scale = (6, 0.1, 2.2)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+    }
+
+    # ── Front wall, left segment (y < -0.5) ──────────────────────────
+    def Cube "FrontWallLeft" (
+        prepend apiSchemas = ["PhysicsCollisionAPI"]
+    )
+    {
+        color3f[] primvars:displayColor = [(0.90, 0.90, 0.88)]
+        double size = 1
+        double3 xformOp:translate = (2.95, -1.50, 1.1)
+        float3 xformOp:scale = (0.1, 2.0, 2.2)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+    }
+
+    # ── Front wall, right segment (y > +0.5) ─────────────────────────
+    def Cube "FrontWallRight" (
+        prepend apiSchemas = ["PhysicsCollisionAPI"]
+    )
+    {
+        color3f[] primvars:displayColor = [(0.90, 0.90, 0.88)]
+        double size = 1
+        double3 xformOp:translate = (2.95, 1.50, 1.1)
+        float3 xformOp:scale = (0.1, 2.0, 2.2)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+    }
+
+    # ── Front wall header (above doorway) ────────────────────────────
+    def Cube "FrontWallHeader" (
+        prepend apiSchemas = ["PhysicsCollisionAPI"]
+    )
+    {
+        color3f[] primvars:displayColor = [(0.90, 0.90, 0.88)]
+        double size = 1
+        double3 xformOp:translate = (2.95, 0, 2.15)
+        float3 xformOp:scale = (0.1, 1.0, 0.1)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+    }
+}

@@ -61,6 +61,20 @@ class AffordancePipeline:
         self._segmentor = OpenVocabSegmentor(self._config.segmentation)
         self._encoder = PointMAEEncoder(self._config.encoder)
 
+        # ── debug 可视化（仅在启用时导入 cv2）──────────────────
+        self._visualizer = None
+        if self._config.visualize_detections:
+            try:
+                from affordance_guided_interaction.door_perception.debug_visualizer import (
+                    DetectionVisualizer,
+                )
+                self._visualizer = DetectionVisualizer()
+            except ImportError:
+                logger.warning(
+                    "visualize_detections=True 但 opencv-python 未安装，"
+                    "跳过可视化。安装方式: pip install opencv-python"
+                )
+
     # ------------------------------------------------------------------
     # 核心 API
     # ------------------------------------------------------------------
@@ -95,6 +109,7 @@ class AffordancePipeline:
 
         # --- 2. 深度反投影：mask → 局部点云 ---
         all_points: list[np.ndarray] = []
+        debug_point_clouds: dict[str, np.ndarray] = {}
         for key in ("door", "handle", "button"):
             mask = masks.get(key)
             if mask is not None and mask.any():
@@ -103,6 +118,18 @@ class AffordancePipeline:
                 )
                 if len(pts) > 0:
                     all_points.append(pts)
+                    if self._visualizer is not None:
+                        debug_point_clouds[key] = pts
+
+        # --- debug 可视化（在降采样前使用原始点云）---
+        if self._visualizer is not None:
+            self._visualizer.show(
+                rgb=rgb,
+                seg_results=seg_results,
+                point_clouds=debug_point_clouds,
+                intrinsics=self._config.camera,
+                extrinsic=extrinsic,
+            )
 
         # 合并所有部件的点云为一个整体
         if all_points:

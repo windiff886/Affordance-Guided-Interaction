@@ -47,10 +47,10 @@ class VecEnvProtocol(Protocol):
         -------
         actor_obs_list : list[dict]
             每个环境的 actor 观测原始字典
-            （由 ActorObsBuilder.build() 产出）。
+            （由 DirectRLEnvAdapter 产出）。
         critic_obs_list : list[dict]
             每个环境的 critic 观测原始字典
-            （由 CriticObsBuilder.build() 产出，含 privileged）。
+            （由 DirectRLEnvAdapter 产出，含 privileged）。
         """
         ...
 
@@ -84,7 +84,7 @@ ActorFlattenFn = Callable[[dict], dict[str, torch.Tensor]]
 BatchActorFlattenFn = Callable[[list[dict]], dict[str, torch.Tensor]]
 
 # 将 privileged 字典展平为 1-D Tensor 的函数类型
-# 签名: (privileged_dict) -> Tensor(28,)
+# 签名: (privileged_dict) -> Tensor(16,)
 PrivFlattenFn = Callable[[dict], torch.Tensor]
 
 
@@ -210,13 +210,14 @@ class RolloutCollector:
                 k: v.to(self.device) for k, v in actor_branches.items()
             }
 
-            # privileged: (B, 28)
+            # privileged: (B, 16)
             priv_flat = self._batch_flatten_priv(current_critic_obs)
             priv_flat = priv_flat.to(self.device)
 
             # ── 2. 缓存当前隐状态（用于 TBPTT 恢复）────────────
             if isinstance(self._hidden, tuple):
-                cached_hidden = self._hidden[0].detach().clone()
+                # LSTM: 缓存完整 (h, c) 元组，TBPTT 恢复需要 cell state
+                cached_hidden = tuple(h.detach().clone() for h in self._hidden)
             else:
                 cached_hidden = self._hidden.detach().clone()
 
@@ -227,7 +228,7 @@ class RolloutCollector:
             )
 
             # ── 4. Critic 前向：估计价值 ─────────────────────────
-            # Critic.forward 期望 dict[str, Tensor] + Tensor(B, 28)
+            # Critic.forward 期望 dict[str, Tensor] + Tensor(B, 16)
             value = self.critic.forward(
                 actor_branches, priv_flat
             ).squeeze(-1)  # (n_envs,)
@@ -246,6 +247,13 @@ class RolloutCollector:
             dones = torch.from_numpy(dones_np).float().to(self.device)
 
             # ── 6. 写入 Buffer ───────────────────────────────────
+            if isinstance(cached_hidden, tuple):
+                h_to_store = cached_hidden[0]
+                c_to_store = cached_hidden[1]
+            else:
+                h_to_store = cached_hidden
+                c_to_store = None
+
             self.buffer.add(
                 step,
                 actor_obs_branches=actor_branches,
@@ -255,7 +263,8 @@ class RolloutCollector:
                 values=value,
                 rewards=rewards,
                 dones=dones,
-                hidden_states=cached_hidden,
+                hidden_states=h_to_store,
+                cell_states=c_to_store,
             )
 
             # ── 7. 更新隐状态，处理 done 环境的隐状态重置 ────────

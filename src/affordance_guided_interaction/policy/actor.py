@@ -1,6 +1,6 @@
 """完整 Actor 网络：多分支 encoder → RecurrentBackbone → ActionHead。
 
-负责将 ``ActorObsBuilder`` 输出的嵌套字典观测拆解为分支张量，
+负责将 ``DirectRLEnvAdapter`` 输出的嵌套字典观测拆解为分支张量，
 分别编码后拼接、经循环主干网络产生隐状态特征，最终交由动作头
 输出双臂 12 维关节力矩。
 
@@ -27,7 +27,6 @@ from typing import Literal
 
 import torch
 import torch.nn as nn
-import numpy as np
 
 from .recurrent_backbone import RecurrentBackbone
 from .action_head import ActionHead
@@ -40,6 +39,8 @@ from .action_head import ActionHead
 NUM_JOINTS_PER_ARM = 6
 TOTAL_ARM_JOINTS = NUM_JOINTS_PER_ARM * 2  # 12
 DOOR_EMBEDDING_DIM = 768
+# visual 分支输入维度 = embedding(768) + visual_valid(1)
+VISUAL_BRANCH_DIM = DOOR_EMBEDDING_DIM + 1
 
 # 每条臂的末端状态维度:
 # pos(3) + quat(4) + lin_vel(3) + ang_vel(3) + lin_acc(3) + ang_acc(3) = 19
@@ -50,7 +51,6 @@ _DUAL_EE_DIM = _SINGLE_EE_DIM * 2  # 38
 _CONTEXT_DIM = 2
 
 # 单臂稳定性仅保留 tilt
-_DEFAULT_ACC_HISTORY_LEN = 10
 _SINGLE_STAB_DIM = 1
 _DUAL_STAB_DIM = _SINGLE_STAB_DIM * 2  # 2
 
@@ -82,10 +82,6 @@ class ActorConfig:
     action_dim: int = TOTAL_ARM_JOINTS
     log_std_init: float = -0.5
 
-    # 动作历史步数（与 ActorObsBuilder 保持一致）
-    action_history_length: int = 3
-    # 稳定性 proxy 加速度历史长度
-    acc_history_length: int = _DEFAULT_ACC_HISTORY_LEN
     # 是否包含关节力矩输入
     include_torques: bool = True
 
@@ -108,8 +104,18 @@ def _build_branch_encoder(in_dim: int, hidden_dim: int, out_dim: int) -> nn.Sequ
 # 观测展平工具
 # ======================================================================
 
+def _t(v) -> torch.Tensor:
+    """将任意值（CUDA tensor / CPU tensor / numpy array）转换为 1-D float32 CPU tensor。
+
+    适配器将 obs 存储为 GPU tensor 切片；展平后由 rollout_collector 统一 .to(device)。
+    """
+    if isinstance(v, torch.Tensor):
+        return v.detach().cpu().float().reshape(-1)
+    return torch.as_tensor(v, dtype=torch.float32).reshape(-1)
+
+
 def flatten_actor_obs(obs: dict, cfg: ActorConfig) -> dict[str, torch.Tensor]:
-    """将 ``ActorObsBuilder.build()`` 输出的嵌套字典展平为分支张量。
+    """将 ``DirectRLEnvAdapter`` 输出的嵌套字典展平为分支张量。
 
     返回的字典包含以下 key，各值均为 ``(feature_dim,)`` 的 1-D 张量：
 
@@ -122,7 +128,7 @@ def flatten_actor_obs(obs: dict, cfg: ActorConfig) -> dict[str, torch.Tensor]:
     Parameters
     ----------
     obs : dict
-        ``ActorObsBuilder.build()`` 返回的 actor_obs 字典。
+        ``DirectRLEnvAdapter`` 返回的 actor_obs 字典。
     cfg : ActorConfig
         配置（决定是否包含 torque 等）。
     """
@@ -130,53 +136,45 @@ def flatten_actor_obs(obs: dict, cfg: ActorConfig) -> dict[str, torch.Tensor]:
 
     # -- proprio --
     parts = [
-        np.asarray(proprio["joint_positions"]).ravel(),
-        np.asarray(proprio["joint_velocities"]).ravel(),
+        _t(proprio["joint_positions"]),
+        _t(proprio["joint_velocities"]),
     ]
     if cfg.include_torques:
-        parts.append(
-            np.asarray(
-                proprio.get("joint_torques", np.zeros(TOTAL_ARM_JOINTS))
-            ).ravel()
-        )
-    parts.append(np.asarray(proprio["prev_action"]).ravel())
-
-    proprio_vec = torch.from_numpy(np.concatenate(parts)).float()
+        parts.append(_t(proprio.get("joint_torques", torch.zeros(TOTAL_ARM_JOINTS))))
+    parts.append(_t(proprio["prev_action"]))
+    proprio_vec = torch.cat(parts)
 
     # -- ee --
     left_ee = obs["ee"]["left"]
     right_ee = obs["ee"]["right"]
-    ee_vec = torch.from_numpy(np.concatenate([
-        np.asarray(left_ee["position"]).ravel(),
-        np.asarray(left_ee["orientation"]).ravel(),
-        np.asarray(left_ee["linear_velocity"]).ravel(),
-        np.asarray(left_ee["angular_velocity"]).ravel(),
-        np.asarray(left_ee["linear_acceleration"]).ravel(),
-        np.asarray(left_ee["angular_acceleration"]).ravel(),
-        np.asarray(right_ee["position"]).ravel(),
-        np.asarray(right_ee["orientation"]).ravel(),
-        np.asarray(right_ee["linear_velocity"]).ravel(),
-        np.asarray(right_ee["angular_velocity"]).ravel(),
-        np.asarray(right_ee["linear_acceleration"]).ravel(),
-        np.asarray(right_ee["angular_acceleration"]).ravel(),
-    ])).float()
+    ee_vec = torch.cat([
+        _t(left_ee["position"]),
+        _t(left_ee["orientation"]),
+        _t(left_ee["linear_velocity"]),
+        _t(left_ee["angular_velocity"]),
+        _t(left_ee["linear_acceleration"]),
+        _t(left_ee["angular_acceleration"]),
+        _t(right_ee["position"]),
+        _t(right_ee["orientation"]),
+        _t(right_ee["linear_velocity"]),
+        _t(right_ee["angular_velocity"]),
+        _t(right_ee["linear_acceleration"]),
+        _t(right_ee["angular_acceleration"]),
+    ])
 
     # -- context --
     ctx = obs["context"]
-    ctx_vec = torch.from_numpy(np.concatenate([
-        np.asarray(ctx["left_occupied"]).ravel(),
-        np.asarray(ctx["right_occupied"]).ravel(),
-    ])).float()
+    ctx_vec = torch.cat([_t(ctx["left_occupied"]), _t(ctx["right_occupied"])])
 
     # -- stability --
     stab = obs["stability"]
-    stab_vec = torch.from_numpy(np.concatenate([
-        np.asarray(stab["left_tilt"]).ravel(),
-        np.asarray(stab["right_tilt"]).ravel(),
-    ])).float()
+    stab_vec = torch.cat([_t(stab["left_tilt"]), _t(stab["right_tilt"])])
 
-    # -- visual --
-    vis_vec = torch.from_numpy(np.asarray(obs["visual"]["door_embedding"]).ravel()).float()
+    # -- visual: embedding(768) + visual_valid(1) = 769 --
+    vis_vec = torch.cat([
+        _t(obs["visual"]["door_embedding"]),
+        _t(obs["visual"].get("visual_valid", torch.zeros(1))),
+    ])
 
     return {
         "proprio": proprio_vec,
@@ -195,7 +193,7 @@ def batch_flatten_actor_obs(
     Parameters
     ----------
     obs_list : list[dict]
-        每个元素为 ``ActorObsBuilder.build()`` 返回的单步字典。
+        每个元素为 ``DirectRLEnvAdapter`` 返回的单步字典。
     cfg : ActorConfig
 
     Returns
@@ -238,7 +236,7 @@ class Actor(nn.Module):
         self.proprio_encoder = _build_branch_encoder(proprio_in, c.proprio_hidden, c.proprio_out)
         self.ee_encoder = _build_branch_encoder(_DUAL_EE_DIM, c.ee_hidden, c.ee_out)
         self.stab_encoder = _build_branch_encoder(stab_in, c.stab_hidden, c.stab_out)
-        self.vis_encoder = _build_branch_encoder(DOOR_EMBEDDING_DIM, c.vis_hidden, c.vis_out)
+        self.vis_encoder = _build_branch_encoder(VISUAL_BRANCH_DIM, c.vis_hidden, c.vis_out)
 
         # -- 汇总维度 --
         concat_dim = c.proprio_out + c.ee_out + _CONTEXT_DIM + c.stab_out + c.vis_out
@@ -298,17 +296,16 @@ class Actor(nn.Module):
         f_ee = self.ee_encoder(flat_obs["ee"])                 # (B, ee_out)
         f_stab = self.stab_encoder(flat_obs["stability"])      # (B, stab_out)
         f_vis = self.vis_encoder(flat_obs["visual"])            # (B, vis_out)
-        ctx = flat_obs["context"]                              # (B, 3)
+        ctx = flat_obs["context"]                              # (B, 2)  # left_occ + right_occ
 
         # 拼接
-        concat = torch.cat([f_proprio, f_ee, ctx, f_stab, f_vis], dim=-1)
+        concat = torch.cat([f_proprio, f_ee, ctx, f_stab, f_vis], dim=-1).contiguous()
 
         # 循环主干
         backbone_out, hidden_new = self.backbone(concat, hidden)
 
-        # 采样动作
-        action, log_prob = self.action_head.sample(backbone_out)
-        _, entropy = self.action_head.evaluate(backbone_out, action)
+        # 采样动作（单次 forward 同时得到 log_prob + entropy）
+        action, log_prob, entropy = self.action_head.sample_with_entropy(backbone_out)
 
         return action, log_prob, entropy, hidden_new
 
@@ -341,7 +338,7 @@ class Actor(nn.Module):
         f_vis = self.vis_encoder(flat_obs["visual"])
         ctx = flat_obs["context"]
 
-        concat = torch.cat([f_proprio, f_ee, ctx, f_stab, f_vis], dim=-1)
+        concat = torch.cat([f_proprio, f_ee, ctx, f_stab, f_vis], dim=-1).contiguous()
         backbone_out, hidden_new = self.backbone(concat, hidden)
 
         if deterministic:

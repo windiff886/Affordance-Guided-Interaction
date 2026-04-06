@@ -2,7 +2,7 @@
 
 ## 1. 本层在系统中的位置
 
-training 层是整个系统的**优化与调度中心**，处于观测构建 (`observations/`)、奖励计算 (`rewards/`) 和策略网络 (`policy/`) 之上，负责：
+training 层是整个系统的**优化与调度中心**，处于环境 (`envs/DoorPushEnv`) 和策略网络 (`policy/`) 之上，负责：
 
 1. **策略优化**：使用 PPO（Proximal Policy Optimization）更新网络参数
 2. **轨迹收集**：管理多环境的高度并行 Rollout，协调 actor 与 critic 的 asymmetric 观测
@@ -10,10 +10,10 @@ training 层是整个系统的**优化与调度中心**，处于观测构建 (`o
 4. **域随机化**：在每个 episode reset 时注入随机性，防止策略过拟合到单一环境实例
 
 ```
-    observations/                rewards/
-    actor_obs, critic_obs        r_total
-         │                          │
-         ▼                          ▼
+    DoorPushEnv (GPU batched)
+    actor_obs, critic_obs, r_total
+         │
+         ▼
 ┌──────────────────────────────────────────────┐
 │  training/                                    │  ◄── 本层
 │                                                │
@@ -204,15 +204,15 @@ $$
 | $M$ | 滑动窗口长度（epoch 数） | 50 |
 | $\eta_{\text{thresh}}$ | 成功率跃迁阈值 | 0.8 |
 
-### 4.4 课程与奖励缩放的耦合
+### 4.4 课程与稳定性约束的配合
 
-课程阶段的推进与 rewards 层的动态缩放因子 $s_t$（见 `rewards/README.md` §7）协同工作：
+课程阶段本身承担了“先学任务，再学约束”的作用：
 
-- **阶段 1**（无持杯）：$s_t$ 不影响策略（无稳定性惩罚项被激活）
-- **阶段 2**（单臂持杯）：$s_t$ 从低值开始线性退火，策略先适应“只有一侧必须稳定”的受限交互
+- **阶段 1**（无持杯）：稳定性项整体关闭，策略先学基础推门
+- **阶段 2**（单臂持杯）：持杯侧稳定性项从 episode 起点开始全量生效
 - **阶段 3**（最终混合分布）：单一策略同时覆盖无杯、单臂持杯、双臂持杯三类正式目标场景，打磨切换鲁棒性
 
-两套机制互为补充：课程控制**任务复杂度的离散跃迁**，$s_t$ 控制**约束强度的连续增长**。
+也就是说，课程控制**任务复杂度的离散跃迁**，而不是再额外叠加一套时间退火去连续放大稳定性惩罚。
 
 ---
 
@@ -281,7 +281,7 @@ $$
 
 **Step 4 — 课程判定**：统计本轮成功率 $\eta$，更新滑动窗口，判断是否满足阶段跃迁条件（§4.3）。
 
-**Step 5 — 指标记录**：分项奖励、混合成功率、`success_none / success_left_only / success_right_only / success_both`、杯体脱落率、平均 $s_t$ 值等关键指标送入 TensorBoard / WandB。
+**Step 5 — 指标记录**：分项奖励、混合成功率、`success_none / success_left_only / success_right_only / success_both`、杯体脱落率等关键指标送入 TensorBoard / WandB。
 
 ### 6.2 梯度裁剪
 

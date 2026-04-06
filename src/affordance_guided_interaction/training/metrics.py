@@ -6,7 +6,6 @@
 - 杯体脱落率
 - 平均 episode 长度
 - PPO 优化指标（actor loss, critic loss, entropy, clip fraction 等）
-- 当前动态缩放因子 s_t 均值
 
 所有指标通过 `summarize()` 一次性输出，供外部写入 TensorBoard / WandB。
 """
@@ -71,7 +70,7 @@ class TrainingMetrics:
         episode_length : int
             本回合持续步数。
         reward_info : dict | None
-            来自 ``RewardManager.step()`` 返回的分项奖励信息字典。
+            来自 ``DoorPushEnv._get_rewards()`` 返回的分项奖励信息字典。
         """
         self._episode_count += 1
         if success:

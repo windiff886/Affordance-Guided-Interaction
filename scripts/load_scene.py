@@ -108,7 +108,7 @@ import omni.kit.commands
 from pxr import Usd, UsdGeom, UsdLux, Sdf, Gf, UsdPhysics, PhysicsSchemaTools
 
 DOOR_SCENE = PROJECT_ROOT / "assets/minimal_push_door/minimal_push_door.usda"
-ROBOT_USD = PROJECT_ROOT / "assets/robot/uni_dingo_dual_arm.usd"
+ROBOT_USD = PROJECT_ROOT / "assets/robot/usd/uni_dingo_dual_arm.usd"
 
 
 def find_first_named_prim(stage: Usd.Stage, prim_names: list[str]) -> Usd.Prim:

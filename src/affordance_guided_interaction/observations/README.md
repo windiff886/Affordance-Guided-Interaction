@@ -2,8 +2,12 @@
 
 > 文档状态：目标设计导向
 >
-> 本文档描述 `observations/` 层的目标形态。
-> 它以 [training_pipeline_detailed.md](/home/windiff/Code/Affordance-Guided-Interaction/training_pipeline_detailed.md) 和 [policy/README.md](/home/windiff/Code/Affordance-Guided-Interaction/src/affordance_guided_interaction/policy/README.md) 为准。
+> 本文档描述观测层的设计规范。
+> 参见 [training_pipeline_detailed.md](../../../docs/training_pipeline_detailed.md) 和 [policy/README.md](../policy/README.md)。
+>
+> **实现说明**: 观测构建现在直接在 `DoorPushEnv._get_observations()` 中以 PyTorch tensor
+> 操作完成，不再通过独立的 `ActorObsBuilder`/`CriticObsBuilder` 类。
+> 本模块保留 `HistoryBuffer` 和 `StabilityProxy` 作为通用工具类。
 
 ---
 
@@ -94,6 +98,7 @@ RGB-D -> 2D视觉识别 -> 3D点云提取 -> 冻结 Point-MAE 编码 -> door_emb
 - 门铰链精确角度 `door_joint_pos`
 - 门铰链精确角速度 `door_joint_vel`
 - 关键域随机化参数：`cup_mass`、`door_mass`、`door_damping`、`base_pos`
+  注：当前 episode 级随机化还会生成 `base_yaw`，但它尚未进入 critic privileged 向量。
 - 掉杯事件标志 `cup_dropped ∈ {0, 1}`
 
 目标设计中，critic **不需要**杯体精确位姿、线速度或角速度。
@@ -285,23 +290,21 @@ critic_obs = {
 ## 6. 信息流总览
 
 ```text
-envs/
-  ├── joint states ------------------------------┐
-  ├── ee states ---------------------------------┤
-  ├── context -----------------------------------┤
-  ├── privileged oracle -------------------------┤
-  └── RGB-D -------------------------------------┘
+DoorPushEnv (GPU batched)
+  ├── ArticulationView → joint states ─────────┐
+  ├── body state view → ee states ─────────────┤
+  ├── occupancy flags → context ───────────────┤  DoorPushEnv._get_observations()
+  ├── simulation oracle → privileged ──────────┤  直接构建 actor_obs(859D)
+  └── cached embedding → visual ───────────────┘  和 critic_obs(875D) tensor
                     │
                     ▼
-perception runtime
-  fixed-frequency update
-  -> cached door_embedding
+DirectRLEnvAdapter
+  tensor → list[dict] 转换
                     │
                     ▼
-observations/
-  raw state + cached embedding
-  -> actor_obs
-  -> critic_obs
+PerceptionRuntime (外部)
+  fixed-frequency RGB-D → 768D embedding
+  → env.update_visual_embedding() 注入
                     │
                     ▼
 policy/

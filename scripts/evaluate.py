@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -31,14 +32,22 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=42, help="随机种子")
     parser.add_argument("--device", type=str, default="cpu", help="推理设备")
     parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="以无窗口模式启动 Isaac Sim",
+    )
+    parser.add_argument(
         "--stochastic",
         action="store_true",
         help="若指定则使用采样动作；默认使用确定性动作",
     )
     args = parser.parse_args()
 
-    from train import build_env_config, build_models, load_config
-    from affordance_guided_interaction.envs.door_env import DoorInteractionEnv
+    from train import build_env_cfg, build_models, load_config
+    from affordance_guided_interaction.utils.runtime_env import resolve_headless_mode
+    from affordance_guided_interaction.utils.sim_runtime import launch_simulation_app
+    from affordance_guided_interaction.envs.door_push_env import DoorPushEnv
+    from affordance_guided_interaction.envs.direct_rl_env_adapter import DirectRLEnvAdapter
     from affordance_guided_interaction.policy import batch_flatten_actor_obs
     from affordance_guided_interaction.training.evaluation import (
         summarize_evaluation_outcomes,
@@ -52,7 +61,13 @@ def main() -> int:
 
     device = torch.device(args.device)
     cfg = load_config(args.config)
-    env_cfg = build_env_config(cfg)
+    simulation_app = launch_simulation_app(
+        headless=resolve_headless_mode(args.headless, os.environ),
+        enable_cameras=True,
+        import_error_message=(
+            "未检测到 isaacsim 运行时，evaluate.py 需要在 Isaac Sim / Isaac Lab 运行时下执行。"
+        ),
+    )
     actor, _critic, actor_cfg = build_models(cfg, device)
     actor.eval()
 
@@ -61,7 +76,11 @@ def main() -> int:
         actor.load_state_dict(checkpoint["actor_state_dict"])
 
     runtime = PerceptionRuntime(refresh_interval=4, embedding_dim=768)
-    env = DoorInteractionEnv(env_cfg)
+
+    # 使用 GPU 环境 (num_envs=1 用于评估)
+    env_cfg = build_env_cfg(cfg, n_envs=1, device=str(device), seed=args.seed)
+    _direct_env = DoorPushEnv(cfg=env_cfg)
+    envs = DirectRLEnvAdapter(_direct_env)
 
     contexts = {
         "none": (False, False),
@@ -74,16 +93,16 @@ def main() -> int:
     try:
         for context_name, (left_occupied, right_occupied) in contexts.items():
             for _ in range(args.episodes_per_context):
-                actor_obs, critic_obs = env.reset(
-                    door_type="push",
-                    left_occupied=left_occupied,
-                    right_occupied=right_occupied,
+                actor_obs_list, critic_obs_list = envs.reset(
+                    door_types=["push"],
+                    left_occupied_list=[left_occupied],
+                    right_occupied_list=[right_occupied],
                 )
                 runtime.reset(1)
                 actor_obs_list, critic_obs_list = runtime.prepare_batch(
-                    actor_obs_list=[actor_obs],
-                    critic_obs_list=[critic_obs],
-                    visual_observations=[env.get_visual_observation()],
+                    actor_obs_list=actor_obs_list,
+                    critic_obs_list=critic_obs_list,
+                    visual_observations=envs.get_visual_observations(),
                     force_refresh_mask=[True],
                 )
                 actor_obs = actor_obs_list[0]
@@ -105,16 +124,17 @@ def main() -> int:
                             deterministic=not args.stochastic,
                         )
 
-                    actor_obs, critic_obs, _reward, done, info = env.step(
-                        action.cpu().numpy()[0]
+                    actor_obs_list, critic_obs_list, _rewards, dones, infos = envs.step(
+                        action.cpu().numpy()
                     )
-                    last_info = info
+                    done = bool(dones[0])
+                    last_info = infos[0]
 
                     actor_obs_list, critic_obs_list = runtime.prepare_batch(
-                        actor_obs_list=[actor_obs],
-                        critic_obs_list=[critic_obs],
-                        visual_observations=[env.get_visual_observation()],
-                        force_refresh_mask=[bool(done)],
+                        actor_obs_list=actor_obs_list,
+                        critic_obs_list=critic_obs_list,
+                        visual_observations=envs.get_visual_observations(),
+                        force_refresh_mask=[done],
                     )
                     actor_obs = actor_obs_list[0]
 
@@ -128,7 +148,9 @@ def main() -> int:
                     }
                 )
     finally:
-        env.close()
+        envs.close()
+        if simulation_app is not None:
+            simulation_app.close()
 
     summary = summarize_evaluation_outcomes(outcomes)
     print(f"[evaluate] checkpoint={args.checkpoint or 'random_init'}")

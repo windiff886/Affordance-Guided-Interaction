@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -33,9 +34,13 @@ class RandomizationConfig:
     door_mass_range: tuple[float, float] = (5.0, 20.0)
     door_damping_range: tuple[float, float] = (0.5, 5.0)
 
-    # 基座标称位置 p_0 与微扰半径 Δp（XY 平面）
-    base_pos_nominal: tuple[float, float, float] = (0.0, 0.0, 0.0)
-    base_pos_delta: float = 0.03  # 单位：m
+    # 门外侧推板附近的基座采样几何
+    push_plate_center_xy: tuple[float, float] = (2.98, 0.27)
+    base_reference_xy: tuple[float, float] = (3.72, 0.27)
+    base_height: float = 0.12
+    base_radius_range: tuple[float, float] = (0.45, 0.60)
+    base_sector_half_angle_deg: float = 20.0
+    base_yaw_delta_deg: float = 10.0
 
     # ── 步级动态噪声标准差 ────────────────────────────────────────
     action_noise_std: float = 0.02    # σ_a
@@ -75,6 +80,7 @@ class DomainRandomizer:
             - ``door_mass``    : float
             - ``door_damping`` : float
             - ``base_pos``     : (3,) ndarray — 世界坐标系下基座位置
+            - ``base_yaw``     : float — 世界坐标系下基座 yaw（rad）
         """
         c = self.cfg
 
@@ -83,19 +89,56 @@ class DomainRandomizer:
         door_mass = float(self._rng.uniform(*c.door_mass_range))
         door_damping = float(self._rng.uniform(*c.door_damping_range))
 
-        # 基座位置：标称 p_0 + U[-Δp, Δp]（仅 XY 平面微扰，Z 保持标称）
-        nominal = np.asarray(c.base_pos_nominal, dtype=np.float64)
-        delta_xy = self._rng.uniform(-c.base_pos_delta, c.base_pos_delta, size=2)
-        base_pos = nominal.copy()
-        base_pos[0] += delta_xy[0]
-        base_pos[1] += delta_xy[1]
+        base_pos = self._sample_base_position()
+        base_yaw = self._sample_base_yaw(base_pos[:2])
 
         return {
             "cup_mass": cup_mass,
             "door_mass": door_mass,
             "door_damping": door_damping,
             "base_pos": base_pos,
+            "base_yaw": base_yaw,
         }
+
+    def _sample_base_position(self) -> np.ndarray:
+        radius = self._sample_base_radius()
+        angle = self._sample_base_sector_angle()
+        center = np.asarray(self.cfg.push_plate_center_xy, dtype=np.float64)
+
+        base_xy = center + radius * np.array(
+            [math.cos(angle), math.sin(angle)],
+            dtype=np.float64,
+        )
+        return np.array(
+            [base_xy[0], base_xy[1], self.cfg.base_height],
+            dtype=np.float64,
+        )
+
+    def _sample_base_radius(self) -> float:
+        inner_radius, outer_radius = self.cfg.base_radius_range
+        return float(self._rng.uniform(inner_radius, outer_radius))
+
+    def _sample_base_sector_angle(self) -> float:
+        center = np.asarray(self.cfg.push_plate_center_xy, dtype=np.float64)
+        reference = np.asarray(self.cfg.base_reference_xy, dtype=np.float64)
+        nominal_angle = math.atan2(reference[1] - center[1], reference[0] - center[0])
+        sector_half_angle = math.radians(self.cfg.base_sector_half_angle_deg)
+        return float(self._rng.uniform(
+            nominal_angle - sector_half_angle,
+            nominal_angle + sector_half_angle,
+        ))
+
+    def _sample_base_yaw(self, base_xy: np.ndarray) -> float:
+        push_center = np.asarray(self.cfg.push_plate_center_xy, dtype=np.float64)
+        nominal_yaw = math.atan2(
+            push_center[1] - float(base_xy[1]),
+            push_center[0] - float(base_xy[0]),
+        )
+        yaw_delta = math.radians(self.cfg.base_yaw_delta_deg)
+        return float(self._rng.uniform(
+            nominal_yaw - yaw_delta,
+            nominal_yaw + yaw_delta,
+        ))
 
     # ═══════════════════════════════════════════════════════════════════
     # 步级噪声注入（Step-level）

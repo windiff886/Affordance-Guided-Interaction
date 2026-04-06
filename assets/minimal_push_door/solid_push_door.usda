@@ -1,21 +1,84 @@
 #usda 1.0
 (
     defaultPrim = "SolidPushDoor"
-    doc = "Reusable solid hinged door leaf for push-door experiments."
+    doc = "Reusable articulated solid hinged door for push-door experiments."
     metersPerUnit = 1
     kilogramsPerUnit = 1
     upAxis = "Z"
 )
 
-def Xform "SolidPushDoor"
+def Xform "SolidPushDoor" (
+    prepend apiSchemas = ["PhysicsArticulationRootAPI"]
+)
 {
+    def Xform "DoorFrame"
+    {
+        def Cube "DoorFrameLeft" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            color3f[] primvars:displayColor = [(0.74, 0.74, 0.72)]
+            double size = 1
+            double3 xformOp:translate = (0.0, -0.54, 1.0)
+            float3 xformOp:scale = (0.12, 0.06, 2.0)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        }
+
+        def Cube "DoorFrameRight" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            color3f[] primvars:displayColor = [(0.74, 0.74, 0.72)]
+            double size = 1
+            double3 xformOp:translate = (0.0, 0.54, 1.0)
+            float3 xformOp:scale = (0.12, 0.06, 2.0)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        }
+
+        def Cube "DoorFrameHeader" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            color3f[] primvars:displayColor = [(0.74, 0.74, 0.72)]
+            double size = 1
+            double3 xformOp:translate = (0.0, 0.0, 2.08)
+            float3 xformOp:scale = (0.12, 1.08, 0.06)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        }
+    }
+
+    def Xform "DoorAnchor" (
+        prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"]
+    )
+    {
+        bool physics:rigidBodyEnabled = true
+        float physics:mass = 0.1
+        double3 xformOp:translate = (0.0, -0.45, 0.0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+
+        def Cube "AnchorGeom" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            color3f[] primvars:displayColor = [(0.30, 0.30, 0.30)]
+            token visibility = "invisible"
+            double size = 1
+            double3 xformOp:translate = (0.0, 0.0, 0.95)
+            float3 xformOp:scale = (0.02, 0.02, 0.02)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        }
+    }
+
     def Xform "DoorLeaf" (
         prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"]
     )
     {
+        bool physics:rigidBodyEnabled = true
         float physics:angularDamping = 0.05
         float physics:linearDamping = 0.05
-        float physics:mass = 5
+        float physics:mass = 5.0
+        double3 xformOp:translate = (0.0, -0.45, 0.0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
 
         def Cube "Panel" (
             prepend apiSchemas = ["PhysicsCollisionAPI"]
@@ -38,5 +101,29 @@ def Xform "SolidPushDoor"
             float3 xformOp:scale = (0.01, 0.18, 0.32)
             uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
         }
+    }
+
+    def PhysicsFixedJoint "RootJoint"
+    {
+        rel physics:body1 = </SolidPushDoor/DoorAnchor>
+        point3f physics:localPos0 = (0, 0, 0)
+        point3f physics:localPos1 = (0, 0, 0)
+        quatf physics:localRot0 = (1, 0, 0, 0)
+        quatf physics:localRot1 = (1, 0, 0, 0)
+    }
+
+    def PhysicsRevoluteJoint "DoorHingeJoint" (
+        prepend apiSchemas = ["PhysicsJointStateAPI:angular"]
+    )
+    {
+        uniform token physics:axis = "Z"
+        float physics:lowerLimit = -105
+        float physics:upperLimit = 105
+        point3f physics:localPos0 = (0, 0, 0)
+        point3f physics:localPos1 = (0, 0, 0)
+        quatf physics:localRot0 = (1, 0, 0, 0)
+        quatf physics:localRot1 = (1, 0, 0, 0)
+        rel physics:body0 = </SolidPushDoor/DoorAnchor>
+        rel physics:body1 = </SolidPushDoor/DoorLeaf>
     }
 }

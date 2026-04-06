@@ -66,7 +66,7 @@ class OpenVocabSegmentor:
             ) from exc
 
         logger.info("Loading LangSAM model on %s ...", self._config.device)
-        model = LangSAM()
+        model = LangSAM(device=self._config.device)
         return model
 
     def _load_grounded_sam2(self) -> object:

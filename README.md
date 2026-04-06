@@ -37,56 +37,44 @@ python -c "from affordance_guided_interaction.training import PPOTrainer; print(
 
 ## 训练
 
-### 本地验证（4060 Laptop）
-
-在正式训练前，使用少量环境快速验证训练管线是否能跑通：
+训练入口现在固定为：
 
 ```bash
-python scripts/train.py \
-    --config configs/training/default.yaml \
-    --num-envs 2 \
-    --seed 42
+python scripts/train.py
+```
+
+所有训练运行参数统一在 [configs/training/default.yaml](configs/training/default.yaml) 中调整，包括：
+
+- `headless`
+- `device`
+- `seed`
+- `resume`
+- `log_dir`
+- `ckpt_dir`
+- `num_envs`
+- `total_steps`
+
+### 本地验证（4060 Laptop）
+
+将 [configs/training/default.yaml](configs/training/default.yaml) 中的当前生效值切到文档内注释给出的 `4060 Laptop` 建议配置后运行：
+
+```bash
+python scripts/train.py
 ```
 
 > 预期行为：控制台每轮迭代打印 `actor_loss / critic_loss / entropy / reward / stage`，无报错即管线正常。
 
 ### 服务器训练（A100）
 
-无头模式启动完整规模训练：
+将 [configs/training/default.yaml](configs/training/default.yaml) 中的当前生效值切到文档内注释给出的 `A100` 建议配置后运行：
 
 ```bash
-python scripts/train.py \
-    --config configs/training/default.yaml \
-    --headless \
-    --num-envs 64
+python scripts/train.py
 ```
-
-### 断点续训
-
-从已有 checkpoint 恢复训练：
-
-```bash
-python scripts/train.py \
-    --resume checkpoints/ckpt_iter_1000.pt \
-    --headless
-```
-
-### 完整命令行参数
-
-| 参数 | 默认值 | 说明 |
-|---|---|---|
-| `--config` | `configs/training/default.yaml` | 训练配置文件路径 |
-| `--num-envs` | 配置文件中的值 (64) | 覆盖并行环境数量 |
-| `--headless` | `false` | 无头模式（无 GUI 渲染，服务器训练） |
-| `--resume` | 无 | 恢复训练的 checkpoint 文件路径 |
-| `--device` | 自动检测 | 指定计算设备 (`cuda` / `cpu`) |
-| `--seed` | `42` | 随机种子 |
-| `--log-dir` | `runs/` | TensorBoard 日志目录 |
-| `--ckpt-dir` | `checkpoints/` | Checkpoint 保存目录 |
 
 ### 推荐环境数配置
 
-| 硬件 | `--num-envs` | 用途 |
+| 硬件 | YAML 中的 `num_envs` 建议值 | 用途 |
 |---|---|---|
 | RTX 4060 Laptop | 2 – 4 | 本地功能验证、debug |
 | RTX 4090 | 16 – 32 | 中等规模训练 |
@@ -135,18 +123,20 @@ configs/
 ├── env/default.yaml         # 物理步长、机器人规格、USD 资产路径
 ├── policy/default.yaml      # Actor/Critic 网络架构参数
 ├── task/default.yaml        # 任务成功/失败判定条件
-├── curriculum/default.yaml  # 课程跃迁窗口与阈值
-└── reward/default.yaml      # SoFTA 奖励权重分配
+└── curriculum/default.yaml  # 课程跃迁窗口与阈值
 ```
 
-修改配置后无需改动代码，`train.py` 会自动合并所有配置文件。
+> 奖励权重已内联至 `DoorPushEnvCfg`（`door_push_env_cfg.py`），数学设计文档见 [`envs/Reward.md`](src/affordance_guided_interaction/envs/Reward.md)。
+
+修改配置后无需改动代码，`train.py` 会自动合并所有配置文件，并直接读取训练 YAML 中的运行时参数。
 
 ### 关键超参速查
 
 ```yaml
 # configs/training/default.yaml
-num_envs: 64               # 并行环境数
-total_steps: 10_000_000    # 总训练步数
+headless: false            # 是否无窗口运行
+num_envs: 2                # 并行环境数（当前生效值）
+total_steps: 50_000        # 总训练步数（当前生效值）
 n_steps_per_rollout: 128   # 每轮采集步数
 
 ppo:
@@ -180,22 +170,57 @@ ppo:
 ```
 Affordance-Guided-Interaction/
 ├── scripts/
-│   ├── train.py                # 训练入口
-│   ├── evaluate.py             # 评估（开发中）
-│   ├── load_scene.py           # Isaac Sim 场景加载/调试
-│   └── rollout_demo.py         # Rollout 可视化
+│   ├── train.py                  # 训练入口
+│   ├── evaluate.py               # 评估（开发中）
+│   ├── export_policy.py          # 策略导出
+│   ├── load_scene.py             # Isaac Sim 场景加载/调试
+│   └── rollout_demo.py           # Rollout 可视化
 ├── src/affordance_guided_interaction/
-│   ├── envs/                   # Isaac Lab 环境层
-│   ├── observations/           # 观测构建（Actor/Critic 分支）
-│   ├── policy/                 # Actor-Critic 网络
-│   ├── rewards/                # SoFTA 奖励体系
-│   ├── training/               # PPO 训练组件
-│   ├── door_perception/        # 视觉感知模块
-│   └── utils/                  # 工具函数
-├── src/teleop_cup_grasp/       # 杯体抓取遥操作（独立模块）
-├── configs/                    # YAML 配置文件
-├── assets/                     # USD 仿真资产
-└── checkpoints/                # 训练 checkpoint（自动生成）
+│   ├── envs/                     # GPU 并行环境（DirectRLEnv）
+│   │   ├── door_push_env.py      #   DoorPushEnv — 自包含环境（obs/rew/term/init）
+│   │   ├── door_push_env_cfg.py  #   DoorPushEnvCfg + DoorPushSceneCfg 声明式配置
+│   │   ├── direct_rl_env_adapter.py  # DirectRLEnvAdapter — VecEnvProtocol 桥接
+│   │   ├── batch_math.py         #   GPU 批量坐标变换工具
+│   │   └── Reward.md             #   奖励函数数学参考文档
+│   ├── observations/             # 观测工具类
+│   │   ├── history_buffer.py     #   HistoryBuffer — 历史帧缓冲
+│   │   └── stability_proxy.py    #   StabilityProxy — 稳定性评估
+│   ├── policy/                   # Actor-Critic 网络
+│   │   ├── actor.py              #   Actor（GRU + 分支输出）
+│   │   ├── critic.py             #   Critic（非对称 MLP）
+│   │   ├── recurrent_backbone.py #   GRU 循环骨干
+│   │   └── action_head.py        #   动作分布头
+│   ├── training/                 # PPO 训练组件
+│   │   ├── ppo_trainer.py        #   PPOTrainer — 优化器
+│   │   ├── rollout_collector.py  #   RolloutCollector — 轨迹采集
+│   │   ├── rollout_buffer.py     #   RolloutBuffer — 经验存储
+│   │   ├── curriculum_manager.py #   CurriculumManager — 课程跃迁
+│   │   ├── domain_randomizer.py  #   DomainRandomizer — 域随机化
+│   │   ├── episode_stats.py      #   EpisodeStats — 回合统计
+│   │   ├── metrics.py            #   Metrics — TensorBoard 日志
+│   │   ├── evaluation.py         #   Evaluation — 评估管线
+│   │   └── perception_runtime.py #   PerceptionRuntime — 视觉推理桥接
+│   ├── door_perception/          # 视觉感知模块（独立）
+│   │   ├── affordance_pipeline.py #  Affordance 检测管线
+│   │   ├── frozen_encoder.py     #   冻结视觉编码器
+│   │   ├── segmentation.py       #   门体分割
+│   │   ├── depth_projection.py   #   深度点云投影
+│   │   ├── config.py             #   感知配置
+│   │   └── debug_visualizer.py   #   调试可视化
+│   └── utils/                    # 工具函数
+│       ├── train_runtime_config.py # 训练运行时配置解析
+│       ├── sim_runtime.py        #   SimulationApp 启动辅助
+│       ├── usd_assets.py         #   USD 资产加载
+│       ├── usd_math.py           #   USD 数学工具
+│       ├── paths.py              #   项目路径常量
+│       ├── pose_alignment.py     #   位姿对齐工具
+│       └── runtime_env.py        #   运行环境检测
+├── src/teleop_cup_grasp/         # 杯体抓取遥操作（独立模块）
+├── configs/                      # YAML 配置文件
+├── assets/                       # USD 仿真资产
+├── model/                        # 预训练权重
+├── docs/                         # 设计文档
+└── checkpoints/                  # 训练 checkpoint（自动生成）
 ```
 
 ---
@@ -203,34 +228,53 @@ Affordance-Guided-Interaction/
 ## 技术架构
 
 ```
-                    ┌─────────────────────────────┐
-                    │     CurriculumManager       │
-                    │   (三阶段课程跃迁)           │
-                    └──────────┬──────────────────┘
-                               │ 阶段配置
-                    ┌──────────▼──────────────────┐
-                    │     RolloutCollector         │
-                    │   (并行轨迹采集)             │
-                    └──────────┬──────────────────┘
-                               │ 观测/动作/奖励
-              ┌────────────────┼────────────────┐
-              │                │                │
-    ┌─────────▼────┐  ┌───────▼──────┐  ┌──────▼───────┐
-    │  VecDoorEnv  │  │    Actor     │  │   Critic     │
-    │ (N并行环境)  │  │ (GRU+分支)   │  │ (非对称MLP)  │
-    └─────────┬────┘  └──────────────┘  └──────────────┘
-              │
-    ┌─────────▼────────────────────────┐
-    │     DoorInteractionEnv           │
-    │  SceneFactory + ContactMonitor   │
-    │  TaskManager + RewardManager     │
-    └──────────────────────────────────┘
-              │
-    ┌─────────▼────────────────────────┐
-    │     Isaac Lab SimulationContext  │
-    │        (GPU 物理仿真)            │
-    └──────────────────────────────────┘
+             ┌──────────────────────────────────────────────────────┐
+             │  train.py                                           │
+             │  配置加载 → 环境创建 → 采集-优化-课程循环            │
+             └────────────────────┬─────────────────────────────────┘
+                                  │
+             ┌────────────────────▼─────────────────────────────────┐
+             │  DirectRLEnvAdapter                                  │
+             │  DoorPushEnv (tensor) → VecEnvProtocol (list[dict]) │
+             │  训练管线桥接层                                      │
+             └────────────────────┬─────────────────────────────────┘
+                                  │
+             ┌────────────────────▼─────────────────────────────────┐
+             │  DoorPushEnv  (DirectRLEnv)                         │
+             │  ┌──────────────────────────────────────────────┐   │
+             │  │ 自包含 GPU 批量环境                           │   │
+             │  │                                              │   │
+             │  │  • _get_observations()  非对称 Actor/Critic  │   │
+             │  │  • _get_rewards()       12 项 tensor 奖励    │   │
+             │  │  • _get_dones()         终止判定              │   │
+             │  │  • _reset_idx()         批量杯体抓取初始化    │   │
+             │  └──────────────────────────────────────────────┘   │
+             └────────────────────┬─────────────────────────────────┘
+                                  │
+          ┌───────────────────────┼───────────────────────┐
+          │                       │                       │
+┌─────────▼──────────┐ ┌─────────▼──────────┐ ┌──────────▼─────────┐
+│ DoorPushEnvCfg     │ │ DoorPushSceneCfg   │ │ Isaac Lab Cloner   │
+│ 环境参数+奖励权重  │ │ 声明式场景定义     │ │ 自动 N 环境复制    │
+│ (configclass)      │ │ Robot/Door/Cup/    │ │ GPU 批量仿真       │
+│                    │ │ ContactSensor      │ │                    │
+└────────────────────┘ └────────────────────┘ └────────────────────┘
+          │                       │                       │
+          └───────────────────────┼───────────────────────┘
+                                  │
+             ┌────────────────────▼─────────────────────────────────┐
+             │  Isaac Lab SimulationContext + PhysX GPU             │
+             │  GPU 物理仿真 (ArticulationView / RigidBodyView)    │
+             └──────────────────────────────────────────────────────┘
 ```
+
+### 核心设计
+
+- **无 Python 循环**：所有 per-env 状态为 `(num_envs, ...)` 形状的 torch tensor，观测 / 奖励 / 终止判定均为纯 tensor 操作
+- **Cloner 自动复制**：`DoorPushSceneCfg` 声明式定义场景（机器人、门、杯体、接触传感器），Isaac Lab Cloner 自动为 N 个并行环境复制完整场景子树
+- **自包含环境**：`DoorPushEnv` 内置 12 项奖励计算（任务进展 + 稳定性约束 + 安全惩罚）、非对称 Actor/Critic 观测构建、批量杯体抓取初始化，无需外部 Manager
+- **非对称观测**：Actor 含传感器噪声 + 视觉 embedding；Critic 含无噪声物理状态 + 门关节角/速度/质量等 privileged 信息
+- **适配器桥接**：`DirectRLEnvAdapter` 将 tensor 接口转换为训练管线 (`RolloutCollector`) 期望的 `VecEnvProtocol`
 
 ---
 

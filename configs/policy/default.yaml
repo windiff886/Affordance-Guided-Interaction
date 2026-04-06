@@ -5,18 +5,6 @@
 
 # ── Actor 网络 ───────────────────────────────────────────────────────
 actor:
-  type: recurrent
-
-  # 分支 encoder 隐层维度
-  proprio_hidden: 128      # 本体感受 encoder 隐层
-  proprio_out: 64          # 本体感受 encoder 输出维度
-  ee_hidden: 64            # 末端执行器 encoder 隐层
-  ee_out: 32               # 末端执行器 encoder 输出维度
-  stab_hidden: 64          # 稳定性 proxy encoder 隐层
-  stab_out: 32             # 稳定性 proxy encoder 输出维度
-  vis_hidden: 256          # 视觉编码 encoder 隐层
-  vis_out: 128             # 视觉编码 encoder 输出维度
-
   # RecurrentBackbone (GRU)
   rnn_hidden: 512          # GRU 隐状态维度
   rnn_layers: 1            # GRU 层数
@@ -27,16 +15,9 @@ actor:
   log_std_init: -0.5       # 动作标准差的初始 log 值
 
   # 观测相关
-  action_history_length: 3  # 保留最近几步动作
-  acc_history_length: 10    # 稳定性 proxy 加速度历史长度
   include_torques: true     # 是否在 proprio 分支中包含关节力矩
 
 # ── Critic 网络 ──────────────────────────────────────────────────────
 critic:
-  type: asymmetric
-
   # 主 MLP 各层维度
   hidden_dims: [512, 256, 128]
-
-  # 是否共享 actor 的 encoder 权重
-  share_actor_encoder: false

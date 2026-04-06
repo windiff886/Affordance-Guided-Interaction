@@ -13,15 +13,17 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
-import numpy as np
 
 from .actor import (
     ActorConfig,
     flatten_actor_obs,
-    NUM_JOINTS_PER_ARM,
-    DOOR_EMBEDDING_DIM,
+    _build_branch_encoder,
+    _t,
+    TOTAL_ARM_JOINTS,
+    VISUAL_BRANCH_DIM,
     _DUAL_EE_DIM,
     _CONTEXT_DIM,
+    _DUAL_STAB_DIM,
 )
 
 
@@ -40,14 +42,8 @@ _PRIVILEGED_DIM = 16
 class CriticConfig:
     """Critic 网络超参配置。"""
 
-    # actor 侧 encoder 产出总维度（需与 ActorConfig 保持一致）
-    actor_feature_dim: int = 256  # 默认 = 64 + 32 + 3 + 32 + 128 = 259 → 对齐后用 256
-
     # Critic MLP 各层维度
     hidden_dims: tuple[int, ...] = (512, 256, 128)
-
-    # 是否使用 actor 的预训练 encoder（共享 vs. 独立）
-    share_actor_encoder: bool = False
 
 
 # ======================================================================
@@ -55,7 +51,10 @@ class CriticConfig:
 # ======================================================================
 
 def flatten_privileged(privileged: dict) -> torch.Tensor:
-    """将 ``CriticObsBuilder`` 输出的 privileged 字典展平为 1-D 张量。
+    """将 ``DirectRLEnvAdapter`` 输出的 privileged 字典展平为 1-D 张量。
+
+    使用 ``_t()`` helper 处理任意输入类型（CUDA tensor / CPU tensor / numpy），
+    与 ``flatten_actor_obs()`` 保持一致（P1 修复）。
 
     Parameters
     ----------
@@ -67,16 +66,16 @@ def flatten_privileged(privileged: dict) -> torch.Tensor:
     torch.Tensor — ``(16,)``
     """
     parts = [
-        np.asarray(privileged["door_pose"]).ravel(),       # 7
-        np.asarray(privileged["door_joint_pos"]).ravel(),   # 1
-        np.asarray(privileged["door_joint_vel"]).ravel(),   # 1
-        np.asarray(privileged["cup_mass"]).ravel(),         # 1
-        np.asarray(privileged["door_mass"]).ravel(),        # 1
-        np.asarray(privileged["door_damping"]).ravel(),     # 1
-        np.asarray(privileged["base_pos"]).ravel(),         # 3
-        np.asarray(privileged["cup_dropped"]).ravel(),      # 1
+        _t(privileged["door_pose"]),        # 7
+        _t(privileged["door_joint_pos"]),    # 1
+        _t(privileged["door_joint_vel"]),    # 1
+        _t(privileged["cup_mass"]),          # 1
+        _t(privileged["door_mass"]),         # 1
+        _t(privileged["door_damping"]),      # 1
+        _t(privileged["base_pos"]),          # 3
+        _t(privileged["cup_dropped"]),       # 1
     ]
-    return torch.from_numpy(np.concatenate(parts)).float()
+    return torch.cat(parts)
 
 
 def flatten_critic_obs(
@@ -87,7 +86,7 @@ def flatten_critic_obs(
     Parameters
     ----------
     critic_obs : dict
-        ``CriticObsBuilder.build()`` 返回的字典，包含
+        ``DirectRLEnvAdapter`` 返回的字典，包含
         ``"actor_obs"`` 和 ``"privileged"`` 两个 key。
     actor_cfg : ActorConfig
 
@@ -135,19 +134,18 @@ class Critic(nn.Module):
         ac = self.actor_cfg
 
         # -- 独立的 actor 侧 encoder（与 Actor 权重不共享）--
-        from .actor import _build_branch_encoder
-
+        # L10: 与 Actor 保持相同公式，使用 TOTAL_ARM_JOINTS 避免隐式关系
         proprio_in = (
-            NUM_JOINTS_PER_ARM * 4
-            + (NUM_JOINTS_PER_ARM * 2 if ac.include_torques else 0)
-            + (NUM_JOINTS_PER_ARM * 2)
+            TOTAL_ARM_JOINTS * 2                                     # q + dq
+            + (TOTAL_ARM_JOINTS if ac.include_torques else 0)        # tau
+            + TOTAL_ARM_JOINTS                                       # prev_action
         )
-        stab_in = 2
+        stab_in = _DUAL_STAB_DIM  # L11: 使用常量而非硬编码 2
 
         self.proprio_encoder = _build_branch_encoder(proprio_in, ac.proprio_hidden, ac.proprio_out)
         self.ee_encoder = _build_branch_encoder(_DUAL_EE_DIM, ac.ee_hidden, ac.ee_out)
         self.stab_encoder = _build_branch_encoder(stab_in, ac.stab_hidden, ac.stab_out)
-        self.vis_encoder = _build_branch_encoder(DOOR_EMBEDDING_DIM, ac.vis_hidden, ac.vis_out)
+        self.vis_encoder = _build_branch_encoder(VISUAL_BRANCH_DIM, ac.vis_hidden, ac.vis_out)
 
         actor_concat_dim = ac.proprio_out + ac.ee_out + _CONTEXT_DIM + ac.stab_out + ac.vis_out
 
@@ -214,6 +212,9 @@ class Critic(nn.Module):
     ) -> torch.Tensor:
         """便捷接口：直接接收 ``flatten_critic_obs()`` 的输出。
 
+        M5 修复：flatten_critic_obs() 产出 CPU tensor（_t() 搬到 CPU），
+        此处自动迁移到模型所在 device，避免直接调用时 CPU/GPU 设备不匹配崩溃。
+
         Parameters
         ----------
         critic_flat : dict
@@ -223,4 +224,7 @@ class Critic(nn.Module):
         -------
         value : ``(batch, 1)``
         """
-        return self.forward(critic_flat["actor_branches"], critic_flat["privileged"])
+        device = next(self.parameters()).device
+        actor_branches = {k: v.to(device) for k, v in critic_flat["actor_branches"].items()}
+        privileged = critic_flat["privileged"].to(device)
+        return self.forward(actor_branches, privileged)

@@ -56,6 +56,10 @@ class PPOConfig:
     actor_lr: float = 3e-4
     critic_lr: float = 3e-4
 
+    # ── 学习率线性衰减 ────────────────────────────────────────────
+    lr_decay: bool = False            # 是否启用线性衰减至 0
+    lr_total_steps: int = 10_000_000  # 衰减完成时对应的全局 env 步数
+
     # ── 更新循环 ──────────────────────────────────────────────────
     num_mini_batches: int = 4   # Mini-batch 数量 N_mb
     num_epochs: int = 5         # 优化轮数 K
@@ -94,6 +98,11 @@ class PPOTrainer:
         self.critic = critic
         self.cfg = cfg or PPOConfig()
         self.device = torch.device(device)
+
+        # 确定 RNN 类型，避免在 _update_step 中通过 tensor 值推断
+        self.use_lstm: bool = (
+            getattr(getattr(actor, "cfg", None), "rnn_type", "gru") == "lstm"
+        )
 
         # 独立 optimizer
         self.actor_optimizer = optim.Adam(
@@ -190,7 +199,14 @@ class PPOTrainer:
         # ── TBPTT: 逐步推演 Actor ────────────────────────────────
         all_log_probs = []
         all_entropies = []
-        hidden = hidden_init.detach()
+
+        # 重建 hidden state — 支持 GRU (bare tensor) 和 LSTM (h, c) tuple
+        h_init = hidden_init.detach()
+        cell_init = batch.get("cell_init")
+        if self.use_lstm and cell_init is not None:
+            hidden = (h_init, cell_init.detach())
+        else:
+            hidden = h_init
 
         for t in range(L):
             # 构建当前步的分支字典 {name: (B, dim)}
@@ -212,6 +228,8 @@ class PPOTrainer:
 
         # ── §2.3 PPO-Clip Actor Loss ─────────────────────────────
         log_ratio = new_log_probs - old_log_probs
+        # Clamp log_ratio to prevent numerical overflow in exp()
+        log_ratio = torch.clamp(log_ratio, -20.0, 20.0)
         ratio = torch.exp(log_ratio)
 
         surr1 = ratio * advantages
@@ -316,3 +334,17 @@ class PPOTrainer:
         """恢复训练器状态（用于 checkpoint 加载）。"""
         self.actor_optimizer.load_state_dict(state["actor_optimizer"])
         self.critic_optimizer.load_state_dict(state["critic_optimizer"])
+
+    def step_lr(self, global_steps: int) -> None:
+        """按全局 env 步数线性衰减学习率（每 training iteration 调用一次）。
+
+        仅在 ``cfg.lr_decay=True`` 时生效，从初始 lr 线性衰减至 0。
+        """
+        if not self.cfg.lr_decay:
+            return
+        frac = min(1.0, global_steps / max(self.cfg.lr_total_steps, 1))
+        factor = 1.0 - frac
+        for pg in self.actor_optimizer.param_groups:
+            pg["lr"] = self.cfg.actor_lr * factor
+        for pg in self.critic_optimizer.param_groups:
+            pg["lr"] = self.cfg.critic_lr * factor

@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
@@ -110,7 +111,7 @@ def _assemble_video(frames: list[np.ndarray], output_path: Path, fps: int = 30) 
 # ═══════════════════════════════════════════════════════════════════════
 
 def run_episode(
-    env,
+    envs,
     actor,
     actor_cfg,
     runtime,
@@ -124,6 +125,11 @@ def run_episode(
 ) -> dict:
     """执行单个 episode rollout。
 
+    Parameters
+    ----------
+    envs:
+        DirectRLEnvAdapter 实例（num_envs=1）。
+
     Returns
     -------
     dict
@@ -133,17 +139,17 @@ def run_episode(
 
     left_occupied, right_occupied = VALID_CONTEXTS[context_name]
 
-    actor_obs, critic_obs = env.reset(
-        door_type="push",
-        left_occupied=left_occupied,
-        right_occupied=right_occupied,
+    actor_obs_list, critic_obs_list = envs.reset(
+        door_types=["push"],
+        left_occupied_list=[left_occupied],
+        right_occupied_list=[right_occupied],
     )
 
     runtime.reset(1)
     actor_obs_list, critic_obs_list = runtime.prepare_batch(
-        actor_obs_list=[actor_obs],
-        critic_obs_list=[critic_obs],
-        visual_observations=[env.get_visual_observation()],
+        actor_obs_list=actor_obs_list,
+        critic_obs_list=critic_obs_list,
+        visual_observations=envs.get_visual_observations(),
         force_refresh_mask=[True],
     )
     actor_obs = actor_obs_list[0]
@@ -166,38 +172,34 @@ def run_episode(
                 actor_branches, hidden=hidden, deterministic=deterministic
             )
 
-        # 环境步进
-        actor_obs, critic_obs, reward, done, info = env.step(
-            action.cpu().numpy()[0]
+        # 环境步进（向量化接口）
+        actor_obs_list, critic_obs_list, rewards, dones, infos = envs.step(
+            action.cpu().numpy()
         )
-        last_info = info
-        total_reward += float(reward)
+        done = bool(dones[0])
+        last_info = infos[0]
+        total_reward += float(rewards[0])
         step += 1
 
         # 视觉 embedding 更新
         actor_obs_list, critic_obs_list = runtime.prepare_batch(
-            actor_obs_list=[actor_obs],
-            critic_obs_list=[critic_obs],
-            visual_observations=[env.get_visual_observation()],
-            force_refresh_mask=[bool(done)],
+            actor_obs_list=actor_obs_list,
+            critic_obs_list=critic_obs_list,
+            visual_observations=envs.get_visual_observations(),
+            force_refresh_mask=[done],
         )
         actor_obs = actor_obs_list[0]
 
         # 逐步诊断输出
         if verbose and step % 20 == 0:
-            door_angle = info.get("door_angle", 0.0)
+            door_angle = last_info.get("door_angle", 0.0)
             print(
                 f"    [Step {step:>4d}] "
-                f"r={reward:>7.4f}  "
+                f"r={float(rewards[0]):>7.4f}  "
                 f"R={total_reward:>8.4f}  "
                 f"angle={door_angle:>5.3f}  "
                 f"action_norm={float(action.norm()):>6.3f}"
             )
-
-        # 帧捕获
-        frame = _try_save_frame(env, frame_dir, episode_idx, step)
-        if frame is not None:
-            frames.append(frame)
 
     success = bool(last_info.get("success", False))
     reason = str(last_info.get("termination_reason", "UNKNOWN"))
@@ -263,10 +265,17 @@ def main() -> int:
         "--quiet", action="store_true",
         help="减少逐步输出",
     )
+    parser.add_argument(
+        "--headless", action="store_true",
+        help="以无窗口模式启动 Isaac Sim",
+    )
     args = parser.parse_args()
 
-    from train import load_config, build_env_config, build_models
-    from affordance_guided_interaction.envs.door_env import DoorInteractionEnv
+    from train import build_env_cfg, load_config, build_models
+    from affordance_guided_interaction.utils.runtime_env import resolve_headless_mode
+    from affordance_guided_interaction.utils.sim_runtime import launch_simulation_app
+    from affordance_guided_interaction.envs.door_push_env import DoorPushEnv
+    from affordance_guided_interaction.envs.direct_rl_env_adapter import DirectRLEnvAdapter
     from affordance_guided_interaction.training.perception_runtime import PerceptionRuntime
 
     # ── 初始化 ──────────────────────────────────────────────
@@ -276,7 +285,13 @@ def main() -> int:
     device = torch.device(args.device)
     config_path = str(_PROJECT_ROOT / args.config)
     cfg = load_config(config_path)
-    env_cfg = build_env_config(cfg)
+    simulation_app = launch_simulation_app(
+        headless=resolve_headless_mode(args.headless, os.environ),
+        enable_cameras=True,
+        import_error_message=(
+            "未检测到 isaacsim 运行时，rollout_demo.py 需要在 Isaac Sim / Isaac Lab 运行时下执行。"
+        ),
+    )
 
     actor, _critic, actor_cfg = build_models(cfg, device)
     actor.eval()
@@ -296,7 +311,11 @@ def main() -> int:
 
     # ── 创建环境和视觉运行时 ────────────────────────────────
     runtime = PerceptionRuntime(refresh_interval=4, embedding_dim=768)
-    env = DoorInteractionEnv(env_cfg)
+
+    # 使用 GPU 环境 (num_envs=1 用于演示)
+    env_cfg = build_env_cfg(cfg, n_envs=1, device=str(device), seed=args.seed)
+    _direct_env = DoorPushEnv(cfg=env_cfg)
+    envs = DirectRLEnvAdapter(_direct_env)
 
     frame_dir = Path(args.save_frames) if args.save_frames else None
     deterministic = not args.stochastic
@@ -324,7 +343,7 @@ def main() -> int:
             t0 = time.time()
 
             result = run_episode(
-                env=env,
+                envs=envs,
                 actor=actor,
                 actor_cfg=actor_cfg,
                 runtime=runtime,
@@ -348,7 +367,9 @@ def main() -> int:
                 f"time={elapsed:.2f}s\n"
             )
     finally:
-        env.close()
+        envs.close()
+        if simulation_app is not None:
+            simulation_app.close()
 
     # ── 视频组装 ────────────────────────────────────────────
     if args.save_video and all_frames:

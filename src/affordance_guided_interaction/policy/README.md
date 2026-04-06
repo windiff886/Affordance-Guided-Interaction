@@ -3,7 +3,7 @@
 > 文档状态：目标设计导向
 >
 > 本文档描述的是 `policy/` 层的目标形态，也就是我们希望最终训练系统中的策略模块如何工作。
-> 它以 `training_pipeline_detailed.md` 中已经确认的策略规格为准，
+> 它以 `docs/training_pipeline_detailed.md` 中已经确认的策略规格为准，
 > 并以 `observations/README.md` 作为上游观测接口的参考。
 >
 > 如果当前代码实现与本文档不一致，应以本文档作为后续重构方向。

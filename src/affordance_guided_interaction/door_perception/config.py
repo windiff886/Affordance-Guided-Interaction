@@ -79,3 +79,6 @@ class AffordancePipelineConfig:
     segmentation: SegmentationConfig = field(default_factory=SegmentationConfig)
     point_cloud: PointCloudConfig = field(default_factory=PointCloudConfig)
     encoder: PointMAEEncoderConfig = field(default_factory=PointMAEEncoderConfig)
+
+    # ── 调试选项 ──────────────────────────────────────────────────────
+    visualize_detections: bool = False

@@ -59,7 +59,7 @@ class ActionHead(nn.Module):
         std : ``(batch, action_dim)``
         """
         mu = self.mu_layer(features)  # (B, action_dim)
-        std = self.log_std.exp().expand_as(mu)  # (B, action_dim)
+        std = torch.clamp(self.log_std, -20.0, 2.0).exp().expand_as(mu)  # (B, action_dim)
         return mu, std
 
     def sample(self, features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -80,6 +80,24 @@ class ActionHead(nn.Module):
         action = dist.rsample()  # 可微采样
         log_prob = dist.log_prob(action).sum(dim=-1)  # (B,)
         return action, log_prob
+
+    def sample_with_entropy(
+        self, features: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """采样动作并同时返回 log_prob 和 entropy（单次 forward，避免 L2 重复计算）。
+
+        Returns
+        -------
+        action : ``(batch, action_dim)``
+        log_prob : ``(batch,)``
+        entropy : ``(batch,)``
+        """
+        mu, std = self.forward(features)
+        dist = Normal(mu, std)
+        action = dist.rsample()
+        log_prob = dist.log_prob(action).sum(dim=-1)
+        entropy = dist.entropy().sum(dim=-1)
+        return action, log_prob, entropy
 
     def evaluate(
         self, features: torch.Tensor, action: torch.Tensor

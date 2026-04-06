@@ -473,6 +473,63 @@ def package_imported_robot_asset(
     return wrapper_path, f"{wrapper_path}{robot_prim_path}"
 
 
+def inline_wrapper_collision_references(
+    stage,
+    *,
+    wrapper_path: str,
+    robot_prim_path: str,
+    Sdf,
+) -> tuple[int, bool]:
+    """Inline packaged collision refs into the robot subtree and drop /colliders.
+
+    The URDF importer authors each ``<link>/collisions`` prim as an internal
+    reference to the shared ``/colliders/<link>`` scope. Keeping that shared
+    scope in the final packaged asset also keeps its PhysicsCollisionGroup
+    prims, which break Isaac Lab physics replication for multi-env cloning.
+
+    This pass materializes the referenced collision subtree directly under each
+    robot link's ``collisions`` prim so the packaged asset no longer depends on
+    the shared ``/colliders`` scope.
+    """
+
+    wrapper_robot_path = f"{wrapper_path}{robot_prim_path}"
+    wrapper_colliders_path = f"{wrapper_path}/colliders"
+    layer = stage.GetRootLayer()
+
+    inline_jobs: list[tuple[str, str]] = []
+    for prim in stage.Traverse():
+        prim_path = str(prim.GetPath())
+        if not prim_path.startswith(f"{wrapper_robot_path}/"):
+            continue
+        if prim.GetName() != "collisions":
+            continue
+
+        for ref in get_applied_references(prim):
+            if ref.assetPath or not ref.primPath:
+                continue
+            source_path = str(ref.primPath)
+            if not source_path.startswith(f"{wrapper_colliders_path}/"):
+                continue
+            inline_jobs.append((prim_path, source_path))
+            break
+
+    for dest_path, source_path in inline_jobs:
+        dest_prim = stage.GetPrimAtPath(dest_path)
+        source_prim = stage.GetPrimAtPath(source_path)
+        if not (dest_prim and dest_prim.IsValid() and source_prim and source_prim.IsValid()):
+            continue
+
+        dest_prim.GetReferences().ClearReferences()
+        Sdf.CopySpec(layer, Sdf.Path(source_path), layer, Sdf.Path(dest_path))
+
+    removed_shared_colliders = False
+    shared_colliders_prim = stage.GetPrimAtPath(wrapper_colliders_path)
+    if shared_colliders_prim and shared_colliders_prim.IsValid():
+        removed_shared_colliders = stage.RemovePrim(wrapper_colliders_path)
+
+    return len(inline_jobs), removed_shared_colliders
+
+
 def authored_geometry_container(prim) -> bool:
     return bool(
         prim
@@ -746,7 +803,10 @@ def run_conversion(args: argparse.Namespace) -> int:
         import_config.import_inertia_tensor = True
         import_config.fix_base = False
         import_config.collision_from_visuals = False
-        import_config.self_collision = True
+        # Avoid authoring asset-level collision groups that break PhysX
+        # replication for Isaac Lab multi-env cloning. Runtime articulation
+        # self-collision is still enabled below.
+        import_config.self_collision = False
         import_config.distance_scale = 1.0
         import_config.create_physics_scene = False
 
@@ -777,6 +837,7 @@ def run_conversion(args: argparse.Namespace) -> int:
                 Sdf.ValueTypeNames.Bool,
                 True,
             )
+        # Keep runtime self-collision enabled on the articulation root.
         attr.Set(True)
         log("✅ 已启用 Articulation 自碰撞检测")
 
@@ -807,6 +868,22 @@ def run_conversion(args: argparse.Namespace) -> int:
         asset_root = stage.GetPrimAtPath(asset_root_path)
         exported_robot_prim = stage.GetPrimAtPath(exported_robot_path)
         log(f"✅ 已打包共享几何根到默认导出根: {asset_root_path}")
+
+        inlined_collision_refs, removed_shared_colliders = inline_wrapper_collision_references(
+            stage,
+            wrapper_path=asset_root_path,
+            robot_prim_path=robot_prim_path,
+            Sdf=Sdf,
+        )
+        log(
+            "✅ 已内联机器人碰撞子树引用: "
+            f"{inlined_collision_refs} 个 collisions prim"
+        )
+        if removed_shared_colliders:
+            log("✅ 已移除包装资产中的共享 /colliders 子树")
+
+        cleared_packaged_refs = clear_invalid_internal_references(stage)
+        log(f"✅ 已清理包装资产中的 {cleared_packaged_refs} 个悬空内部引用")
 
         deinstanced = deinstance_all_prims(stage, Usd)
         log(f"✅ 已关闭 {deinstanced} 个 prim 的 instanceable 标记（修复 PhysX 碰撞识别）")

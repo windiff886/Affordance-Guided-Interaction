@@ -7,10 +7,25 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Literal
 
 import torch
 import torch.nn as nn
+
+logger = logging.getLogger(__name__)
+
+
+def _should_retry_without_cudnn(exc: RuntimeError) -> bool:
+    """Return whether a cuDNN-backed RNN call should be retried without cuDNN."""
+    msg = str(exc)
+    if "cuDNN error" in msg:
+        return True
+    if "CUDNN_STATUS_" in msg:
+        return True
+    if "non-contiguous input" in msg:
+        return True
+    return False
 
 
 class RecurrentBackbone(nn.Module):
@@ -39,6 +54,7 @@ class RecurrentBackbone(nn.Module):
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         self.rnn_type = rnn_type
+        self._warned_cudnn_fallback = False
 
         # 构建循环层
         rnn_cls = nn.GRU if rnn_type == "gru" else nn.LSTM
@@ -97,14 +113,36 @@ class RecurrentBackbone(nn.Module):
         # 2-D 输入 → 3-D
         if x.dim() == 2:
             x = x.unsqueeze(1)  # (B, 1, F)
+        x = x.contiguous()
 
         batch_size = x.size(0)
 
         if hidden is None:
             hidden = self.init_hidden(batch_size)
+        elif isinstance(hidden, tuple):
+            hidden = tuple(h.contiguous() for h in hidden)
+        else:
+            hidden = hidden.contiguous()
 
         # RNN 前向
-        rnn_out, hidden_new = self.rnn(x, hidden)  # rnn_out: (B, 1, H)
+        try:
+            rnn_out, hidden_new = self.rnn(x, hidden)  # rnn_out: (B, 1, H)
+        except RuntimeError as exc:
+            if not _should_retry_without_cudnn(exc):
+                raise
+
+            if not self._warned_cudnn_fallback:
+                logger.warning(
+                    "cuDNN RNN path rejected the current tensor layout. "
+                    "Falling back to the non-cuDNN RNN kernel for this call. "
+                    "input_shape=%s rnn_type=%s",
+                    tuple(x.shape),
+                    self.rnn_type,
+                )
+                self._warned_cudnn_fallback = True
+
+            with torch.backends.cudnn.flags(enabled=False):
+                rnn_out, hidden_new = self.rnn(x, hidden)
 
         # 取最后一个时间步的输出
         output = rnn_out[:, -1, :]  # (B, H)
