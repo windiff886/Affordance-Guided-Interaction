@@ -33,7 +33,7 @@ class RolloutBuffer:
         每轮 rollout 的采集步数 T。
     actor_branch_dims : dict[str, int]
         Actor 各分支的维度映射，例如：
-        ``{"proprio": 60, "ee": 26, "context": 2, "stability": 40, "visual": 769}``
+        ``{"proprio": 60, "ee": 26, "context": 2, "stability": 40, "visual": 768}``
     privileged_dim : int
         展平后的 privileged 信息总维度（16）。
     action_dim : int

@@ -45,6 +45,7 @@ class PerceptionRuntime:
         self._visualize_detections = visualize_detections
         self._strict_mode = strict_mode
         self._cache: list[VisualCacheEntry] = []
+        self._last_error_reason: str | None = None
 
     def reset(self, n_envs: int) -> None:
         """完全重置所有环境的视觉缓存。"""
@@ -85,6 +86,11 @@ class PerceptionRuntime:
 
             if should_refresh:
                 embedding, visual_valid = self._encode(visual_observations[idx])
+                if not visual_valid:
+                    reason = self._last_error_reason or "未知视觉错误"
+                    raise RuntimeError(
+                        f"visual_valid=0，视觉模块异常，env_id={idx}，原因：{reason}"
+                    )
                 entry = VisualCacheEntry(
                     door_embedding=embedding,
                     visual_valid=visual_valid,
@@ -104,20 +110,27 @@ class PerceptionRuntime:
 
     def _encode(self, observation: dict[str, Any] | None) -> tuple[np.ndarray, bool]:
         zero = np.zeros(self.embedding_dim, dtype=np.float32)
+        self._last_error_reason = None
         if observation is None:
+            self._last_error_reason = "visual_observation 缺失"
             return zero, False
 
         pipeline = self._get_pipeline()
         if pipeline is None:
+            self._last_error_reason = "视觉管线初始化失败"
             return zero, False
 
         try:
             embedding = pipeline.encode(observation=observation, task_goal="push")
-        except Exception:
+        except Exception as exc:
+            self._last_error_reason = f"视觉编码异常: {exc}"
             return zero, False
 
         arr = np.asarray(embedding, dtype=np.float32).ravel()
         if arr.shape != (self.embedding_dim,):
+            self._last_error_reason = (
+                f"embedding 维度错误: got {arr.shape}, expected {(self.embedding_dim,)}"
+            )
             return zero, False
         return arr, True
 
@@ -155,14 +168,8 @@ class PerceptionRuntime:
     ) -> None:
         actor_obs.setdefault("visual", {})
         actor_obs["visual"]["door_embedding"] = entry.door_embedding.copy()
-        actor_obs["visual"]["visual_valid"] = np.array(
-            [1.0 if entry.visual_valid else 0.0], dtype=np.float32
-        )
 
         critic_actor_obs = critic_obs.get("actor_obs")
         if isinstance(critic_actor_obs, dict):
             critic_actor_obs.setdefault("visual", {})
             critic_actor_obs["visual"]["door_embedding"] = entry.door_embedding.copy()
-            critic_actor_obs["visual"]["visual_valid"] = np.array(
-                [1.0 if entry.visual_valid else 0.0], dtype=np.float32
-            )

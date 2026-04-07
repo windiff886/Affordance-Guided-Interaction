@@ -338,17 +338,16 @@ class DoorPushEnvCfg(DirectRLEnvCfg):
 
     # ── 观测空间 ────────────────────────────────────────────────────
     # Actor obs: proprio(48) + ee(38) + context(2) + stability(2) +
-    #            visual(768+1) = 859
-    # 注：visual_valid(1) 单独注入
-    num_observations: int = 859
-    observation_space: int = 859
+    #            visual(768) = 858
+    num_observations: int = 858
+    observation_space: int = 858
 
-    # Critic obs (privileged): actor_obs(859) + door_pose(7) +
+    # Critic obs (privileged): actor_obs(858) + door_pose(7) +
     #     door_joint_pos(1) + door_joint_vel(1) + cup_mass(1) +
     #     door_mass(1) + door_damping(1) + base_pos(3) +
-    #     cup_dropped(1) = 875
-    num_states: int = 875
-    state_space: int = 875
+    #     cup_dropped(1) = 874
+    num_states: int = 874
+    state_space: int = 874
 
     # ── 任务判定阈值 ────────────────────────────────────────────────
     # 门角度到达 target → terminated(success)

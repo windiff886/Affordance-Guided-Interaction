@@ -294,8 +294,8 @@ DoorPushEnv (GPU batched)
   ├── ArticulationView → joint states ─────────┐
   ├── body state view → ee states ─────────────┤
   ├── occupancy flags → context ───────────────┤  DoorPushEnv._get_observations()
-  ├── simulation oracle → privileged ──────────┤  直接构建 actor_obs(859D)
-  └── cached embedding → visual ───────────────┘  和 critic_obs(875D) tensor
+  ├── simulation oracle → privileged ──────────┤  直接构建 actor_obs(858D)
+  └── cached embedding → visual ───────────────┘  和 critic_obs(874D) tensor
                     │
                     ▼
 DirectRLEnvAdapter
@@ -304,7 +304,7 @@ DirectRLEnvAdapter
                     ▼
 PerceptionRuntime (外部)
   fixed-frequency RGB-D → 768D embedding
-  → env.update_visual_embedding() 注入
+  → 直接覆写 obs["visual"]["door_embedding"]
                     │
                     ▼
 policy/

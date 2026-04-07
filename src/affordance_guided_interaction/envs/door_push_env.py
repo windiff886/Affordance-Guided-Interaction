@@ -136,7 +136,6 @@ class DoorPushEnv(DirectRLEnv):
         self._door_embedding = torch.zeros(
             N, self.cfg.door_embedding_dim, device=dev
         )
-        self._visual_valid = torch.zeros(N, device=dev)
         self._visual_stale_steps = torch.zeros(N, dtype=torch.long, device=dev)
         self._episode_reset_fn = None
 
@@ -302,7 +301,7 @@ class DoorPushEnv(DirectRLEnv):
             noisy_dq = all_dq + torch.randn_like(all_dq) * self.cfg.obs_noise_std
 
         # proprio(48) + left_ee(19) + right_ee(19) + context(2)
-        # + stability(2) + visual(768+1) = 859
+        # + stability(2) + visual(768) = 858
         actor_obs = torch.cat([
             # proprio: q(12) + dq(12) + tau(12) + prev_action(12) = 48
             noisy_q, noisy_dq, all_tau, self._prev_action,
@@ -318,10 +317,9 @@ class DoorPushEnv(DirectRLEnv):
             left_occ, right_occ,
             # stability: 2
             left_tilt, right_tilt,
-            # visual: embedding(768) + valid(1) = 769
+            # visual: embedding(768)
             self._door_embedding,
-            self._visual_valid.unsqueeze(-1),
-        ], dim=-1)  # (N, 859)
+        ], dim=-1)  # (N, 858)
 
         # ── Critic obs (无噪声 + privileged) ───────────────────
         # 门状态 (base_link 系)
@@ -350,7 +348,7 @@ class DoorPushEnv(DirectRLEnv):
             # context + stability
             left_occ, right_occ, left_tilt, right_tilt,
             # visual
-            self._door_embedding, self._visual_valid.unsqueeze(-1),
+            self._door_embedding,
             # privileged: door_pose(7) + door_joint(2) + domain_params(6) + cup_dropped(1) = 16
             #   domain_params: cup_mass(1)+door_mass(1)+door_damping(1)+base_pos(3) = 6
             door_pose_base,
@@ -360,7 +358,7 @@ class DoorPushEnv(DirectRLEnv):
             self._door_damping.unsqueeze(-1),
             self._base_pos,
             cup_dropped.float().unsqueeze(-1),
-        ], dim=-1)  # (N, 875)
+        ], dim=-1)  # (N, 874)
 
         return {"policy": actor_obs, "critic": critic_obs}
 
@@ -608,7 +606,6 @@ class DoorPushEnv(DirectRLEnv):
         self._prev_right_ee_lin_vel[env_ids] = 0.0
         self._prev_right_ee_ang_vel[env_ids] = 0.0
         self._door_embedding[env_ids] = 0.0
-        self._visual_valid[env_ids] = 0.0
         self._visual_stale_steps[env_ids] = 0
         self._cached_cup_dropped[env_ids] = False
         if self._camera is not None:
@@ -636,17 +633,14 @@ class DoorPushEnv(DirectRLEnv):
     def update_visual_embedding(
         self,
         embedding: Tensor,
-        valid: Tensor,
     ) -> None:
         """外部视觉感知运行时调用，更新所有 env 的视觉缓存。
 
         Parameters
         ----------
         embedding : (N, 768)
-        valid : (N,)
         """
         self._door_embedding.copy_(embedding.to(self.device))
-        self._visual_valid.copy_(valid.to(self.device))
 
     def set_episode_reset_fn(self, fn) -> None:
         """注册 auto-reset 回调，在 `_reset_idx()` 中逐 env 调用。"""

@@ -59,7 +59,6 @@ _S_RO   = slice(87,  88)   # right_occupied
 _S_LT   = slice(88,  89)   # left_tilt
 _S_RT   = slice(89,  90)   # right_tilt
 _S_EMB  = slice(90,  858)  # door_embedding (768D)
-_S_VV   = slice(858, 859)  # visual_valid
 
 
 class DirectRLEnvAdapter:
@@ -155,10 +154,10 @@ class DirectRLEnvAdapter:
     ) -> tuple[list[dict], list[dict]]:
         """将 batch tensor obs 转为 per-env dict list。
 
-        将 DoorPushEnv 产出的 859D flat actor tensor 解构为
+        将 DoorPushEnv 产出的 858D flat actor tensor 解构为
         ``flatten_actor_obs()`` 期望的嵌套字典结构。
 
-        Actor obs 859D tensor 布局（对齐 DoorPushEnv._get_observations）：
+        Actor obs 858D tensor 布局（对齐 DoorPushEnv._get_observations）：
             [0:12)   joint_positions
             [12:24)  joint_velocities
             [24:36)  joint_torques
@@ -171,7 +170,7 @@ class DirectRLEnvAdapter:
             [80:83)  right_ee_la      [83:86)  right_ee_aa
             [86:87)  left_occupied    [87:88)  right_occupied
             [88:89)  left_tilt        [89:90)  right_tilt
-            [90:858) door_embedding   [858:859) visual_valid
+            [90:858) door_embedding
 
         critic_obs dict 结构:
             {
@@ -183,14 +182,14 @@ class DirectRLEnvAdapter:
                 },
             }
         """
-        actor_t = obs_dict["policy"]   # (N, 859)
-        critic_t = obs_dict["critic"]  # (N, 875)
+        actor_t = obs_dict["policy"]   # (N, 858)
+        critic_t = obs_dict["critic"]  # (N, 874)
 
         actor_list: list[dict] = []
         critic_list: list[dict] = []
 
         for i in range(self.n_envs):
-            # L13: .clone() 避免 slice view 持有整个 (N,859) batch tensor
+            # L13: .clone() 避免 slice view 持有整个 (N,858) batch tensor
             a = actor_t[i].clone()
 
             actor_obs = {
@@ -228,13 +227,12 @@ class DirectRLEnvAdapter:
                 },
                 "visual": {
                     "door_embedding": a[_S_EMB],
-                    "visual_valid":   a[_S_VV],
                 },
             }
             actor_list.append(actor_obs)
 
             # 解构 critic tensor → actor_obs + privileged
-            critic_row = critic_t[i].cpu().numpy()  # (875,)
+            critic_row = critic_t[i].cpu().numpy()  # (874,)
             priv_np = critic_row[self._actor_obs_dim:]
 
             privileged: dict[str, np.ndarray] = {}

@@ -39,8 +39,8 @@ from .action_head import ActionHead
 NUM_JOINTS_PER_ARM = 6
 TOTAL_ARM_JOINTS = NUM_JOINTS_PER_ARM * 2  # 12
 DOOR_EMBEDDING_DIM = 768
-# visual 分支输入维度 = embedding(768) + visual_valid(1)
-VISUAL_BRANCH_DIM = DOOR_EMBEDDING_DIM + 1
+# visual 分支输入维度 = embedding(768)
+VISUAL_BRANCH_DIM = DOOR_EMBEDDING_DIM
 
 # 每条臂的末端状态维度:
 # pos(3) + quat(4) + lin_vel(3) + ang_vel(3) + lin_acc(3) + ang_acc(3) = 19
@@ -170,11 +170,8 @@ def flatten_actor_obs(obs: dict, cfg: ActorConfig) -> dict[str, torch.Tensor]:
     stab = obs["stability"]
     stab_vec = torch.cat([_t(stab["left_tilt"]), _t(stab["right_tilt"])])
 
-    # -- visual: embedding(768) + visual_valid(1) = 769 --
-    vis_vec = torch.cat([
-        _t(obs["visual"]["door_embedding"]),
-        _t(obs["visual"].get("visual_valid", torch.zeros(1))),
-    ])
+    # -- visual: 纯 door_embedding(768) --
+    vis_vec = _t(obs["visual"]["door_embedding"])
 
     return {
         "proprio": proprio_vec,

@@ -243,7 +243,7 @@ def build_collector(
         "ee": 38,                                           # 双臂各 19
         "context": 2,                                       # left_occ + right_occ
         "stability": 2,                                     # left/right tilt
-        "visual": 769,                                      # Point-MAE 编码(768) + visual_valid(1)
+        "visual": 768,                                      # Point-MAE 编码
     }
 
     buffer = RolloutBuffer(
@@ -263,7 +263,7 @@ def build_collector(
     debug_cfg = t_cfg.get("debug", {})
     perception_runtime = PerceptionRuntime(
         refresh_interval=visual_cfg.get("refresh_interval", 4),
-        embedding_dim=768,  # Point-MAE embedding dim（不含 visual_valid）
+        embedding_dim=768,  # Point-MAE embedding dim
         visualize_detections=debug_cfg.get("visualize_detections", False),
         strict_mode=debug_cfg.get("strict_mode", False),
     )
