@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
+import torch
 
 from affordance_guided_interaction.door_perception.config import CameraIntrinsics
 
@@ -80,6 +81,41 @@ def backproject_masks(
     }
 
 
+def backproject_depth_batch(
+    depth: torch.Tensor,
+    intrinsics: CameraIntrinsics,
+    mask: torch.Tensor | None = None,
+    extrinsic: torch.Tensor | None = None,
+    *,
+    max_points: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """将一批深度图反投影为定长 batched 点云。"""
+    batch, height, width = depth.shape
+    device = depth.device
+
+    u = torch.arange(width, device=device, dtype=torch.float32)
+    v = torch.arange(height, device=device, dtype=torch.float32)
+    v_grid, u_grid = torch.meshgrid(v, u, indexing="ij")
+    u_grid = u_grid.unsqueeze(0).expand(batch, -1, -1)
+    v_grid = v_grid.unsqueeze(0).expand(batch, -1, -1)
+
+    valid = depth > 0
+    if mask is not None:
+        valid = valid & mask.to(device=device, dtype=torch.bool)
+
+    x = (u_grid - float(intrinsics.cx)) * depth / float(intrinsics.fx)
+    y = (v_grid - float(intrinsics.cy)) * depth / float(intrinsics.fy)
+    points = torch.stack([x, y, depth], dim=-1).reshape(batch, -1, 3)
+    valid_flat = valid.reshape(batch, -1)
+
+    if extrinsic is not None:
+        rot = extrinsic[:, :3, :3].to(device=device, dtype=points.dtype)
+        trans = extrinsic[:, :3, 3].to(device=device, dtype=points.dtype)
+        points = torch.bmm(points, rot.transpose(1, 2)) + trans.unsqueeze(1)
+
+    return sample_or_pad_batch(points, valid_flat, max_points)
+
+
 # ---------------------------------------------------------------------------
 # 点云降采样工具（管线使用，替代旧 point_cloud_processing.py 中的复杂滤波）
 # ---------------------------------------------------------------------------
@@ -136,3 +172,29 @@ def sample_or_pad(points: np.ndarray, n: int) -> np.ndarray:
     else:
         idx = np.random.choice(len(points), size=n, replace=True)
     return points[idx]
+
+
+def sample_or_pad_batch(
+    points: torch.Tensor,
+    valid_mask: torch.Tensor,
+    n: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """将 batched 点云对齐到固定点数，并返回有效点标记。"""
+    batch = points.shape[0]
+    aligned = torch.zeros(batch, n, 3, dtype=points.dtype, device=points.device)
+    valid_out = torch.zeros(batch, n, dtype=torch.bool, device=points.device)
+
+    for idx in range(batch):
+        current = points[idx][valid_mask[idx]]
+        count = int(current.shape[0])
+        if count == 0:
+            continue
+        take = min(count, n)
+        aligned[idx, :take] = current[:take]
+        valid_out[idx, :take] = True
+        if count < n:
+            repeat_count = n - count
+            repeat_idx = torch.arange(repeat_count, device=points.device) % count
+            aligned[idx, count:n] = current[repeat_idx]
+
+    return aligned, valid_out

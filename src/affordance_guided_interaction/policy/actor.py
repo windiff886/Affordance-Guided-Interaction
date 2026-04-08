@@ -203,6 +203,17 @@ def batch_flatten_actor_obs(
     return {k: torch.stack([f[k] for f in flat_list], dim=0) for k in keys}
 
 
+def build_actor_branches_from_tensor(obs: torch.Tensor) -> dict[str, torch.Tensor]:
+    """从 flat actor obs tensor 直接切出 batch 分支。"""
+    return {
+        "proprio": obs[:, 0:48],
+        "ee": obs[:, 48:86],
+        "context": obs[:, 86:88],
+        "stability": obs[:, 88:90],
+        "visual": obs[:, 90:858],
+    }
+
+
 # ======================================================================
 # Actor 网络
 # ======================================================================
@@ -376,3 +387,40 @@ class Actor(nn.Module):
 
         log_prob, entropy = self.action_head.evaluate(backbone_out, actions)
         return log_prob, entropy, hidden_new
+
+    def evaluate_action_sequence(
+        self,
+        branches_seq: dict[str, torch.Tensor],
+        actions_seq: torch.Tensor,
+        hidden=None,
+    ) -> tuple[torch.Tensor, torch.Tensor, object]:
+        """按序列批量计算 log_prob 和 entropy。"""
+        batch, seq_len, _ = branches_seq["proprio"].shape
+
+        proprio = branches_seq["proprio"].reshape(batch * seq_len, -1)
+        ee = branches_seq["ee"].reshape(batch * seq_len, -1)
+        stability = branches_seq["stability"].reshape(batch * seq_len, -1)
+        visual = branches_seq["visual"].reshape(batch * seq_len, -1)
+        context = branches_seq["context"].reshape(batch, seq_len, -1)
+
+        f_proprio = self.proprio_encoder(proprio).reshape(batch, seq_len, -1)
+        f_ee = self.ee_encoder(ee).reshape(batch, seq_len, -1)
+        f_stab = self.stab_encoder(stability).reshape(batch, seq_len, -1)
+        f_vis = self.vis_encoder(visual).reshape(batch, seq_len, -1)
+
+        concat = torch.cat([f_proprio, f_ee, context, f_stab, f_vis], dim=-1)
+        backbone_out, hidden_new = self.backbone(
+            concat,
+            hidden,
+            return_sequence=True,
+        )
+
+        log_prob, entropy = self.action_head.evaluate(
+            backbone_out.reshape(batch * seq_len, -1),
+            actions_seq.reshape(batch * seq_len, -1),
+        )
+        return (
+            log_prob.reshape(batch, seq_len),
+            entropy.reshape(batch, seq_len),
+            hidden_new,
+        )

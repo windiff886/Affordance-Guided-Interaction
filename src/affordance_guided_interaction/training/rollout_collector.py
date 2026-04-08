@@ -16,10 +16,18 @@
 
 from __future__ import annotations
 
+from time import perf_counter
 from typing import Protocol, runtime_checkable, Any, Callable
 
 import torch
 import numpy as np
+
+from affordance_guided_interaction.policy.actor import (
+    build_actor_branches_from_tensor,
+)
+from affordance_guided_interaction.policy.critic import (
+    flatten_privileged_tensor,
+)
 
 from .episode_stats import compute_episode_outcome_stats
 
@@ -134,6 +142,7 @@ class RolloutCollector:
 
         # 隐状态缓存
         self._hidden = None
+        self._timings: dict[str, float] = {}
 
     # ═══════════════════════════════════════════════════════════════════
     # §6.1 Step 1 — 轨迹收集
@@ -144,9 +153,9 @@ class RolloutCollector:
         self,
         envs,
         n_steps: int,
-        current_actor_obs: list[dict],
-        current_critic_obs: list[dict],
-    ) -> tuple[list[dict], list[dict], dict[str, float]]:
+        current_actor_obs: list[dict] | torch.Tensor,
+        current_critic_obs: list[dict] | torch.Tensor,
+    ) -> tuple[list[dict] | torch.Tensor, list[dict] | torch.Tensor, dict[str, float]]:
         """在并行环境中收集 n_steps 步轨迹数据。
 
         Parameters
@@ -162,9 +171,9 @@ class RolloutCollector:
 
         Returns
         -------
-        next_actor_obs : list[dict]
+        next_actor_obs : list[dict] | torch.Tensor
             采集结束后各环境的 actor 观测。
-        next_critic_obs : list[dict]
+        next_critic_obs : list[dict] | torch.Tensor
             采集结束后各环境的 critic 观测。
         collect_stats : dict[str, float]
             采集期间的统计信息。
@@ -172,6 +181,7 @@ class RolloutCollector:
         n_envs = envs.n_envs
         self.actor.eval()
         self.critic.eval()
+        self._timings.clear()
 
         # 初始化隐状态
         if self._hidden is None:
@@ -195,24 +205,21 @@ class RolloutCollector:
             "both": 0,
         }
 
-        current_actor_obs, current_critic_obs = self._prepare_visual_batch(
-            envs=envs,
-            actor_obs_list=current_actor_obs,
-            critic_obs_list=current_critic_obs,
-            force_refresh_mask=[True] * n_envs,
+        current_actor_obs, current_critic_obs = self.measure(
+            "vision_s",
+            lambda: self._prepare_visual_batch(
+                envs=envs,
+                actor_obs_list=current_actor_obs,
+                critic_obs_list=current_critic_obs,
+                force_refresh_mask=[True] * n_envs,
+            ),
         )
 
         for step in range(n_steps):
             # ── 1. 展平观测为分支张量字典 ────────────────────────
             # actor_branches: {"proprio": (B, d1), "ee": (B, d2), ...}
-            actor_branches = self.batch_actor_flatten_fn(current_actor_obs)
-            actor_branches = {
-                k: v.to(self.device) for k, v in actor_branches.items()
-            }
-
-            # privileged: (B, 16)
-            priv_flat = self._batch_flatten_priv(current_critic_obs)
-            priv_flat = priv_flat.to(self.device)
+            actor_branches = self._build_actor_branches(current_actor_obs)
+            priv_flat = self._build_privileged_batch(current_critic_obs)
 
             # ── 2. 缓存当前隐状态（用于 TBPTT 恢复）────────────
             if isinstance(self._hidden, tuple):
@@ -234,17 +241,26 @@ class RolloutCollector:
             ).squeeze(-1)  # (n_envs,)
 
             # ── 5. 环境 step ─────────────────────────────────────
-            actions_np = action.cpu().numpy()
-            (
-                next_actor_obs,
-                next_critic_obs,
-                rewards_np,
-                dones_np,
-                infos,
-            ) = envs.step(actions_np)
+            if self._uses_tensor_batch_path(current_actor_obs, current_critic_obs) and hasattr(envs, "step_batch"):
+                batch_step = envs.step_batch(action)
+                next_actor_obs = batch_step.actor_obs
+                next_critic_obs = batch_step.critic_obs
+                rewards = batch_step.rewards.float().to(self.device)
+                dones = batch_step.dones.float().to(self.device)
+                dones_np = batch_step.dones.detach().cpu().numpy().astype(np.float64)
+                rewards_np = batch_step.rewards.detach().cpu().numpy().astype(np.float64)
+                infos = batch_step.infos
+            else:
+                (
+                    next_actor_obs,
+                    next_critic_obs,
+                    rewards_np,
+                    dones_np,
+                    infos,
+                ) = envs.step(action)
 
-            rewards = torch.from_numpy(rewards_np).float().to(self.device)
-            dones = torch.from_numpy(dones_np).float().to(self.device)
+                rewards = torch.from_numpy(rewards_np).float().to(self.device)
+                dones = torch.from_numpy(dones_np).float().to(self.device)
 
             # ── 6. 写入 Buffer ───────────────────────────────────
             if isinstance(cached_hidden, tuple):
@@ -285,24 +301,24 @@ class RolloutCollector:
             )
 
             # ── 8. 推进观测 ──────────────────────────────────────
-            current_actor_obs, current_critic_obs = self._prepare_visual_batch(
-                envs=envs,
-                actor_obs_list=next_actor_obs,
-                critic_obs_list=next_critic_obs,
-                force_refresh_mask=[bool(x) for x in dones_np],
+            current_actor_obs, current_critic_obs = self.measure(
+                "vision_s",
+                lambda: self._prepare_visual_batch(
+                    envs=envs,
+                    actor_obs_list=next_actor_obs,
+                    critic_obs_list=next_critic_obs,
+                    force_refresh_mask=[bool(x) for x in dones_np],
+                ),
             )
 
         # ── 计算最终 bootstrap value ─────────────────────────────
-        last_actor_branches = self.batch_actor_flatten_fn(current_actor_obs)
-        last_actor_branches = {
-            k: v.to(self.device) for k, v in last_actor_branches.items()
-        }
-        last_priv_flat = self._batch_flatten_priv(current_critic_obs).to(self.device)
+        last_actor_branches = self._build_actor_branches(current_actor_obs)
+        last_priv_flat = self._build_privileged_batch(current_critic_obs)
 
         last_values = self.critic.forward(
             last_actor_branches, last_priv_flat
         ).squeeze(-1)
-        last_dones = torch.from_numpy(dones_np).float().to(self.device)
+        last_dones = torch.as_tensor(dones_np, dtype=torch.float32, device=self.device)
 
         # 缓存供外部调用 buffer.compute_gae()
         self._last_values = last_values
@@ -356,6 +372,32 @@ class RolloutCollector:
         ]
         return torch.stack(flat_list, dim=0)  # (n_envs, priv_dim)
 
+    def _build_actor_branches(
+        self,
+        actor_obs: list[dict] | torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        if isinstance(actor_obs, torch.Tensor):
+            branches = build_actor_branches_from_tensor(actor_obs.to(self.device))
+        else:
+            branches = self.batch_actor_flatten_fn(actor_obs)
+            branches = {k: v.to(self.device) for k, v in branches.items()}
+        return branches
+
+    def _build_privileged_batch(
+        self,
+        critic_obs: list[dict] | torch.Tensor,
+    ) -> torch.Tensor:
+        if isinstance(critic_obs, torch.Tensor):
+            return flatten_privileged_tensor(critic_obs.to(self.device))
+        return self._batch_flatten_priv(critic_obs).to(self.device)
+
+    @staticmethod
+    def _uses_tensor_batch_path(
+        actor_obs: list[dict] | torch.Tensor,
+        critic_obs: list[dict] | torch.Tensor,
+    ) -> bool:
+        return isinstance(actor_obs, torch.Tensor) and isinstance(critic_obs, torch.Tensor)
+
     def _init_hidden(self, n_envs: int) -> None:
         """初始化隐状态并移至正确设备。"""
         self._hidden = self.actor.init_hidden(n_envs)
@@ -384,27 +426,75 @@ class RolloutCollector:
         if self.perception_runtime is not None:
             self.perception_runtime.reset(n_envs)
 
+    def measure(self, name: str, fn: Callable[[], Any]) -> Any:
+        """累积一个代码段的耗时。"""
+        start = perf_counter()
+        result = fn()
+        self._timings[name] = self._timings.get(name, 0.0) + (perf_counter() - start)
+        return result
+
+    def _merge_timings(self, timings: dict[str, float]) -> None:
+        """将外部 timing 字典累加到 collector 计时桶。"""
+        for name, value in timings.items():
+            self._timings[name] = self._timings.get(name, 0.0) + float(value)
+
     def _prepare_visual_batch(
         self,
         *,
         envs,
-        actor_obs_list: list[dict],
-        critic_obs_list: list[dict],
+        actor_obs_list: list[dict] | torch.Tensor,
+        critic_obs_list: list[dict] | torch.Tensor,
         force_refresh_mask: list[bool],
-    ) -> tuple[list[dict], list[dict]]:
+    ) -> tuple[list[dict] | torch.Tensor, list[dict] | torch.Tensor]:
         if self.perception_runtime is None:
             return actor_obs_list, critic_obs_list
 
-        visual_observations = None
-        if hasattr(envs, "get_visual_observations"):
-            visual_observations = envs.get_visual_observations()
+        if self._uses_tensor_batch_path(actor_obs_list, critic_obs_list):
+            refresh_mask = self.perception_runtime.get_tensor_refresh_mask(
+                n_envs=actor_obs_list.shape[0],
+                device=actor_obs_list.device,
+                force_refresh_mask=torch.as_tensor(
+                    force_refresh_mask,
+                    dtype=torch.bool,
+                    device=actor_obs_list.device,
+                ),
+            )
+            visual_observations = None
+            if bool(refresh_mask.any()) and hasattr(envs, "get_visual_observations_batch"):
+                fetch_start = perf_counter()
+                visual_observations = envs.get_visual_observations_batch()
+                self._timings["camera_fetch_s"] = self._timings.get("camera_fetch_s", 0.0) + (
+                    perf_counter() - fetch_start
+                )
+            prepared = self.perception_runtime.prepare_batch_tensors(
+                actor_obs_list,
+                critic_obs_list,
+                visual_observations=visual_observations,
+                force_refresh_mask=refresh_mask,
+            )
+            self._merge_timings(self.perception_runtime.consume_stage_timings())
+            return prepared["actor_obs"], prepared["critic_obs"]
 
-        return self.perception_runtime.prepare_batch(
+        refresh_mask = self.perception_runtime.get_list_refresh_mask(
+            n_envs=len(actor_obs_list),
+            force_refresh_mask=force_refresh_mask,
+        )
+        visual_observations = None
+        if any(refresh_mask) and hasattr(envs, "get_visual_observations"):
+            fetch_start = perf_counter()
+            visual_observations = envs.get_visual_observations()
+            self._timings["camera_fetch_s"] = self._timings.get("camera_fetch_s", 0.0) + (
+                perf_counter() - fetch_start
+            )
+
+        prepared = self.perception_runtime.prepare_batch(
             actor_obs_list=actor_obs_list,
             critic_obs_list=critic_obs_list,
             visual_observations=visual_observations,
-            force_refresh_mask=force_refresh_mask,
+            force_refresh_mask=refresh_mask,
         )
+        self._merge_timings(self.perception_runtime.consume_stage_timings())
+        return prepared
 
     @staticmethod
     def _accumulate_context_stats(

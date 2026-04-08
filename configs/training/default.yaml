@@ -10,41 +10,45 @@
 # 所有运行参数都在本文件中修改，不再依赖命令行覆盖。
 #
 # 4060 Laptop 本地验证建议（手动切换下面的生效值）：
-headless: false
-device: null
-seed: 42
-resume: null
-log_dir: runs
-ckpt_dir: checkpoints
-num_envs: 2
-total_steps: 50_000
-n_steps_per_rollout: 128
-checkpoint_interval: 100
+# headless: false
+# device: null
+# seed: 42
+# resume: null
+# log_dir: runs
+# ckpt_dir: checkpoints
+# num_envs: 2
+# total_steps: 50_000
+# n_steps_per_rollout: 128
+# checkpoint_interval: 100
 #
 # A100 正式训练建议（手动切换下面的生效值）：
-#   headless: true
-#   device: cuda
-#   seed: 42
-#   resume: null
-#   log_dir: runs
-#   ckpt_dir: checkpoints
-#   num_envs: 64
-#   total_steps: 10_000_000
-#   n_steps_per_rollout: 128
-#   checkpoint_interval: 50
+# headless: true
+# device: cuda
+# seed: 42
+# resume: null
+# log_dir: runs
+# ckpt_dir: checkpoints
+# num_envs: 64
+# total_steps: 10_000_000
+# n_steps_per_rollout: 128
+# checkpoint_interval: 50
 #
 # ── 运行时参数（当前生效值）──────────────────────────────────────────
-headless: false             # 是否以无窗口模式启动仿真
-device: null                # null 表示自动选择 cuda/cpu
+headless: true             # 是否以无窗口模式启动仿真
+device: cuda                # null 表示自动选择 cuda/cpu
 seed: 42                    # 全局随机种子
 resume: null                # 恢复训练的 checkpoint 路径；null 表示从头开始
 log_dir: runs               # TensorBoard 日志根目录
 ckpt_dir: checkpoints       # checkpoint 输出目录
 
 # ── 基本训练参数（当前生效值）────────────────────────────────────────
-num_envs: 2                 # 并行环境数量
-total_steps: 50_000         # 总训练步数
+num_envs: 64                 # 并行环境数量
+total_steps: 10_000_000         # 总训练步数
 n_steps_per_rollout: 128    # 每轮 rollout 采集步数 T
+
+# ── 日志与 checkpoint ────────────────────────────────────────────────
+log_interval: 1             # 每 N 轮迭代打印日志
+checkpoint_interval: 50     # 每 N 轮迭代保存 checkpoint
 
 # ── PPO 算法超参（§2, §6, §7.1）──────────────────────────────────────
 ppo:
@@ -63,12 +67,8 @@ ppo:
   seq_length: 16            # TBPTT 截断长度 L
   normalize_advantages: true
 
-# ── 日志与 checkpoint ────────────────────────────────────────────────
-log_interval: 1             # 每 N 轮迭代打印日志
-checkpoint_interval: 50     # 每 N 轮迭代保存 checkpoint
-
 # ── 调试选项 ──────────────────────────────────────────────────────────
 debug:
-  visualize_detections: true  # 是否用 OpenCV 弹窗显示视觉检测结果（mask + bbox + 点云投影）
+  visualize_detections: false  # 是否用 OpenCV 弹窗显示视觉检测结果（mask + bbox + 点云投影）
   strict_mode: true           # 正式训练设 true → 缺 Isaac Lab 或视觉依赖时直接报错退出
                                # 本地开发设 false → 保持 placeholder 退化行为

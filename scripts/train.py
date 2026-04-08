@@ -188,6 +188,17 @@ def build_env_cfg(
         env_cfg.decimation = int(env_cfg_yaml["decimation"])
         env_cfg.sim.render_interval = env_cfg.decimation
 
+    visual_cfg = cfg.get("training", {}).get("visual", {})
+    env_cfg.visual_refresh_interval = int(
+        visual_cfg.get("refresh_interval", env_cfg.visual_refresh_interval)
+    )
+    if env_cfg.scene.tiled_camera is not None:
+        env_cfg.scene.tiled_camera.update_period = (
+            float(env_cfg.sim.dt)
+            * int(env_cfg.decimation)
+            * int(env_cfg.visual_refresh_interval)
+        )
+
     if not enable_cameras:
         env_cfg.scene.tiled_camera = None
 
@@ -375,6 +386,7 @@ def main() -> int:
     print(f"   无头模式: {headless}")
     print(f"   随机种子: {runtime_cfg.seed}")
     print(f"   启用视觉传感器: {enable_cameras}")
+    print("📈 Throughput profiling enabled: rollout / vision / ppo timing buckets")
 
     simulation_app = launch_simulation_app(
         headless=headless,
@@ -488,12 +500,20 @@ def main() -> int:
         build_curriculum_reset_batch(initial_stage_cfg, randomizer, n_envs)
     )
 
-    actor_obs_list, critic_obs_list = envs.reset(
-        domain_params_list=domain_params_list,
-        door_types=door_types,
-        left_occupied_list=left_occupied,
-        right_occupied_list=right_occupied,
-    )
+    if hasattr(envs, "reset_batch"):
+        actor_obs_list, critic_obs_list = envs.reset_batch(
+            domain_params_list=domain_params_list,
+            door_types=door_types,
+            left_occupied_list=left_occupied,
+            right_occupied_list=right_occupied,
+        )
+    else:
+        actor_obs_list, critic_obs_list = envs.reset(
+            domain_params_list=domain_params_list,
+            door_types=door_types,
+            left_occupied_list=left_occupied,
+            right_occupied_list=right_occupied,
+        )
     collector.reset_hidden(n_envs)
 
     # ═══════════════════════════════════════════════════════════════════
@@ -510,12 +530,14 @@ def main() -> int:
             iter_start = time.time()
 
             # ── Step 1: 轨迹采集 ──────────────────────────────
+            collect_start = time.time()
             actor_obs_list, critic_obs_list, collect_stats = collector.collect(
                 envs=envs,
                 n_steps=n_steps,
                 current_actor_obs=actor_obs_list,
                 current_critic_obs=critic_obs_list,
             )
+            rollout_s = time.time() - collect_start
 
             # ── Step 2: 计算 GAE ──────────────────────────────
             buffer.compute_gae(
@@ -526,7 +548,9 @@ def main() -> int:
             )
 
             # ── Step 3: PPO 参数更新 ──────────────────────────
+            update_start = time.time()
             update_metrics = ppo_trainer.update(buffer)
+            update_s = time.time() - update_start
 
             # ── Step 4: 更新全局步数计数器 & 学习率衰减 ──────────
             steps_this_iter = n_envs * n_steps
@@ -545,6 +569,11 @@ def main() -> int:
 
             iter_time = time.time() - iter_start
             fps = steps_this_iter / max(iter_time, 1e-6)
+            vision_s = collector._timings.get("vision_s", 0.0)
+            camera_fetch_s = collector._timings.get("camera_fetch_s", 0.0)
+            segmentation_s = collector._timings.get("segmentation_s", 0.0)
+            pointcloud_s = collector._timings.get("pointcloud_s", 0.0)
+            encoder_s = collector._timings.get("encoder_s", 0.0)
 
             # ── Step 6: 课程管理器跃迁判定 ─────────────────────
             mean_reward = collect_stats.get("collect/mean_reward", 0.0)
@@ -577,6 +606,9 @@ def main() -> int:
                     f"clip={update_metrics['clip_fraction']:>5.3f} | "
                     f"r̄={mean_reward:>.4f} | "
                     f"succ={epoch_success_rate:>5.3f} | "
+                    f"rollout={rollout_s:>5.2f}s | "
+                    f"vision={vision_s:>5.2f}s | "
+                    f"update={update_s:>5.2f}s | "
                     f"stage={curriculum.current_stage} | "
                     f"ETA={eta_h:.1f}h"
                 )
@@ -590,6 +622,18 @@ def main() -> int:
                 writer.add_scalar("train/approx_kl", update_metrics["approx_kl"], global_steps)
                 writer.add_scalar("train/explained_variance", update_metrics["explained_variance"], global_steps)
                 writer.add_scalar("train/fps", fps, global_steps)
+                writer.add_scalar("timing/rollout_s", rollout_s, global_steps)
+                writer.add_scalar("timing/vision_s", vision_s, global_steps)
+                writer.add_scalar("timing/camera_fetch_s", camera_fetch_s, global_steps)
+                writer.add_scalar("timing/segmentation_s", segmentation_s, global_steps)
+                writer.add_scalar("timing/pointcloud_s", pointcloud_s, global_steps)
+                writer.add_scalar("timing/encoder_s", encoder_s, global_steps)
+                writer.add_scalar("timing/update_s", update_s, global_steps)
+                writer.add_scalar(
+                    "timing/env_steps_per_s",
+                    steps_this_iter / max(rollout_s, 1e-6),
+                    global_steps,
+                )
                 writer.add_scalar("collect/mean_reward", mean_reward, global_steps)
                 writer.add_scalar("collect/completed_episodes", completed_eps, global_steps)
                 writer.add_scalar("collect/successful_episodes", successful_eps, global_steps)

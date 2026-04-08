@@ -492,6 +492,28 @@ class PointMAEEncoder:
 
         return embedding.squeeze(0).cpu().numpy()
 
+    def encode_batch(
+        self,
+        points_batch: "torch.Tensor | np.ndarray",
+    ) -> "torch.Tensor":
+        """将 batched 点云编码为 batched embedding。"""
+        _check_torch()
+        import torch as _torch
+
+        self._ensure_model()
+        assert self._model is not None
+
+        tensor = _torch.as_tensor(points_batch, dtype=_torch.float32)
+        if tensor.ndim != 3:
+            raise ValueError(
+                f"points_batch 维度错误: got {tuple(tensor.shape)}, expected (B, N, 3)"
+            )
+
+        with _torch.no_grad():
+            embedding = self._model(tensor.to(self._config.device))
+
+        return embedding
+
     @property
     def embed_dim(self) -> int:
         """输出 embedding 的维度。"""

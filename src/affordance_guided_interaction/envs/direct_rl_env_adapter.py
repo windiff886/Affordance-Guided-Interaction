@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable
 
 import numpy as np
@@ -94,6 +95,17 @@ class DirectRLEnvAdapter:
         # episode reset 回调（兼容旧接口）
         self._episode_reset_fn: Callable | None = None
 
+    @dataclass(slots=True)
+    class BatchStepResult:
+        actor_obs: Tensor
+        critic_obs: Tensor
+        rewards: Tensor
+        dones: Tensor
+        terminated: Tensor
+        truncated: Tensor
+        info_dict: dict[str, Any]
+        infos: list[dict[str, Any]]
+
     @property
     def n_envs(self) -> int:
         return self._env.num_envs
@@ -107,6 +119,24 @@ class DirectRLEnvAdapter:
         right_occupied_list: list[bool] | None = None,
     ) -> tuple[list[dict], list[dict]]:
         """重置所有环境。"""
+        actor_obs, critic_obs = self.reset_batch(
+            domain_params_list=domain_params_list,
+            door_types=door_types,
+            left_occupied_list=left_occupied_list,
+            right_occupied_list=right_occupied_list,
+        )
+        return self._tensor_to_obs_list({"policy": actor_obs, "critic": critic_obs})
+
+    def reset_batch(
+        self,
+        *,
+        domain_params_list: list[dict[str, Any] | None] | None = None,
+        door_types: list[str] | None = None,
+        left_occupied_list: list[bool] | None = None,
+        right_occupied_list: list[bool] | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        """重置所有环境并保留 batched tensor 观测。"""
+        del door_types
         # 将 occupancy 传递给底层 env
         if left_occupied_list is not None and right_occupied_list is not None:
             self._env.set_occupancy(
@@ -121,14 +151,16 @@ class DirectRLEnvAdapter:
         obs_dict, _info = self._env.reset()
         self._current_actor_obs = obs_dict["policy"]
         self._current_critic_obs = obs_dict["critic"]
-        return self._tensor_to_obs_list(obs_dict)
+        return self._current_actor_obs, self._current_critic_obs
 
     def step(
-        self, actions: np.ndarray
+        self, actions: np.ndarray | Tensor
     ) -> tuple[list[dict], list[dict], np.ndarray, np.ndarray, list[dict]]:
         """执行一步。"""
-        # 将 numpy actions 转为 torch tensor
-        actions_t = torch.from_numpy(actions).float().to(self._env.device)
+        if isinstance(actions, torch.Tensor):
+            actions_t = actions.to(self._env.device)
+        else:
+            actions_t = torch.from_numpy(actions).float().to(self._env.device)
 
         obs_dict, reward_t, terminated_t, truncated_t, info_dict = self._env.step(
             actions_t
@@ -148,6 +180,31 @@ class DirectRLEnvAdapter:
 
         actor_obs_list, critic_obs_list = self._tensor_to_obs_list(obs_dict)
         return actor_obs_list, critic_obs_list, rewards_np, dones_np, infos
+
+    def step_batch(self, actions: Tensor) -> BatchStepResult:
+        """执行一步并保留 tensor 结果。"""
+        obs_dict, reward_t, terminated_t, truncated_t, info_dict = self._env.step(
+            actions
+        )
+
+        self._current_actor_obs = obs_dict["policy"]
+        self._current_critic_obs = obs_dict["critic"]
+
+        dones_np = (terminated_t | truncated_t).detach().cpu().numpy().astype(np.float64)
+        infos = self._build_info_list(
+            terminated_t, truncated_t, info_dict, dones_np,
+        )
+
+        return self.BatchStepResult(
+            actor_obs=obs_dict["policy"],
+            critic_obs=obs_dict["critic"],
+            rewards=reward_t,
+            dones=(terminated_t | truncated_t),
+            terminated=terminated_t,
+            truncated=truncated_t,
+            info_dict=info_dict,
+            infos=infos,
+        )
 
     def _tensor_to_obs_list(
         self, obs_dict: dict[str, Tensor]
@@ -342,6 +399,12 @@ class DirectRLEnvAdapter:
         if hasattr(self._env, "get_visual_observations"):
             return self._env.get_visual_observations()
         return [None] * self.n_envs
+
+    def get_visual_observations_batch(self) -> dict[str, Tensor] | None:
+        """读取底层环境暴露的 batched 视觉观测。"""
+        if hasattr(self._env, "get_visual_observations_batch"):
+            return self._env.get_visual_observations_batch()
+        return None
 
     def close(self) -> None:
         """关闭环境。"""

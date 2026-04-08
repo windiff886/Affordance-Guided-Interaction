@@ -78,6 +78,14 @@ def flatten_privileged(privileged: dict) -> torch.Tensor:
     return torch.cat(parts)
 
 
+def flatten_privileged_tensor(
+    critic_obs: torch.Tensor,
+    actor_obs_dim: int = 858,
+) -> torch.Tensor:
+    """从 flat critic obs tensor 直接切出 privileged 分支。"""
+    return critic_obs[:, actor_obs_dim:]
+
+
 def flatten_critic_obs(
     critic_obs: dict, actor_cfg: ActorConfig
 ) -> dict[str, torch.Tensor]:

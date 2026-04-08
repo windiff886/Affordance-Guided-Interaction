@@ -12,16 +12,20 @@
 from __future__ import annotations
 
 import logging
+from time import perf_counter
 from typing import Any
 
 import numpy as np
+import torch
 
 from affordance_guided_interaction.door_perception.config import (
     AffordancePipelineConfig,
 )
 from affordance_guided_interaction.door_perception.depth_projection import (
     backproject_depth,
+    backproject_depth_batch,
     sample_or_pad,
+    sample_or_pad_batch,
     voxel_downsample,
 )
 from affordance_guided_interaction.door_perception.frozen_encoder import (
@@ -85,71 +89,115 @@ class AffordancePipeline:
         observation: dict[str, Any],
         task_goal: str | None = None,
     ) -> np.ndarray:
-        """执行完整管线，返回 door_embedding。
+        """执行完整管线，返回 door_embedding。"""
+        embedding, _timings = self.encode_with_timings(
+            observation=observation,
+            task_goal=task_goal,
+        )
+        return embedding
 
-        Parameters
-        ----------
-        observation : dict
-            包含 rgb, depth 等键值的观测字典。
-        task_goal : str | None
-            兼容参数。当前版本不再输出 z_prog，故该参数不会参与计算。
-
-        Returns
-        -------
-        door_embedding : np.ndarray
-            (embed_dim,) Point-MAE 输出的高维 embedding 向量。
-        """
+    def encode_with_timings(
+        self,
+        *,
+        observation: dict[str, Any],
+        task_goal: str | None = None,
+    ) -> tuple[np.ndarray, dict[str, float]]:
+        """执行单帧管线并返回阶段 timing。"""
+        del task_goal
         rgb: np.ndarray = observation["rgb"]
         depth: np.ndarray = observation["depth"]
         extrinsic: np.ndarray | None = observation.get("extrinsic")
+        timings: dict[str, float] = {}
 
-        # --- 1. 开集分割 ---
-        seg_results = self._segmentor.segment(rgb)
+        seg_results = self._measure_stage(
+            timings,
+            "segmentation_s",
+            lambda: self._segmentor.segment(rgb),
+        )
         masks = self._unpack_masks(seg_results)
 
-        # --- 2. 深度反投影：mask → 局部点云 ---
-        all_points: list[np.ndarray] = []
-        debug_point_clouds: dict[str, np.ndarray] = {}
-        for key in ("door", "handle", "button"):
-            mask = masks.get(key)
-            if mask is not None and mask.any():
-                pts = backproject_depth(
-                    depth, self._config.camera, mask=mask, extrinsic=extrinsic
+        def build_points() -> np.ndarray:
+            all_points: list[np.ndarray] = []
+            debug_point_clouds: dict[str, np.ndarray] = {}
+            for key in ("door",):
+                mask = masks.get(key)
+                if mask is not None and mask.any():
+                    pts = backproject_depth(
+                        depth, self._config.camera, mask=mask, extrinsic=extrinsic
+                    )
+                    if len(pts) > 0:
+                        all_points.append(pts)
+                        if self._visualizer is not None:
+                            debug_point_clouds[key] = pts
+
+            if self._visualizer is not None:
+                self._visualizer.show(
+                    rgb=rgb,
+                    seg_results=seg_results,
+                    point_clouds=debug_point_clouds,
+                    intrinsics=self._config.camera,
+                    extrinsic=extrinsic,
                 )
-                if len(pts) > 0:
-                    all_points.append(pts)
-                    if self._visualizer is not None:
-                        debug_point_clouds[key] = pts
 
-        # --- debug 可视化（在降采样前使用原始点云）---
-        if self._visualizer is not None:
-            self._visualizer.show(
-                rgb=rgb,
-                seg_results=seg_results,
-                point_clouds=debug_point_clouds,
-                intrinsics=self._config.camera,
-                extrinsic=extrinsic,
+            if all_points:
+                merged_points = np.concatenate(all_points, axis=0)
+            else:
+                merged_points = np.zeros((0, 3), dtype=np.float64)
+
+            if len(merged_points) > 0:
+                merged_points = voxel_downsample(
+                    merged_points, self._config.point_cloud.voxel_size
+                )
+            return sample_or_pad(
+                merged_points, self._config.point_cloud.max_points
             )
 
-        # 合并所有部件的点云为一个整体
-        if all_points:
-            merged_points = np.concatenate(all_points, axis=0)
-        else:
-            merged_points = np.zeros((0, 3), dtype=np.float64)
-
-        # --- 3. 基础降采样 + 点数对齐 ---
-        if len(merged_points) > 0:
-            merged_points = voxel_downsample(
-                merged_points, self._config.point_cloud.voxel_size
-            )
-        aligned_points = sample_or_pad(
-            merged_points, self._config.point_cloud.max_points
+        aligned_points = self._measure_stage(timings, "pointcloud_s", build_points)
+        door_embedding = self._measure_stage(
+            timings,
+            "encoder_s",
+            lambda: self._encoder.encode(aligned_points),
         )
+        return door_embedding, timings
 
-        # --- 4. Point-MAE 编码 → door_embedding ---
-        door_embedding = self._encoder.encode(aligned_points)
+    def encode_batch(
+        self,
+        *,
+        observations: dict[str, torch.Tensor],
+        task_goal: str | None = None,
+    ) -> torch.Tensor:
+        """执行 batched RGB-D -> door_embedding 管线。"""
+        embedding, _timings = self.encode_batch_with_timings(
+            observations=observations,
+            task_goal=task_goal,
+        )
+        return embedding
 
-        return door_embedding
+    def encode_batch_with_timings(
+        self,
+        *,
+        observations: dict[str, torch.Tensor],
+        task_goal: str | None = None,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        """执行 batched RGB-D -> door_embedding 管线并返回阶段 timing。"""
+        del task_goal
+        timings: dict[str, float] = {}
+        seg = self._measure_stage(
+            timings,
+            "segmentation_s",
+            lambda: self._segmentor.segment_batch(observations["rgb"]),
+        )
+        points = self._measure_stage(
+            timings,
+            "pointcloud_s",
+            lambda: self._build_points_batch(observations, seg),
+        )
+        embedding = self._measure_stage(
+            timings,
+            "encoder_s",
+            lambda: self._encoder.encode_batch(points),
+        )
+        return embedding, timings
 
     # ------------------------------------------------------------------
     # 内部辅助
@@ -167,3 +215,57 @@ class AffordancePipeline:
             if key not in masks or r.confidence > 0:
                 masks[key] = r.mask
         return masks
+
+    @staticmethod
+    def _measure_stage(
+        timings: dict[str, float],
+        name: str,
+        fn,
+    ):
+        start = perf_counter()
+        result = fn()
+        timings[name] = timings.get(name, 0.0) + (perf_counter() - start)
+        return result
+
+    def _build_points_batch(
+        self,
+        observations: dict[str, torch.Tensor],
+        masks: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        depth = observations["depth"]
+        extrinsic = observations.get("extrinsic")
+
+        point_batches: list[torch.Tensor] = []
+        valid_batches: list[torch.Tensor] = []
+        for key in ("door",):
+            mask = masks.get(key)
+            if mask is None:
+                continue
+            points, valid = backproject_depth_batch(
+                depth,
+                self._config.camera,
+                mask=mask,
+                extrinsic=extrinsic,
+                max_points=self._config.point_cloud.max_points,
+            )
+            point_batches.append(points)
+            valid_batches.append(valid)
+
+        if not point_batches:
+            batch = int(depth.shape[0])
+            return torch.zeros(
+                batch,
+                self._config.point_cloud.max_points,
+                3,
+                dtype=depth.dtype,
+                device=depth.device,
+            )
+
+        merged_points = torch.cat(point_batches, dim=1)
+        merged_valid = torch.cat(valid_batches, dim=1)
+        aligned_points, _ = sample_or_pad_batch(
+            merged_points,
+            merged_valid,
+            self._config.point_cloud.max_points,
+        )
+        return aligned_points

@@ -14,11 +14,11 @@
 |------|--------|-------|
 | `training/default.yaml` | 28 | 100% |
 | `env/default.yaml` | 2 | 100% |
-| `policy/default.yaml` | 10 | 100% |
+| `policy/default.yaml` | 8 | 100% |
 | `curriculum/default.yaml` | 3 | 100% |
 | `task/default.yaml` | 2 | 100% |
 
-**整体**：45 个参数，全部被代码消费。
+**整体**：43 个参数，全部被代码消费。
 
 > **已删除**: `reward/default.yaml`（22 参数）— 奖励超参数现在在 `DoorPushEnvCfg` 中定义。
 > 数学公式参考见 `envs/Reward.md`。
@@ -115,7 +115,7 @@ cfg = {
 
 ---
 
-### 3.3 `policy/default.yaml` — 策略网络配置（10 参数）
+### 3.3 `policy/default.yaml` — 策略网络配置（8 参数）
 
 分支 encoder 的维度参数（`proprio_hidden`、`ee_hidden` 等）由 `ActorConfig` dataclass 默认值控制，不在 YAML 中暴露。如需修改这些维度，直接编辑 `actor.py` 中的 `ActorConfig` dataclass。
 
@@ -128,9 +128,7 @@ cfg = {
 | `actor.rnn_type` | `gru` | `train.py:117` → `ActorConfig` → `RecurrentBackbone` | 循环单元类型（`gru` 或 `lstm`） |
 | `actor.action_dim` | `12` | `train.py:118` → `ActorConfig` → `ActionHead` | 输出动作维度（双臂 12 个关节力矩） |
 | `actor.log_std_init` | `-0.5` | `train.py:119` → `ActorConfig` → `ActionHead` | 高斯策略初始 $\log\sigma$（对应 $\sigma \approx 0.61$） |
-| `actor.action_history_length` | `3` | `train.py:120` → `ActorConfig` | 动作历史步数（与 `env/default.yaml` 中同名参数应保持一致） |
-| `actor.acc_history_length` | `10` | `train.py:121` → `ActorConfig` | 加速度历史窗口长度（与 `env/default.yaml` 中同名参数应保持一致） |
-| `actor.include_torques` | `true` | `train.py:122` → `ActorConfig` → `Actor`、`Critic` | 是否在本体感觉输入中包含关节力矩。为 `true` 时 proprio 维度为 48，为 `false` 时为 36 |
+| `actor.include_torques` | `true` | `train.py:120` → `ActorConfig` → `Actor`、`Critic` | 是否在本体感觉输入中包含关节力矩。为 `true` 时 proprio 维度为 48，为 `false` 时为 36 |
 
 #### Critic 网络
 

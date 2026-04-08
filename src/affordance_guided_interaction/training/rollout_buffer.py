@@ -267,12 +267,7 @@ class RolloutBuffer:
                 f"会产生空 mini-batch。请减小 num_mini_batches 或增大 n_envs/n_steps。"
             )
 
-        # 构建序列索引：(seq_start_step, env_idx)
-        seq_indices = []
-        for env_idx in range(self.n_envs):
-            for seq_idx in range(num_seqs_per_env):
-                t_start = seq_idx * seq_length
-                seq_indices.append((t_start, env_idx))
+        seq_indices = self._build_seq_index_tensor(seq_length)
 
         # 随机打乱
         perm = torch.randperm(total_seqs)
@@ -285,54 +280,47 @@ class RolloutBuffer:
             end = start + batch_size if mb_idx < num_mini_batches - 1 else total_seqs
 
             mb_indices = perm[start:end]
-
-            # 各分支序列收集器
-            branch_seqs: dict[str, list[torch.Tensor]] = {
-                name: [] for name in self.actor_branch_dims
-            }
-            priv_seqs: list[torch.Tensor] = []
-            act_seqs: list[torch.Tensor] = []
-            lp_seqs: list[torch.Tensor] = []
-            val_seqs: list[torch.Tensor] = []
-            adv_seqs: list[torch.Tensor] = []
-            ret_seqs: list[torch.Tensor] = []
-            hid_seqs: list[torch.Tensor] = []
-            cell_seqs: list[torch.Tensor] = []
-
-            for idx in mb_indices:
-                t_start, env_idx = seq_indices[idx.item()]
-                t_end = t_start + seq_length
-
-                for name in self.actor_branch_dims:
-                    branch_seqs[name].append(
-                        self.actor_obs_branches[name][t_start:t_end, env_idx]
-                    )
-
-                priv_seqs.append(self.privileged_obs[t_start:t_end, env_idx])
-                act_seqs.append(self.actions[t_start:t_end, env_idx])
-                lp_seqs.append(self.log_probs[t_start:t_end, env_idx])
-                val_seqs.append(self.values[t_start:t_end, env_idx])
-                adv_seqs.append(self.advantages[t_start:t_end, env_idx])
-                ret_seqs.append(self.returns[t_start:t_end, env_idx])
-                # 隐状态：取片段开始时刻的缓存
-                hid_seqs.append(self.hidden_states[t_start, :, env_idx, :])
-                cell_seqs.append(self.cell_states[t_start, :, env_idx, :])
+            mb_pairs = seq_indices[mb_indices]
+            t_start = mb_pairs[:, 0]
+            env_idx = mb_pairs[:, 1]
+            time_offsets = torch.arange(seq_length, device=self.device).unsqueeze(0)
+            time_index = t_start.unsqueeze(1) + time_offsets
+            env_index = env_idx.unsqueeze(1)
 
             result: dict[str, torch.Tensor] = {}
-            # Actor 分支
             for name in self.actor_branch_dims:
-                result[name] = torch.stack(branch_seqs[name])  # (B, L, dim)
+                result[name] = self.actor_obs_branches[name][time_index, env_index]
 
-            result["privileged"] = torch.stack(priv_seqs)       # (B, L, priv_dim)
-            result["actions"] = torch.stack(act_seqs)           # (B, L, act_dim)
-            result["log_probs"] = torch.stack(lp_seqs)          # (B, L)
-            result["values"] = torch.stack(val_seqs)            # (B, L)
-            result["advantages"] = torch.stack(adv_seqs)        # (B, L)
-            result["returns"] = torch.stack(ret_seqs)           # (B, L)
-            result["hidden_init"] = torch.stack(hid_seqs, dim=1)  # (layers, B, H)
-            result["cell_init"] = torch.stack(cell_seqs, dim=1)    # (layers, B, H)
+            result["privileged"] = self.privileged_obs[time_index, env_index]
+            result["actions"] = self.actions[time_index, env_index]
+            result["log_probs"] = self.log_probs[time_index, env_index]
+            result["values"] = self.values[time_index, env_index]
+            result["advantages"] = self.advantages[time_index, env_index]
+            result["returns"] = self.returns[time_index, env_index]
+            result["hidden_init"] = self.hidden_states[t_start, :, env_idx, :].permute(1, 0, 2)
+            result["cell_init"] = self.cell_states[t_start, :, env_idx, :].permute(1, 0, 2)
 
             yield result
+
+    def iter_minibatches_recurrent(
+        self,
+        *,
+        seq_length: int,
+        num_mini_batches: int,
+    ) -> Iterator[dict[str, torch.Tensor]]:
+        """兼容包装：按 recurrent mini-batch 形式迭代序列。"""
+        yield from self.recurrent_mini_batch_generator(
+            num_mini_batches=num_mini_batches,
+            seq_length=seq_length,
+        )
+
+    def _build_seq_index_tensor(self, seq_length: int) -> torch.Tensor:
+        """构建所有 `(t_start, env_idx)` 序列起点索引。"""
+        num_seqs_per_env = self.n_steps // seq_length
+        t_starts = torch.arange(num_seqs_per_env, device=self.device) * seq_length
+        env_ids = torch.arange(self.n_envs, device=self.device)
+        grid_t, grid_env = torch.meshgrid(t_starts, env_ids, indexing="ij")
+        return torch.stack([grid_t.reshape(-1), grid_env.reshape(-1)], dim=1)
 
     # ═══════════════════════════════════════════════════════════════════
     # 清空

@@ -196,10 +196,6 @@ class PPOTrainer:
             adv_std = adv_flat.std() + 1e-8
             advantages = (advantages - adv_mean) / adv_std
 
-        # ── TBPTT: 逐步推演 Actor ────────────────────────────────
-        all_log_probs = []
-        all_entropies = []
-
         # 重建 hidden state — 支持 GRU (bare tensor) 和 LSTM (h, c) tuple
         h_init = hidden_init.detach()
         cell_init = batch.get("cell_init")
@@ -208,23 +204,16 @@ class PPOTrainer:
         else:
             hidden = h_init
 
-        for t in range(L):
-            # 构建当前步的分支字典 {name: (B, dim)}
-            obs_t = {
-                name: batch[name][:, t, :]
-                for name in _ACTOR_BRANCH_KEYS
-                if name in batch
-            }
-            act_t = act_seq[:, t, :]
-
-            log_prob_t, entropy_t, hidden = self.actor.evaluate_actions(
-                obs_t, act_t, hidden
-            )
-            all_log_probs.append(log_prob_t)
-            all_entropies.append(entropy_t)
-
-        new_log_probs = torch.stack(all_log_probs, dim=1)  # (B, L)
-        entropies = torch.stack(all_entropies, dim=1)      # (B, L)
+        obs_seq = {
+            name: batch[name]
+            for name in _ACTOR_BRANCH_KEYS
+            if name in batch
+        }
+        new_log_probs, entropies, hidden = self.actor.evaluate_action_sequence(
+            obs_seq,
+            act_seq,
+            hidden,
+        )
 
         # ── §2.3 PPO-Clip Actor Loss ─────────────────────────────
         log_ratio = new_log_probs - old_log_probs

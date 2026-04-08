@@ -26,10 +26,12 @@ class SegmentationConfig:
 
     model_type: str = "lang_sam"  # "lang_sam" | "grounded_sam2"
     text_prompts: list[str] = field(
-        default_factory=lambda: ["door", "door handle", "button"]
+        default_factory=lambda: ["door"]
     )
     confidence_threshold: float = 0.3
     device: str = "cuda"
+    lang_sam_max_batch_size: int | None = 32
+    lang_sam_autocast_dtype: str = "bfloat16"
 
 
 @dataclass(slots=True)

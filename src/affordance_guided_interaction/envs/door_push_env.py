@@ -48,6 +48,7 @@ from .door_push_env_cfg import (
     POST_REMOVE_SETTLE_STEPS,
     TRAY_SIZE_XYZ,
 )
+from .camera_batch_utils import align_camera_pose_batch, align_camera_tensor_batch
 from .batch_math import (
     batch_quat_conjugate,
     batch_quat_from_yaw,
@@ -648,47 +649,81 @@ class DoorPushEnv(DirectRLEnv):
 
     def get_visual_observations(self) -> list[dict[str, np.ndarray] | None]:
         """导出当前帧 RGB-D 观测，供训练侧视觉运行时编码。"""
-        if self._camera is None or not self._camera_capture_enabled:
+        batch_observations = self.get_visual_observations_batch()
+        if batch_observations is None:
             return [None] * self.num_envs
+
+        rgb_np = batch_observations["rgb"].detach().cpu().numpy().astype(
+            np.uint8, copy=False
+        )
+        depth_np = batch_observations["depth"].detach().cpu().numpy().astype(
+            np.float32, copy=False
+        )
+        extrinsic_np = batch_observations["extrinsic"].detach().cpu().numpy().astype(
+            np.float32, copy=False
+        )
+
+        observations: list[dict[str, np.ndarray]] = []
+        for env_idx in range(self.num_envs):
+            observations.append(
+                {
+                    "rgb": rgb_np[env_idx],
+                    "depth": depth_np[env_idx],
+                    "extrinsic": extrinsic_np[env_idx],
+                }
+            )
+        return observations
+
+    def get_visual_observations_batch(self) -> dict[str, Tensor] | None:
+        """导出当前帧 batched RGB-D 观测，保持 tensor-native。"""
+        if self._camera is None or not self._camera_capture_enabled:
+            return None
 
         camera_data = self._read_camera_data()
         if camera_data is None:
-            return [None] * self.num_envs
+            return None
 
         outputs = camera_data.output
         rgb = outputs.get("rgb")
         depth = outputs.get("depth")
         if rgb is None or depth is None:
-            return [None] * self.num_envs
+            return None
 
-        rgb_np = rgb[..., :3].detach().cpu().numpy().astype(np.uint8, copy=False)
-        depth_np = depth.detach().cpu().numpy()
-        if depth_np.ndim == 4 and depth_np.shape[-1] == 1:
-            depth_np = depth_np[..., 0]
-        depth_np = np.where(np.isfinite(depth_np), depth_np, 0.0).astype(
-            np.float32, copy=False
+        batch_size = int(self.num_envs)
+        rgb_tensor = align_camera_tensor_batch(
+            rgb[..., :3].contiguous(),
+            batch_size=batch_size,
+            name="rgb",
         )
-
-        cam_pos = camera_data.pos_w.detach().cpu().numpy().astype(
-            np.float32, copy=False
+        depth_tensor = align_camera_tensor_batch(
+            depth,
+            batch_size=batch_size,
+            name="depth",
         )
-        cam_rot = batch_quat_to_rotation_matrix(
-            camera_data.quat_w_ros
-        ).detach().cpu().numpy().astype(np.float32, copy=False)
+        if depth_tensor.ndim == 4 and depth_tensor.shape[-1] == 1:
+            depth_tensor = depth_tensor[..., 0]
+        depth_tensor = torch.where(
+            torch.isfinite(depth_tensor),
+            depth_tensor,
+            torch.zeros_like(depth_tensor),
+        ).to(dtype=torch.float32)
 
-        observations: list[dict[str, np.ndarray]] = []
-        for env_idx in range(self.num_envs):
-            extrinsic = np.eye(4, dtype=np.float32)
-            extrinsic[:3, :3] = cam_rot[env_idx]
-            extrinsic[:3, 3] = cam_pos[env_idx]
-            observations.append(
-                {
-                    "rgb": rgb_np[env_idx],
-                    "depth": depth_np[env_idx],
-                    "extrinsic": extrinsic,
-                }
-            )
-        return observations
+        cam_pos_w, cam_quat_w_ros = align_camera_pose_batch(
+            camera_data.pos_w,
+            camera_data.quat_w_ros,
+            batch_size=batch_size,
+        )
+        cam_rot = batch_quat_to_rotation_matrix(cam_quat_w_ros)
+        extrinsic = torch.eye(
+            4, dtype=torch.float32, device=depth_tensor.device
+        ).repeat(batch_size, 1, 1)
+        extrinsic[:, :3, :3] = cam_rot.to(dtype=torch.float32)
+        extrinsic[:, :3, 3] = cam_pos_w.to(dtype=torch.float32)
+        return {
+            "rgb": rgb_tensor,
+            "depth": depth_tensor.contiguous(),
+            "extrinsic": extrinsic,
+        }
 
     def _read_camera_data(self):
         """读取相机数据；首帧/渲染未就绪时尝试恢复，失败则安全回退。"""

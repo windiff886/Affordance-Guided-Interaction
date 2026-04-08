@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Any, Sequence
 
 import numpy as np
+import torch
 
 
 @dataclass
@@ -46,6 +47,10 @@ class PerceptionRuntime:
         self._strict_mode = strict_mode
         self._cache: list[VisualCacheEntry] = []
         self._last_error_reason: str | None = None
+        self._door_embeddings: torch.Tensor | None = None
+        self._visual_valid_mask: torch.Tensor | None = None
+        self._stale_steps_tensor: torch.Tensor | None = None
+        self._stage_timings: dict[str, float] = {}
 
     def reset(self, n_envs: int) -> None:
         """完全重置所有环境的视觉缓存。"""
@@ -58,6 +63,10 @@ class PerceptionRuntime:
             )
             for _ in range(n_envs)
         ]
+        self._door_embeddings = None
+        self._visual_valid_mask = None
+        self._stale_steps_tensor = None
+        self._stage_timings.clear()
 
     def prepare_batch(
         self,
@@ -69,20 +78,17 @@ class PerceptionRuntime:
     ) -> tuple[list[dict], list[dict]]:
         """为一批 observation 注入最近一次视觉缓存。"""
         n_envs = len(actor_obs_list)
-        self._ensure_cache_size(n_envs)
+        refresh_mask = self.get_list_refresh_mask(
+            n_envs=n_envs,
+            force_refresh_mask=force_refresh_mask,
+        )
 
         if visual_observations is None:
             visual_observations = [None] * n_envs
-        if force_refresh_mask is None:
-            force_refresh_mask = [False] * n_envs
 
         for idx in range(n_envs):
             entry = self._cache[idx]
-            should_refresh = (
-                bool(force_refresh_mask[idx])
-                or (not entry.visual_valid)
-                or entry.stale_steps >= (self.refresh_interval - 1)
-            )
+            should_refresh = refresh_mask[idx]
 
             if should_refresh:
                 embedding, visual_valid = self._encode(visual_observations[idx])
@@ -108,6 +114,121 @@ class PerceptionRuntime:
         if len(self._cache) != n_envs:
             self.reset(n_envs)
 
+    def _ensure_tensor_cache(self, n_envs: int, device: torch.device) -> None:
+        if (
+            self._door_embeddings is not None
+            and self._visual_valid_mask is not None
+            and self._stale_steps_tensor is not None
+            and self._door_embeddings.shape[0] == n_envs
+            and self._door_embeddings.device == device
+        ):
+            return
+
+        self._door_embeddings = torch.zeros(
+            n_envs, self.embedding_dim, dtype=torch.float32, device=device
+        )
+        self._visual_valid_mask = torch.zeros(
+            n_envs, dtype=torch.bool, device=device
+        )
+        self._stale_steps_tensor = torch.full(
+            (n_envs,),
+            self.refresh_interval - 1,
+            dtype=torch.int64,
+            device=device,
+        )
+
+    def get_list_refresh_mask(
+        self,
+        *,
+        n_envs: int,
+        force_refresh_mask: Sequence[bool] | None = None,
+    ) -> list[bool]:
+        """返回 list-observation 路径中实际需要视觉刷新的 env mask。"""
+        self._ensure_cache_size(n_envs)
+        if force_refresh_mask is None:
+            force_refresh_mask = [False] * n_envs
+        if len(force_refresh_mask) != n_envs:
+            raise ValueError(
+                f"force_refresh_mask 长度错误: got {len(force_refresh_mask)}, expected {n_envs}"
+            )
+
+        refresh_mask: list[bool] = []
+        for idx, entry in enumerate(self._cache):
+            refresh_mask.append(
+                bool(force_refresh_mask[idx])
+                or (not entry.visual_valid)
+                or entry.stale_steps >= (self.refresh_interval - 1)
+            )
+        return refresh_mask
+
+    def get_tensor_refresh_mask(
+        self,
+        *,
+        n_envs: int,
+        device: torch.device,
+        force_refresh_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """返回 tensor-observation 路径中实际需要视觉刷新的 env mask。"""
+        self._ensure_tensor_cache(n_envs, device)
+        assert self._visual_valid_mask is not None
+        assert self._stale_steps_tensor is not None
+
+        refresh_mask = force_refresh_mask.to(device=device, dtype=torch.bool)
+        stale_mask = self._stale_steps_tensor >= (self.refresh_interval - 1)
+        return refresh_mask | (~self._visual_valid_mask) | stale_mask
+
+    def consume_stage_timings(self) -> dict[str, float]:
+        """取出并清空最近累积的视觉子阶段 timing。"""
+        timings = dict(self._stage_timings)
+        self._stage_timings.clear()
+        return timings
+
+    def _accumulate_stage_timings(self, timings: dict[str, float] | None) -> None:
+        if not timings:
+            return
+        for name, value in timings.items():
+            self._stage_timings[name] = self._stage_timings.get(name, 0.0) + float(value)
+
+    def prepare_batch_tensors(
+        self,
+        actor_obs: torch.Tensor,
+        critic_obs: torch.Tensor,
+        *,
+        visual_observations: dict[str, torch.Tensor] | None,
+        force_refresh_mask: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """为 batched tensor observation 注入最近一次视觉缓存。"""
+        n_envs = actor_obs.shape[0]
+        refresh_mask = self.get_tensor_refresh_mask(
+            n_envs=n_envs,
+            device=actor_obs.device,
+            force_refresh_mask=force_refresh_mask,
+        )
+        assert self._door_embeddings is not None
+        assert self._visual_valid_mask is not None
+        assert self._stale_steps_tensor is not None
+
+        if refresh_mask.any():
+            if visual_observations is None:
+                raise RuntimeError("visual_observations 缺失")
+            masked_obs = {
+                key: value[refresh_mask] for key, value in visual_observations.items()
+            }
+            encoded = self._encode_batch(masked_obs)
+            self._door_embeddings[refresh_mask] = encoded
+            self._visual_valid_mask[refresh_mask] = True
+            self._stale_steps_tensor[refresh_mask] = 0
+
+        self._stale_steps_tensor[~refresh_mask] += 1
+        actor_obs[:, 90:858] = self._door_embeddings
+        critic_obs[:, 90:858] = self._door_embeddings
+
+        return {
+            "actor_obs": actor_obs,
+            "critic_obs": critic_obs,
+            "visual_embeddings": self._door_embeddings.clone(),
+        }
+
     def _encode(self, observation: dict[str, Any] | None) -> tuple[np.ndarray, bool]:
         zero = np.zeros(self.embedding_dim, dtype=np.float32)
         self._last_error_reason = None
@@ -121,7 +242,14 @@ class PerceptionRuntime:
             return zero, False
 
         try:
-            embedding = pipeline.encode(observation=observation, task_goal="push")
+            if hasattr(pipeline, "encode_with_timings"):
+                embedding, stage_timings = pipeline.encode_with_timings(
+                    observation=observation,
+                    task_goal="push",
+                )
+                self._accumulate_stage_timings(stage_timings)
+            else:
+                embedding = pipeline.encode(observation=observation, task_goal="push")
         except Exception as exc:
             self._last_error_reason = f"视觉编码异常: {exc}"
             return zero, False
@@ -133,6 +261,56 @@ class PerceptionRuntime:
             )
             return zero, False
         return arr, True
+
+    def _encode_batch(
+        self,
+        visual_observations: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        pipeline = self._get_pipeline()
+        if pipeline is None:
+            raise RuntimeError("视觉管线初始化失败")
+
+        if hasattr(pipeline, "encode_batch_with_timings"):
+            embedding, stage_timings = pipeline.encode_batch_with_timings(
+                observations=visual_observations,
+                task_goal="push",
+            )
+            self._accumulate_stage_timings(stage_timings)
+        elif hasattr(pipeline, "encode_batch"):
+            embedding = pipeline.encode_batch(
+                observations=visual_observations,
+                task_goal="push",
+            )
+        else:
+            chunks = []
+            batch = int(visual_observations["rgb"].shape[0])
+            for idx in range(batch):
+                single = {
+                    key: value[idx].detach().cpu().numpy()
+                    for key, value in visual_observations.items()
+                }
+                if hasattr(pipeline, "encode_with_timings"):
+                    embedding_i, stage_timings = pipeline.encode_with_timings(
+                        observation=single,
+                        task_goal="push",
+                    )
+                    self._accumulate_stage_timings(stage_timings)
+                else:
+                    embedding_i = pipeline.encode(observation=single, task_goal="push")
+                chunks.append(embedding_i)
+            embedding = np.stack(chunks, axis=0)
+
+        tensor = torch.as_tensor(
+            embedding,
+            dtype=torch.float32,
+            device=visual_observations["rgb"].device,
+        )
+        if tensor.ndim != 2 or tensor.shape[1] != self.embedding_dim:
+            raise RuntimeError(
+                f"embedding 维度错误: got {tuple(tensor.shape)}, "
+                f"expected (*, {self.embedding_dim})"
+            )
+        return tensor
 
     def _get_pipeline(self) -> Any | None:
         if self._pipeline_initialized:

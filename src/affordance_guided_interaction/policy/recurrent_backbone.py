@@ -92,6 +92,8 @@ class RecurrentBackbone(nn.Module):
         self,
         x: torch.Tensor,
         hidden: torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None = None,
+        *,
+        return_sequence: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | tuple[torch.Tensor, torch.Tensor]]:
         """循环前向计算。
 
@@ -143,6 +145,9 @@ class RecurrentBackbone(nn.Module):
 
             with torch.backends.cudnn.flags(enabled=False):
                 rnn_out, hidden_new = self.rnn(x, hidden)
+
+        if return_sequence:
+            return rnn_out, hidden_new
 
         # 取最后一个时间步的输出
         output = rnn_out[:, -1, :]  # (B, H)
