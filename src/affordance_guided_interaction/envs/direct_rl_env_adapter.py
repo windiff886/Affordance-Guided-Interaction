@@ -22,8 +22,8 @@ if TYPE_CHECKING:
     from affordance_guided_interaction.envs.door_push_env import DoorPushEnv
 
 
-# privileged 信息在 critic tensor 中的布局（最后 16 维）
-_PRIV_DIM = 16
+# privileged 信息在 critic tensor 中的布局（最后 13 维）
+_PRIV_DIM = 13
 
 # privileged 子段的偏移和大小
 _PRIV_LAYOUT: list[tuple[str, int, int]] = [
@@ -33,8 +33,7 @@ _PRIV_LAYOUT: list[tuple[str, int, int]] = [
     ("cup_mass",        9,  1),
     ("door_mass",      10,  1),
     ("door_damping",   11,  1),
-    ("base_pos",       12,  3),
-    ("cup_dropped",    15,  1),
+    ("cup_dropped",    12,  1),
 ]
 
 # Actor obs tensor 各段切片（M6：命名常量，避免硬编码偏移）
@@ -59,7 +58,8 @@ _S_LO   = slice(86,  87)   # left_occupied
 _S_RO   = slice(87,  88)   # right_occupied
 _S_LT   = slice(88,  89)   # left_tilt
 _S_RT   = slice(89,  90)   # right_tilt
-_S_EMB  = slice(90,  858)  # door_embedding (768D)
+_S_DCG  = slice(90,  93)   # door_center_in_base
+_S_DNM  = slice(93,  96)   # door_normal_in_base
 
 
 class DirectRLEnvAdapter:
@@ -211,10 +211,10 @@ class DirectRLEnvAdapter:
     ) -> tuple[list[dict], list[dict]]:
         """将 batch tensor obs 转为 per-env dict list。
 
-        将 DoorPushEnv 产出的 858D flat actor tensor 解构为
+        将 DoorPushEnv 产出的 96D flat actor tensor 解构为
         ``flatten_actor_obs()`` 期望的嵌套字典结构。
 
-        Actor obs 858D tensor 布局（对齐 DoorPushEnv._get_observations）：
+        Actor obs 96D tensor 布局（对齐 DoorPushEnv._get_observations）：
             [0:12)   joint_positions
             [12:24)  joint_velocities
             [24:36)  joint_torques
@@ -227,7 +227,8 @@ class DirectRLEnvAdapter:
             [80:83)  right_ee_la      [83:86)  right_ee_aa
             [86:87)  left_occupied    [87:88)  right_occupied
             [88:89)  left_tilt        [89:90)  right_tilt
-            [90:858) door_embedding
+            [90:93)  door_center_in_base
+            [93:96)  door_normal_in_base
 
         critic_obs dict 结构:
             {
@@ -239,8 +240,8 @@ class DirectRLEnvAdapter:
                 },
             }
         """
-        actor_t = obs_dict["policy"]   # (N, 858)
-        critic_t = obs_dict["critic"]  # (N, 874)
+        actor_t = obs_dict["policy"]   # (N, 96)
+        critic_t = obs_dict["critic"]  # (N, 109)
 
         actor_list: list[dict] = []
         critic_list: list[dict] = []
@@ -282,8 +283,9 @@ class DirectRLEnvAdapter:
                     "left_tilt":  a[_S_LT],
                     "right_tilt": a[_S_RT],
                 },
-                "visual": {
-                    "door_embedding": a[_S_EMB],
+                "door_geometry": {
+                    "door_center_in_base": a[_S_DCG],
+                    "door_normal_in_base": a[_S_DNM],
                 },
             }
             actor_list.append(actor_obs)
@@ -326,6 +328,7 @@ class DirectRLEnvAdapter:
         # D7: 读取 _get_dones() 在 auto-reset 之前缓存的 occupancy
         ep_left_occ: Tensor | None = info_dict.get("episode_left_occupied")
         ep_right_occ: Tensor | None = info_dict.get("episode_right_occupied")
+        reward_info_dict: dict[str, Tensor] | None = info_dict.get("reward_info")
 
         for i in range(self.n_envs):
             done = bool(dones_np[i])
@@ -360,6 +363,10 @@ class DirectRLEnvAdapter:
                 "success": success,
                 "episode_context": context,
             }
+            if reward_info_dict is not None:
+                info["reward_info"] = {
+                    key: float(val[i]) for key, val in reward_info_dict.items()
+                }
             infos.append(info)
         return infos
 
@@ -393,18 +400,6 @@ class DirectRLEnvAdapter:
         # 传递域随机化参数（如果底层环境支持）
         if domain_params_list is not None and hasattr(self._env, "set_domain_params_batch"):
             self._env.set_domain_params_batch(domain_params_list)
-
-    def get_visual_observations(self) -> list[dict[str, Any] | None]:
-        """读取底层环境暴露的视觉观测；缺失时回退为全 None。"""
-        if hasattr(self._env, "get_visual_observations"):
-            return self._env.get_visual_observations()
-        return [None] * self.n_envs
-
-    def get_visual_observations_batch(self) -> dict[str, Tensor] | None:
-        """读取底层环境暴露的 batched 视觉观测。"""
-        if hasattr(self._env, "get_visual_observations_batch"):
-            return self._env.get_visual_observations_batch()
-        return None
 
     def close(self) -> None:
         """关闭环境。"""

@@ -145,7 +145,6 @@ class TrainingMetrics:
         summary["episode/success_rate"] = self._success_count / n
         summary["episode/success_mixed"] = self._success_count / n
         summary["episode/cup_drop_rate"] = self._cup_drop_count / n
-        summary["episode/count"] = float(self._episode_count)
         summary["episode/success_none"] = _safe_rate(
             self._context_successes["none"],
             self._context_totals["none"],

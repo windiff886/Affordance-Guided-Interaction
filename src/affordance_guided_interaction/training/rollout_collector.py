@@ -9,13 +9,14 @@
 本模块通过 Protocol 声明环境接口，不硬依赖具体的仿真实现。
 
 接口约定：
-- Actor 的观测为 **分支字典** ``{"proprio", "ee", "context", "stability", "visual"}``
+- Actor 的观测为 **分支字典** ``{"proprio", "ee", "context", "stability", "door_geometry"}``
   由 ``flatten_actor_obs()`` / ``batch_flatten_actor_obs()`` 产出。
 - Critic 接收同样的分支字典 + 额外的 ``privileged`` 向量。
 """
 
 from __future__ import annotations
 
+from collections import defaultdict
 from time import perf_counter
 from typing import Protocol, runtime_checkable, Any, Callable
 
@@ -92,7 +93,7 @@ ActorFlattenFn = Callable[[dict], dict[str, torch.Tensor]]
 BatchActorFlattenFn = Callable[[list[dict]], dict[str, torch.Tensor]]
 
 # 将 privileged 字典展平为 1-D Tensor 的函数类型
-# 签名: (privileged_dict) -> Tensor(16,)
+# 签名: (privileged_dict) -> Tensor(13,)
 PrivFlattenFn = Callable[[dict], torch.Tensor]
 
 
@@ -192,6 +193,8 @@ class RolloutCollector:
         completed_episodes = 0
         successful_episodes = 0
         total_steps = 0
+        reward_sums: dict[str, float] = defaultdict(float)
+        reward_counts: dict[str, int] = defaultdict(int)
         context_totals = {
             "none": 0,
             "left_only": 0,
@@ -299,6 +302,11 @@ class RolloutCollector:
                 context_totals=context_totals,
                 context_successes=context_successes,
             )
+            self._accumulate_reward_stats(
+                infos=infos,
+                reward_sums=reward_sums,
+                reward_counts=reward_counts,
+            )
 
             # ── 8. 推进观测 ──────────────────────────────────────
             current_actor_obs, current_critic_obs = self.measure(
@@ -348,6 +356,9 @@ class RolloutCollector:
             ),
             "collect/total_steps": float(total_steps),
         }
+        for key, total in reward_sums.items():
+            count = max(reward_counts[key], 1)
+            collect_stats[f"reward/{key}"] = total / count
 
         return current_actor_obs, current_critic_obs, collect_stats
 
@@ -513,6 +524,21 @@ class RolloutCollector:
             context_totals[context_name] += 1
             if bool(info.get("success", False)):
                 context_successes[context_name] += 1
+
+    @staticmethod
+    def _accumulate_reward_stats(
+        *,
+        infos: list[dict],
+        reward_sums: dict[str, float],
+        reward_counts: dict[str, int],
+    ) -> None:
+        for info in infos:
+            reward_info = info.get("reward_info")
+            if not isinstance(reward_info, dict):
+                continue
+            for key, value in reward_info.items():
+                reward_sums[key] = reward_sums.get(key, 0.0) + float(value)
+                reward_counts[key] = reward_counts.get(key, 0) + 1
 
     @staticmethod
     def _safe_rate(successes: int, totals: int) -> float:

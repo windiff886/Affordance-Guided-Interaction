@@ -2,9 +2,9 @@
 
 > **审计日期**：2026-04-06
 >
-> 本文档对 5 个 YAML 配置文件的全部参数逐一追溯到源代码消费点，说明其含义与作用。
+> 本文档对 6 个 YAML 配置文件的全部参数逐一追溯到源代码消费点，说明其含义与作用。
 > 旧路径（VecDoorEnv）已删除，仅保留 GPU 批量并行路径（DoorPushEnv + DirectRLEnvAdapter）。
-> 奖励超参数现定义在 `DoorPushEnvCfg`（`door_push_env_cfg.py`），不再使用 YAML 配置。
+> 训练入口默认会加载 `reward/default.yaml`，并通过 `train.py` 的 `_inject_reward_params()` 将奖励超参数覆盖写入 `DoorPushEnvCfg`；`DoorPushEnvCfg` 中保留同名默认值作为回退。
 
 ---
 
@@ -17,17 +17,18 @@
 | `policy/default.yaml` | 8 | 100% |
 | `curriculum/default.yaml` | 3 | 100% |
 | `task/default.yaml` | 2 | 100% |
+| `reward/default.yaml` | 22 | 100% |
 
-**整体**：43 个参数，全部被代码消费。
+**整体**：65 个参数，全部被代码消费。
 
-> **已删除**: `reward/default.yaml`（22 参数）— 奖励超参数现在在 `DoorPushEnvCfg` 中定义。
+> **已恢复**: `reward/default.yaml`（22 参数）— 奖励超参数从 `DoorPushEnvCfg` 迁移到独立 YAML 配置文件，由 `train.py` 的 `_inject_reward_params()` 注入。
 > 数学公式参考见 `envs/Reward.md`。
 
 ---
 
 ## 2. 配置加载机制
 
-`scripts/train.py` 中的 `load_config()` 从 `configs/` 目录加载 5 个 YAML 文件，返回字典：
+`scripts/train.py` 中的 `load_config()` 从 `configs/` 目录加载 6 个 YAML 文件，返回字典：
 
 ```python
 cfg = {
@@ -36,6 +37,7 @@ cfg = {
     "policy":     ...,  # configs/policy/default.yaml
     "task":       ...,  # configs/task/default.yaml
     "curriculum": ...,  # configs/curriculum/default.yaml
+    "reward":     ...,  # configs/reward/default.yaml
 }
 ```
 

@@ -29,7 +29,7 @@ training 层是整个系统的**优化与调度中心**，处于环境 (`envs/Do
 
 **核心设计原则**：
 
-- training 层不处理具体的物理接触或视觉编码，只关注"如何高效收敛"
+- training 层不处理具体的物理接触或感知编码，只关注"如何高效收敛"
 - 严格维持 actor / critic 的信息不对称——actor 只看部署可得信号，critic 额外看仿真 oracle
 - 所有超参数外置于配置文件，代码保持数学纯粹性
 
@@ -132,8 +132,8 @@ $$
 
 | 角色 | 输入 | 说明 |
 |------|------|------|
-| **Actor** | `proprio + ee + context + stability + visual` | 仅部署时可得的信号；其中 `stability` 只保留左右倾斜程度，`visual` 的正式结果是 `door_embedding` |
-| **Critic** | `actor_obs + privileged` | 额外获得门真实状态、关键隐藏物理参数与 `cup_dropped` 等训练期 privileged information |
+| **Actor** | `proprio + ee + context + stability + door_geometry` | 仅部署时可得的信号；其中 `stability` 只保留左右倾斜程度，`door_geometry` 分支提供 6 维门几何观测 |
+| **Critic** | `actor_obs + privileged` | 额外获得门真实状态、关键隐藏物理参数与 `cup_dropped` 等训练期 privileged information（不含 `base_pos`） |
 
 ### 3.2 信息不对称的收敛意义
 
@@ -153,7 +153,7 @@ $$
 h_t = \text{GRU}(h_{t-1},\; e_t)
 $$
 
-其中 $e_t$ 为所有 encoder 输出拼接后的特征向量。隐状态在每个 episode 开始时清零，在 episode 内部持续流转，使策略能够通过交互历史隐式推断环境动力学。
+其中 $e_t$ 为所有观测分支拼接后的特征向量。隐状态在每个 episode 开始时清零，在 episode 内部持续流转，使策略能够通过交互历史隐式推断环境动力学。
 
 ### 3.4 截断时间反向传播（TBPTT）
 
@@ -179,7 +179,7 @@ $$
 
 | 阶段 | 上下文分布 | 门类型 | 核心学习目标 |
 |------|------------|--------|------------|
-| **Stage 1** | `none: 1.0` | push | 学会基础推门交互，先跑通视觉-控制闭环 |
+| **Stage 1** | `none: 1.0` | push | 学会基础推门交互，先跑通几何观测-控制闭环 |
 | **Stage 2** | `left_only: 0.5, right_only: 0.5` | push | 在单臂持杯约束下学会稳定推门 |
 | **Stage 3** | `none / left_only / right_only / both` 各 `0.25` | push | 在最终混合分布下统一覆盖无杯、单臂持杯和双臂持杯 |
 
@@ -252,7 +252,7 @@ $$
 域随机化采样的隐藏参数（$m_{\text{cup}}, m_{\text{door}}, d_{\text{hinge}}$ 等）同时提供给 Critic 作为 privileged information，但 Actor 完全不可见。这构成了 asymmetric actor-critic 框架的核心信息差：
 
 $$
-o_t^{\text{critic}} = o_t^{\text{actor}} \cup \{m_{\text{cup}},\, m_{\text{door}},\, d_{\text{hinge}},\, p_{\text{base}}\}
+o_t^{\text{critic}} = o_t^{\text{actor}} \cup \{m_{\text{cup}},\, m_{\text{door}},\, d_{\text{hinge}}\}
 $$
 
 Actor 必须通过交互反馈（力矩响应、速度变化等）和 RNN 隐状态来隐式推断这些参数。

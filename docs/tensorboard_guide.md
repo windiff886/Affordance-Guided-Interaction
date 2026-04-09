@@ -26,6 +26,8 @@ ssh -L 6006:localhost:6006 root@39.105.12.60 -p 6026
 
 ## TensorBoard 各参数含义
 
+> **日志频率**：TensorBoard 指标在每轮迭代结束时写入（即每 `n_steps_per_rollout` 步）。控制台日志受 `log_interval` 控制（默认每 5 轮打印一次）。
+
 ### `train/` — 训练核心指标
 
 | 指标 | 含义 | 如何判断好坏 |
@@ -49,16 +51,6 @@ ssh -L 6006:localhost:6006 root@39.105.12.60 -p 6026
 │  ┌──────────────────────┐  ┌───────────┐  ┌──────────────┐  │
 │  │   rollout_s          │  │ update_s  │  │ GAE + 其他   │  │
 │  │  (轨迹采集)           │  │ (PPO更新) │  │              │  │
-│  │                      │  │           │  │              │  │
-│  │  ┌────────────────┐  │  │           │  │              │  │
-│  │  │   vision_s     │  │  │           │  │              │  │
-│  │  │  (视觉感知总和) │  │  │           │  │              │  │
-│  │  │                │  │  │           │  │              │  │
-│  │  │ camera_fetch_s │  │  │           │  │              │  │
-│  │  │ segmentation_s │  │  │           │  │              │  │
-│  │  │ pointcloud_s   │  │  │           │  │              │  │
-│  │  │ encoder_s      │  │  │           │  │              │  │
-│  │  └────────────────┘  │  │           │  │              │  │
 │  └──────────────────────┘  └───────────┘  └──────────────┘  │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -66,34 +58,12 @@ ssh -L 6006:localhost:6006 root@39.105.12.60 -p 6026
 #### **rollout_s** — 轨迹采集总耗时
 
 从 `collector.collect()` 开始到结束的完整耗时。包含：
-- `n_steps_per_rollout`（默认 128）步环境交互
+- `n_steps_per_rollout` 步环境交互（当前配置为 64）
 - Actor/Critic 前向推理
-- 视觉感知（嵌入其中）
+- 观测数据准备（door geometry ground truth）
 - 数据写入 Buffer
 
 这是一轮迭代中**最耗时的部分**。
-
-#### **vision_s** — 视觉感知管线总耗时
-
-是 `rollout_s` 的**子集**。包含完整的视觉感知流程：
-- 从环境获取相机图像（RGB + 深度）
-- 语义分割（生成门区域 mask）
-- 深度投影（生成 3D 点云）
-- Point-MAE 编码器前向推理（生成 768 维 visual embedding）
-- 将 embedding 注入观测数据
-
-这个值是**累积的**——`n_steps_per_rollout` 步中每步都会调用视觉感知，`vision_s` 是所有步的总和。
-
-`vision_s` 可进一步分解为以下子计时（它们的总和 ≈ `vision_s`）：
-
-| 子指标 | 含义 |
-|--------|------|
-| **camera_fetch_s** | 获取相机图像（RGB + 深度）的耗时 |
-| **segmentation_s** | 语义分割模型推理耗时（LangSAM / Grounded-SAM2） |
-| **pointcloud_s** | 深度投影 → 3D 点云构建 + FPS 下采样的耗时 |
-| **encoder_s** | Point-MAE 编码器前向推理耗时 |
-
-**如果 `vision_s` 接近 `rollout_s`，说明视觉感知是性能瓶颈，可查看子计时定位具体瓶颈环节。**
 
 #### **update_s** — PPO 参数更新耗时
 
@@ -101,7 +71,7 @@ ssh -L 6006:localhost:6006 root@39.105.12.60 -p 6026
 - 从 Buffer 中抽取 mini-batch
 - TBPTT（截断反向传播）序列处理
 - Actor/Critic 反向传播 + 梯度裁剪
-- 优化器更新参数（共 4 mini-batches × 5 epochs = 20 次更新）
+- 优化器更新参数（共 `num_mini_batches` × `num_epochs` 次更新，当前配置为 8 × 4 = 32 次）
 
 这部分通常在**秒级**，一般不是瓶颈。
 
@@ -122,11 +92,11 @@ env_steps_per_s = steps_this_iter / rollout_s
 
 | 如果 | 说明 |
 |------|------|
-| `vision_s` ≈ `rollout_s`（比如都是 900+ 秒） | 视觉感知是瓶颈，查看子计时确定是分割、点云还是编码器 |
-| `segmentation_s` 占 `vision_s` 大头 | 语义分割模型推理太慢，考虑换更快的模型（如 Grounded-SAM2） |
-| `encoder_s` 占 `vision_s` 大头 | Point-MAE 编码器推理太慢，考虑 AMP 或减少点数 |
-| `vision_s` 很小，`rollout_s` 很大 | 环境仿真本身慢（Isaac Sim 渲染/物理） |
+| `rollout_s` 很大 | 环境仿真本身慢（Isaac Sim 渲染/物理），或策略推理开销大 |
 | `update_s` 很大 | PPO 更新有问题（不太可能） |
+| `train/fps` 远小于 `timing/env_steps_per_s` | PPO 更新占了大量时间 |
+
+> **注**：视觉感知管线（相机图像获取、语义分割、点云构建、Point-MAE 编码）的子计时（`vision_s`、`camera_fetch_s`、`segmentation_s`、`pointcloud_s`、`encoder_s`）在 `rollout_collector.py` 内部已实现计时，但当前版本**未暴露到 TensorBoard**。这些管线仅在 `enable_cameras=True` 时启用，而当前训练配置中 `enable_cameras=False`，使用仿真器 ground truth 的 door geometry（6维）替代视觉 embedding。
 
 ### `collect/` — 环境交互指标
 
@@ -146,6 +116,31 @@ env_steps_per_s = steps_this_iter / rollout_s
 | **success_right_only** | 上下文为"仅右手持杯"时的成功率 |
 | **success_both** | 上下文为"双手持杯"时的成功率（最终目标） |
 | **success_mixed** | 所有上下文混合的整体成功率，等于 `episode_success_rate` |
+
+### `reward/` — 奖励总项
+
+`reward/` 页面只保留总奖励和四个一级分量，方便先看整体趋势。所有这些曲线都记录的是**本轮 rollout 内所有环境、所有步的平均值**。
+
+| 指标 | 含义 |
+|------|------|
+| **total** | 本轮平均总奖励，等于 `r_task + r_stab^L + r_stab^R - r_safe` |
+| **task** | 主任务奖励总量 `r_task` |
+| **stab_left** | 左臂稳定性奖励总量 `r_stab^L`，已乘左臂 occupancy mask |
+| **stab_right** | 右臂稳定性奖励总量 `r_stab^R`，已乘右臂 occupancy mask |
+| **safe** | 安全惩罚总量 `r_safe`，按正惩罚量记录，进入总奖励时会被减掉 |
+
+### `reward_terms/` — 奖励子项
+
+`reward_terms/` 页面只放细分子项，用来排查到底是哪一项在主导 reward 变化。
+
+- `reward_terms/task/*`：`delta`、`open_bonus`
+- `reward_terms/stab_left/*` 与 `reward_terms/stab_right/*`：`zero_acc`、`zero_ang`、`acc`、`ang`、`tilt`、`smooth`、`reg`
+- `reward_terms/safe/*`：`self_collision`、`joint_limit`、`joint_vel`、`torque_limit`、`cup_drop`
+
+**解释时要注意符号：**
+- `reward/task`、`reward/stab_left`、`reward/stab_right` 和对应的 `reward_terms/stab_*/*` / `reward_terms/task/*` 都按进入总奖励的有符号贡献记录。
+- `reward/safe` 与 `reward_terms/safe/*` 都按正惩罚量记录，最终总奖励通过减去它们得到。
+- 在 `stage_1`（无杯）中，`reward/stab_left`、`reward/stab_right` 以及 `reward_terms/stab_left/*`、`reward_terms/stab_right/*` 理论上都应接近 0；如果不为 0，优先检查 occupancy mask 或日志链路。
 
 ### `curriculum/` — 课程学习
 
@@ -172,16 +167,11 @@ env_steps_per_s = steps_this_iter / rollout_s
 | **success_rate** | 当前聚合周期的整体成功率 |
 | **success_mixed** | 同 `success_rate`（兼容别名） |
 | **cup_drop_rate** | 杯体脱落率（推门过程中杯子从手中脱落的比例） |
-| **count** | 聚合周期内的 episode 数量 |
 | **mean_length** | 平均 episode 长度（步数） |
 | **success_none** | "无杯"上下文的成功率 |
 | **success_left_only** | "仅左手持杯"上下文的成功率 |
 | **success_right_only** | "仅右手持杯"上下文的成功率 |
 | **success_both** | "双手持杯"上下文的成功率 |
-
-#### `metrics/reward/` — 分项奖励均值
-
-动态标签，取决于 `DoorPushEnv._get_rewards()` 返回的 `reward_info` 字典内容。常见标签如 `metrics/reward/task`、`metrics/reward/stability`、`metrics/reward/safety` 等。
 
 #### `metrics/ppo/` — PPO 指标均值
 

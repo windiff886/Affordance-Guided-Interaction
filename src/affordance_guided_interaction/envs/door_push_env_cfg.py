@@ -20,7 +20,8 @@ from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg, RigidObjectCfg
 from isaaclab.envs import DirectRLEnvCfg
 from isaaclab.scene import InteractiveSceneCfg
-from isaaclab.sensors import ContactSensorCfg, TiledCameraCfg
+from isaaclab.sensors import ContactSensorCfg
+from isaaclab.sensors import TiledCameraCfg  # optional, kept for future visual experiments
 from isaaclab.utils import configclass
 
 from .direct_rl_env_window import DirectRLEnvWindow
@@ -338,16 +339,15 @@ class DoorPushEnvCfg(DirectRLEnvCfg):
 
     # ── 观测空间 ────────────────────────────────────────────────────
     # Actor obs: proprio(48) + ee(38) + context(2) + stability(2) +
-    #            visual(768) = 858
-    num_observations: int = 858
-    observation_space: int = 858
+    #            door_geometry(6) = 96
+    num_observations: int = 96
+    observation_space: int = 96
 
-    # Critic obs (privileged): actor_obs(858) + door_pose(7) +
+    # Critic obs (privileged): actor_obs(96) + door_pose(7) +
     #     door_joint_pos(1) + door_joint_vel(1) + cup_mass(1) +
-    #     door_mass(1) + door_damping(1) + base_pos(3) +
-    #     cup_dropped(1) = 874
-    num_states: int = 874
-    state_space: int = 874
+    #     door_mass(1) + door_damping(1) + cup_dropped(1) = 109
+    num_states: int = 109
+    state_space: int = 109
 
     # ── 任务判定阈值 ────────────────────────────────────────────────
     # 门角度到达 target → terminated(success)
@@ -408,6 +408,6 @@ class DoorPushEnvCfg(DirectRLEnvCfg):
     rew_beta_torque: float = 0.01
     rew_w_drop: float = 100.0
 
-    # ── 视觉感知 ────────────────────────────────────────────────────
-    door_embedding_dim: int = 768
-    visual_refresh_interval: int = 4
+    # ── 门几何观测 ────────────────────────────────────────────────────
+    door_geometry_dim: int = 6  # center(3) + normal(3)
+    visual_refresh_interval: int = 4  # deprecated, kept for config compat

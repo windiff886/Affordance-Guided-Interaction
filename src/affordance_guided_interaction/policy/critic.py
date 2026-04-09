@@ -20,7 +20,7 @@ from .actor import (
     _build_branch_encoder,
     _t,
     TOTAL_ARM_JOINTS,
-    VISUAL_BRANCH_DIM,
+    DOOR_GEOMETRY_DIM,
     _DUAL_EE_DIM,
     _CONTEXT_DIM,
     _DUAL_STAB_DIM,
@@ -29,9 +29,9 @@ from .actor import (
 
 # Privileged 信息维度:
 #   door_pose(7) + door_joint_pos(1) + door_joint_vel(1)
-#   + cup_mass(1) + door_mass(1) + door_damping(1) + base_pos(3)
-#   + cup_dropped(1) = 16
-_PRIVILEGED_DIM = 16
+#   + cup_mass(1) + door_mass(1) + door_damping(1)
+#   + cup_dropped(1) = 13
+_PRIVILEGED_DIM = 13
 
 
 # ======================================================================
@@ -63,7 +63,7 @@ def flatten_privileged(privileged: dict) -> torch.Tensor:
 
     Returns
     -------
-    torch.Tensor — ``(16,)``
+    torch.Tensor — ``(13,)``
     """
     parts = [
         _t(privileged["door_pose"]),        # 7
@@ -72,7 +72,6 @@ def flatten_privileged(privileged: dict) -> torch.Tensor:
         _t(privileged["cup_mass"]),          # 1
         _t(privileged["door_mass"]),         # 1
         _t(privileged["door_damping"]),      # 1
-        _t(privileged["base_pos"]),          # 3
         _t(privileged["cup_dropped"]),       # 1
     ]
     return torch.cat(parts)
@@ -80,7 +79,7 @@ def flatten_privileged(privileged: dict) -> torch.Tensor:
 
 def flatten_privileged_tensor(
     critic_obs: torch.Tensor,
-    actor_obs_dim: int = 858,
+    actor_obs_dim: int = 96,
 ) -> torch.Tensor:
     """从 flat critic obs tensor 直接切出 privileged 分支。"""
     return critic_obs[:, actor_obs_dim:]
@@ -153,9 +152,9 @@ class Critic(nn.Module):
         self.proprio_encoder = _build_branch_encoder(proprio_in, ac.proprio_hidden, ac.proprio_out)
         self.ee_encoder = _build_branch_encoder(_DUAL_EE_DIM, ac.ee_hidden, ac.ee_out)
         self.stab_encoder = _build_branch_encoder(stab_in, ac.stab_hidden, ac.stab_out)
-        self.vis_encoder = _build_branch_encoder(VISUAL_BRANCH_DIM, ac.vis_hidden, ac.vis_out)
+        self.geom_encoder = _build_branch_encoder(DOOR_GEOMETRY_DIM, ac.geom_hidden, ac.geom_out)
 
-        actor_concat_dim = ac.proprio_out + ac.ee_out + _CONTEXT_DIM + ac.stab_out + ac.vis_out
+        actor_concat_dim = ac.proprio_out + ac.ee_out + _CONTEXT_DIM + ac.stab_out + ac.geom_out
 
         # -- privileged encoder --
         self.priv_encoder = _build_branch_encoder(_PRIVILEGED_DIM, 64, 32)
@@ -191,7 +190,7 @@ class Critic(nn.Module):
         actor_flat : dict[str, Tensor]
             由 ``flatten_actor_obs()`` 产出的分支张量字典，
             每个值形状 ``(batch, dim)``。
-        privileged : ``(batch, 16)``
+        privileged : ``(batch, 13)``
             由 ``flatten_privileged()`` 产出的 privileged 张量。
 
         Returns
@@ -202,10 +201,10 @@ class Critic(nn.Module):
         f_proprio = self.proprio_encoder(actor_flat["proprio"])
         f_ee = self.ee_encoder(actor_flat["ee"])
         f_stab = self.stab_encoder(actor_flat["stability"])
-        f_vis = self.vis_encoder(actor_flat["visual"])
+        f_geom = self.geom_encoder(actor_flat["door_geometry"])
         ctx = actor_flat["context"]
 
-        actor_features = torch.cat([f_proprio, f_ee, ctx, f_stab, f_vis], dim=-1)
+        actor_features = torch.cat([f_proprio, f_ee, ctx, f_stab, f_geom], dim=-1)
 
         # privileged 编码
         priv_features = self.priv_encoder(privileged)

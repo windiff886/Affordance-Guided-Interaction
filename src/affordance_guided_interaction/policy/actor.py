@@ -7,11 +7,11 @@
 数据流概览::
 
     actor_obs
-      ├── proprio   → MLP → f_proprio
-      ├── ee         → MLP → f_ee
-      ├── context    → 直接拼接
-      ├── stability  → MLP → f_stab
-      └── visual     → MLP → f_vis
+      ├── proprio        → MLP → f_proprio
+      ├── ee             → MLP → f_ee
+      ├── context        → 直接拼接
+      ├── stability      → MLP → f_stab
+      └── door_geometry  → MLP → f_geom
               ↓ concat
       RecurrentBackbone (GRU / LSTM)
               ↓
@@ -38,9 +38,9 @@ from .action_head import ActionHead
 
 NUM_JOINTS_PER_ARM = 6
 TOTAL_ARM_JOINTS = NUM_JOINTS_PER_ARM * 2  # 12
-DOOR_EMBEDDING_DIM = 768
-# visual 分支输入维度 = embedding(768)
-VISUAL_BRANCH_DIM = DOOR_EMBEDDING_DIM
+
+# door_geometry 分支: center(3) + normal(3) = 6
+DOOR_GEOMETRY_DIM = 6
 
 # 每条臂的末端状态维度:
 # pos(3) + quat(4) + lin_vel(3) + ang_vel(3) + lin_acc(3) + ang_acc(3) = 19
@@ -70,8 +70,8 @@ class ActorConfig:
     ee_out: int = 32
     stab_hidden: int = 64
     stab_out: int = 32
-    vis_hidden: int = 256
-    vis_out: int = 128
+    geom_hidden: int = 64
+    geom_out: int = 32
 
     # RecurrentBackbone
     rnn_hidden: int = 512
@@ -123,7 +123,7 @@ def flatten_actor_obs(obs: dict, cfg: ActorConfig) -> dict[str, torch.Tensor]:
     - ``"ee"``      — 左右臂末端状态拼接
     - ``"context"`` — left_occ + right_occ
     - ``"stability"`` — 左右臂 tilt 拼接
-    - ``"visual"``  — door_embedding
+    - ``"door_geometry"`` — door_center(3) + door_normal(3)
 
     Parameters
     ----------
@@ -170,15 +170,18 @@ def flatten_actor_obs(obs: dict, cfg: ActorConfig) -> dict[str, torch.Tensor]:
     stab = obs["stability"]
     stab_vec = torch.cat([_t(stab["left_tilt"]), _t(stab["right_tilt"])])
 
-    # -- visual: 纯 door_embedding(768) --
-    vis_vec = _t(obs["visual"]["door_embedding"])
+    # -- door_geometry: center(3) + normal(3) = 6 --
+    geom_vec = torch.cat([
+        _t(obs["door_geometry"]["door_center_in_base"]),
+        _t(obs["door_geometry"]["door_normal_in_base"]),
+    ])
 
     return {
         "proprio": proprio_vec,
         "ee": ee_vec,
         "context": ctx_vec,
         "stability": stab_vec,
-        "visual": vis_vec,
+        "door_geometry": geom_vec,
     }
 
 
@@ -210,7 +213,7 @@ def build_actor_branches_from_tensor(obs: torch.Tensor) -> dict[str, torch.Tenso
         "ee": obs[:, 48:86],
         "context": obs[:, 86:88],
         "stability": obs[:, 88:90],
-        "visual": obs[:, 90:858],
+        "door_geometry": obs[:, 90:96],
     }
 
 
@@ -244,10 +247,10 @@ class Actor(nn.Module):
         self.proprio_encoder = _build_branch_encoder(proprio_in, c.proprio_hidden, c.proprio_out)
         self.ee_encoder = _build_branch_encoder(_DUAL_EE_DIM, c.ee_hidden, c.ee_out)
         self.stab_encoder = _build_branch_encoder(stab_in, c.stab_hidden, c.stab_out)
-        self.vis_encoder = _build_branch_encoder(VISUAL_BRANCH_DIM, c.vis_hidden, c.vis_out)
+        self.geom_encoder = _build_branch_encoder(DOOR_GEOMETRY_DIM, c.geom_hidden, c.geom_out)
 
         # -- 汇总维度 --
-        concat_dim = c.proprio_out + c.ee_out + _CONTEXT_DIM + c.stab_out + c.vis_out
+        concat_dim = c.proprio_out + c.ee_out + _CONTEXT_DIM + c.stab_out + c.geom_out
 
         # -- 循环主干 --
         self.backbone = RecurrentBackbone(
@@ -303,11 +306,11 @@ class Actor(nn.Module):
         f_proprio = self.proprio_encoder(flat_obs["proprio"])  # (B, proprio_out)
         f_ee = self.ee_encoder(flat_obs["ee"])                 # (B, ee_out)
         f_stab = self.stab_encoder(flat_obs["stability"])      # (B, stab_out)
-        f_vis = self.vis_encoder(flat_obs["visual"])            # (B, vis_out)
+        f_geom = self.geom_encoder(flat_obs["door_geometry"])            # (B, vis_out)
         ctx = flat_obs["context"]                              # (B, 2)  # left_occ + right_occ
 
         # 拼接
-        concat = torch.cat([f_proprio, f_ee, ctx, f_stab, f_vis], dim=-1).contiguous()
+        concat = torch.cat([f_proprio, f_ee, ctx, f_stab, f_geom], dim=-1).contiguous()
 
         # 循环主干
         backbone_out, hidden_new = self.backbone(concat, hidden)
@@ -343,10 +346,10 @@ class Actor(nn.Module):
         f_proprio = self.proprio_encoder(flat_obs["proprio"])
         f_ee = self.ee_encoder(flat_obs["ee"])
         f_stab = self.stab_encoder(flat_obs["stability"])
-        f_vis = self.vis_encoder(flat_obs["visual"])
+        f_geom = self.geom_encoder(flat_obs["door_geometry"])
         ctx = flat_obs["context"]
 
-        concat = torch.cat([f_proprio, f_ee, ctx, f_stab, f_vis], dim=-1).contiguous()
+        concat = torch.cat([f_proprio, f_ee, ctx, f_stab, f_geom], dim=-1).contiguous()
         backbone_out, hidden_new = self.backbone(concat, hidden)
 
         if deterministic:
@@ -379,10 +382,10 @@ class Actor(nn.Module):
         f_proprio = self.proprio_encoder(flat_obs["proprio"])
         f_ee = self.ee_encoder(flat_obs["ee"])
         f_stab = self.stab_encoder(flat_obs["stability"])
-        f_vis = self.vis_encoder(flat_obs["visual"])
+        f_geom = self.geom_encoder(flat_obs["door_geometry"])
         ctx = flat_obs["context"]
 
-        concat = torch.cat([f_proprio, f_ee, ctx, f_stab, f_vis], dim=-1)
+        concat = torch.cat([f_proprio, f_ee, ctx, f_stab, f_geom], dim=-1)
         backbone_out, hidden_new = self.backbone(concat, hidden)
 
         log_prob, entropy = self.action_head.evaluate(backbone_out, actions)
@@ -400,15 +403,15 @@ class Actor(nn.Module):
         proprio = branches_seq["proprio"].reshape(batch * seq_len, -1)
         ee = branches_seq["ee"].reshape(batch * seq_len, -1)
         stability = branches_seq["stability"].reshape(batch * seq_len, -1)
-        visual = branches_seq["visual"].reshape(batch * seq_len, -1)
+        door_geometry = branches_seq["door_geometry"].reshape(batch * seq_len, -1)
         context = branches_seq["context"].reshape(batch, seq_len, -1)
 
         f_proprio = self.proprio_encoder(proprio).reshape(batch, seq_len, -1)
         f_ee = self.ee_encoder(ee).reshape(batch, seq_len, -1)
         f_stab = self.stab_encoder(stability).reshape(batch, seq_len, -1)
-        f_vis = self.vis_encoder(visual).reshape(batch, seq_len, -1)
+        f_geom = self.geom_encoder(door_geometry).reshape(batch, seq_len, -1)
 
-        concat = torch.cat([f_proprio, f_ee, context, f_stab, f_vis], dim=-1)
+        concat = torch.cat([f_proprio, f_ee, context, f_stab, f_geom], dim=-1)
         backbone_out, hidden_new = self.backbone(
             concat,
             hidden,

@@ -15,7 +15,7 @@
 
 `observations/` 位于 `envs/` 与 `policy/` 之间，只负责一件事：
 
-> 把环境给出的原始物理状态和视觉结果，整理成 actor / critic 的正式输入。
+> 把环境给出的原始物理状态和门几何信息，整理成 actor / critic 的正式输入。
 
 这里有两条硬边界：
 
@@ -26,7 +26,7 @@
 
 - 不做 reward 计算
 - 不做 PPO 更新
-- 不直接处理原始 `RGB-D`
+- 不直接处理原始 `RGB-D` 或感知流水线
 - 不决定课程阶段
 - 不给 actor 泄漏仿真 oracle
 
@@ -62,19 +62,23 @@
 
 所有几何量统一表达在 `base_link` 坐标系下，而不是世界坐标系。
 
-### 2.3 在线视觉结果
+### 2.3 门几何信号
 
-视觉前端的正式输出只有一个：
+门几何观测的正式输出为 6 维信号：
 
-- `door_embedding ∈ R^768`
+- `door_center_in_base ∈ R^3` -- 门叶中心在 base_link 坐标系下的位置
+- `door_normal_in_base ∈ R^3` -- 门叶法向量在 base_link 坐标系下的方向
 
-其来源链路固定为：
+其来源为仿真 ground truth：
 
 ```text
-RGB-D -> 2D视觉识别 -> 3D点云提取 -> 冻结 Point-MAE 编码 -> door_embedding
+仿真门叶刚体位姿 (door leaf body pose)
+  + 固定的 DoorLeaf 本体坐标系局部偏移
+  -> 变换到 base_link 坐标系
+  -> door_center_in_base(3) + door_normal_in_base(3)
 ```
 
-`observations/` 不处理原始图像、mask 或原始点云，只消费已经编码好的视觉结果。
+该信号直接从仿真物理引擎获取，不经过相机或感知流水线。感知流水线（camera -> segmentation -> point cloud -> Point-MAE）不再是默认观测路径的一部分。
 
 ### 2.4 持杯上下文
 
@@ -97,33 +101,33 @@ RGB-D -> 2D视觉识别 -> 3D点云提取 -> 冻结 Point-MAE 编码 -> door_emb
 - 门板精确位姿 `door_pose`
 - 门铰链精确角度 `door_joint_pos`
 - 门铰链精确角速度 `door_joint_vel`
-- 关键域随机化参数：`cup_mass`、`door_mass`、`door_damping`、`base_pos`
+- 关键域随机化参数：`cup_mass`、`door_mass`、`door_damping`
   注：当前 episode 级随机化还会生成 `base_yaw`，但它尚未进入 critic privileged 向量。
+  注：`base_pos` 已从 critic privileged 向量中移除。
 - 掉杯事件标志 `cup_dropped ∈ {0, 1}`
 
 目标设计中，critic **不需要**杯体精确位姿、线速度或角速度。
 
 ---
 
-## 3. 视觉缓存与时间语义
+## 3. 门几何信号的数据流
 
-在线视觉采用固定频率更新，而不是每个控制步完整重跑一次。
-
-因此每个 environment 都维护最近一次有效视觉缓存：
+门几何信号直接从仿真 ground truth 计算，无需缓存或异步更新：
 
 ```text
-VisualCachePerEnv:
-  door_embedding: R^768
-  is_initialized: bool
+DoorGeometryPerEnv:
+  door_center_in_base: R^3
+  door_normal_in_base: R^3
 ```
 
-其时间语义如下：
+其计算流程如下：
 
-1. episode reset 后必须先完成一次 warm start，得到有效 `door_embedding`
-2. 到达视觉刷新步时，更新缓存
-3. 非刷新步直接复用最近一次缓存
+1. episode reset 后，门叶刚体位姿由仿真器直接提供
+2. 每个控制步，从门叶 body pose 中提取位置与朝向
+3. 利用固定的 DoorLeaf 本体坐标系局部偏移，计算门叶中心与法向量
+4. 将结果变换到 base_link 坐标系，得到 `door_center_in_base` 和 `door_normal_in_base`
 
-这意味着 actor 在每个控制步都能拿到 `door_embedding`，但它并不要求每一步都来自新的视觉前向。
+由于该信号来自仿真 ground truth，不存在视觉缓存中的延迟或刷新频率问题。每个控制步的计算都是即时完成的。
 
 ---
 
@@ -137,7 +141,7 @@ o_actor,t = {
   ee,
   context,
   stability,
-  visual
+  door_geometry
 }
 ```
 
@@ -186,15 +190,16 @@ o_actor,t = {
 
 与运动相关的速度、加速度等量统一归入 `ee`，不在 `stability` 中重复表达。
 
-### 4.5 `visual`
+### 4.5 `door_geometry`
 
-`visual` 只包含：
+`door_geometry` 包含：
 
 ```text
-door_embedding ∈ R^768
+door_center_in_base ∈ R^3
+door_normal_in_base ∈ R^3
 ```
 
-它来自当前环境最近一次视觉缓存，而不是原始 `RGB-D`。
+它来自仿真 ground truth（门叶刚体位姿 + 固定局部偏移），经过 base_link 坐标系变换后直接提供。
 
 ### 4.6 推荐结构
 
@@ -232,8 +237,9 @@ actor_obs = {
         "left_tilt": (1,),
         "right_tilt": (1,),
     },
-    "visual": {
-        "door_embedding": (768,),
+    "door_geometry": {
+        "door_center_in_base": (3,),
+        "door_normal_in_base": (3,),
     },
 }
 ```
@@ -259,7 +265,6 @@ o_critic,t = {
 - `cup_mass`
 - `door_mass`
 - `door_damping`
-- `base_pos`
 - `cup_dropped`
 
 推荐结构如下：
@@ -274,7 +279,6 @@ critic_obs = {
         "cup_mass": (1,),
         "door_mass": (1,),
         "door_damping": (1,),
-        "base_pos": (3,),
         "cup_dropped": (1,),
     },
 }
@@ -291,20 +295,15 @@ critic_obs = {
 
 ```text
 DoorPushEnv (GPU batched)
-  ├── ArticulationView → joint states ─────────┐
-  ├── body state view → ee states ─────────────┤
-  ├── occupancy flags → context ───────────────┤  DoorPushEnv._get_observations()
-  ├── simulation oracle → privileged ──────────┤  直接构建 actor_obs(858D)
-  └── cached embedding → visual ───────────────┘  和 critic_obs(874D) tensor
+  ├── ArticulationView -> joint states ─────────┐
+  ├── body state view -> ee states ─────────────┤
+  ├── occupancy flags -> context ───────────────┤  DoorPushEnv._get_observations()
+  ├── simulation oracle -> privileged ──────────┤  直接构建 actor_obs(96D)
+  └── door leaf body pose -> door_geometry ─────┘  和 critic_obs(109D) tensor
                     │
                     ▼
 DirectRLEnvAdapter
-  tensor → list[dict] 转换
-                    │
-                    ▼
-PerceptionRuntime (外部)
-  fixed-frequency RGB-D → 768D embedding
-  → 直接覆写 obs["visual"]["door_embedding"]
+  tensor -> list[dict] 转换
                     │
                     ▼
 policy/
@@ -327,6 +326,10 @@ policy/
 
 目标设计里假设杯体在未掉落前被稳定抓持。对 value estimate 真正关键的是门真实推进状态、隐藏动力学参数，以及是否已经发生掉杯，而不是连续的杯体刚体状态。
 
-### 为什么视觉必须通过缓存接入 observations
+### 为什么门几何信号直接从仿真 ground truth 计算
 
-因为训练系统采用固定频率视觉更新。`observations/` 需要消费的是“当前可用的视觉结果”，而不是假设视觉每一步都新鲜计算完成。
+门几何信号（`door_center_in_base` 和 `door_normal_in_base`）从仿真 ground truth 直接获取，而非经过相机/感知流水线。这样做的原因是：
+
+1. 训练阶段不需要引入感知噪声，保持策略学习的数据干净
+2. 感知流水线（camera -> segmentation -> point cloud -> Point-MAE）不再是默认观测路径的一部分，减少了训练时的计算开销和异步复杂度
+3. 如需引入感知，可以在后续阶段作为独立模块叠加，而不会影响核心策略训练

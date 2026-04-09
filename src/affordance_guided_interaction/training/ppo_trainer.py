@@ -11,7 +11,7 @@
 
 接口约定：
 - RolloutBuffer 的 mini-batch 按分支字典输出 actor 观测
-  （key 为 "proprio", "ee", "context", "stability", "visual"）。
+  （key 为 "proprio", "ee", "context", "stability", "door_geometry"）。
 - Actor.evaluate_actions(flat_obs_branches, actions, hidden) → log_prob, entropy, hidden
 - Critic.forward(actor_branches, privileged) → value
 """
@@ -26,7 +26,7 @@ import torch.optim as optim
 
 
 # ── Actor 观测的标准分支 key 列表 ─────────────────────────────────
-_ACTOR_BRANCH_KEYS = ("proprio", "ee", "context", "stability", "visual")
+_ACTOR_BRANCH_KEYS = ("proprio", "ee", "context", "stability", "door_geometry")
 
 
 @dataclass

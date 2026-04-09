@@ -23,7 +23,7 @@ from torch import Tensor
 
 from isaaclab.assets import Articulation, RigidObject
 from isaaclab.envs import DirectRLEnv
-from isaaclab.sensors import ContactSensor, TiledCamera
+from isaaclab.sensors import ContactSensor
 
 from .door_push_env_cfg import (
     DoorPushEnvCfg,
@@ -48,7 +48,6 @@ from .door_push_env_cfg import (
     POST_REMOVE_SETTLE_STEPS,
     TRAY_SIZE_XYZ,
 )
-from .camera_batch_utils import align_camera_pose_batch, align_camera_tensor_batch
 from .batch_math import (
     batch_quat_conjugate,
     batch_quat_from_yaw,
@@ -68,6 +67,23 @@ from .physx_mass_ops import (
 )
 
 logger = logging.getLogger(__name__)
+
+# ═══════════════════════════════════════════════════════════════════════
+# 门几何观测常量
+# ═══════════════════════════════════════════════════════════════════════
+
+# DoorLeaf 局部坐标系下的门板中心偏移
+_DOOR_CENTER_OFFSET_LOCAL = (0.02, 0.45, 1.0)
+# DoorLeaf 局部坐标系下的推门侧法向量 (+X)
+_DOOR_NORMAL_LOCAL = (1.0, 0.0, 0.0)
+
+# 观测维度
+# actor: proprio(48) + ee(38) + context(2) + stability(2) + door_geometry(6) = 96
+# critic: actor_obs(96) + privileged(13) = 109
+_ACTOR_OBS_DIM = 96
+_CRITIC_OBS_DIM = 109
+_DOOR_GEOMETRY_DIM = 6
+_PRIVILEGED_DIM = 13
 
 
 class DoorPushEnv(DirectRLEnv):
@@ -94,9 +110,7 @@ class DoorPushEnv(DirectRLEnv):
         # ── 解析关节 / body 索引（一次性，对所有 env 共享）──────
         robot: Articulation = self.scene["robot"]
         door: Articulation = self.scene["door"]
-        self._camera: TiledCamera | None = self.scene.sensors.get("tiled_camera")
-        self._camera_capture_enabled = self._camera is not None
-        self._camera_read_failure_warned = False
+        self._camera = self.scene.sensors.get("tiled_camera")
 
         self._arm_joint_ids, _ = robot.find_joints(ARM_JOINT_NAMES)
         self._gripper_joint_ids, _ = robot.find_joints(GRIPPER_JOINT_NAMES)
@@ -133,11 +147,6 @@ class DoorPushEnv(DirectRLEnv):
         self._prev_right_ee_lin_vel = torch.zeros(N, 3, device=dev)
         self._prev_right_ee_ang_vel = torch.zeros(N, 3, device=dev)
 
-        # 视觉 embedding 缓存
-        self._door_embedding = torch.zeros(
-            N, self.cfg.door_embedding_dim, device=dev
-        )
-        self._visual_stale_steps = torch.zeros(N, dtype=torch.long, device=dev)
         self._episode_reset_fn = None
 
         nan = float("nan")
@@ -294,6 +303,35 @@ class DoorPushEnv(DirectRLEnv):
         left_occ = self._left_occupied.float().unsqueeze(-1)   # (N, 1)
         right_occ = self._right_occupied.float().unsqueeze(-1)  # (N, 1)
 
+        # ── 门几何观测（base_link 系）─────────────────────────────
+        door_leaf_pos_w = door.data.body_pos_w[:, self._door_panel_body_idx]   # (N, 3)
+        door_leaf_quat_w = door.data.body_quat_w[:, self._door_panel_body_idx]  # (N, 4)
+
+        center_offset_local = torch.tensor(
+            _DOOR_CENTER_OFFSET_LOCAL, device=self.device, dtype=torch.float32
+        )
+        normal_local = torch.tensor(
+            _DOOR_NORMAL_LOCAL, device=self.device, dtype=torch.float32
+        )
+
+        R_world_from_leaf = batch_quat_to_rotation_matrix(door_leaf_quat_w)  # (N, 3, 3)
+        door_center_w = door_leaf_pos_w + torch.bmm(
+            R_world_from_leaf,
+            center_offset_local.view(1, 3, 1).expand(self.num_envs, -1, -1),
+        ).squeeze(-1)  # (N, 3)
+        door_normal_w = torch.bmm(
+            R_world_from_leaf,
+            normal_local.view(1, 3, 1).expand(self.num_envs, -1, -1),
+        ).squeeze(-1)  # (N, 3)
+
+        door_center_base = batch_vector_world_to_base(
+            door_center_w - base_pos, base_quat
+        )  # (N, 3)
+        door_normal_base = batch_vector_world_to_base(
+            door_normal_w, base_quat
+        )  # (N, 3)
+        door_geometry = torch.cat([door_center_base, door_normal_base], dim=-1)  # (N, 6)
+
         # ── Actor obs (含噪声) ──────────────────────────────────
         noisy_q = all_q
         noisy_dq = all_dq
@@ -301,8 +339,7 @@ class DoorPushEnv(DirectRLEnv):
             noisy_q = all_q + torch.randn_like(all_q) * self.cfg.obs_noise_std
             noisy_dq = all_dq + torch.randn_like(all_dq) * self.cfg.obs_noise_std
 
-        # proprio(48) + left_ee(19) + right_ee(19) + context(2)
-        # + stability(2) + visual(768) = 858
+        # actor: proprio(48) + ee(38) + context(2) + stability(2) + door_geometry(6) = 96
         actor_obs = torch.cat([
             # proprio: q(12) + dq(12) + tau(12) + prev_action(12) = 48
             noisy_q, noisy_dq, all_tau, self._prev_action,
@@ -318,9 +355,9 @@ class DoorPushEnv(DirectRLEnv):
             left_occ, right_occ,
             # stability: 2
             left_tilt, right_tilt,
-            # visual: embedding(768)
-            self._door_embedding,
-        ], dim=-1)  # (N, 858)
+            # door_geometry: center(3) + normal(3) = 6
+            door_geometry,
+        ], dim=-1)  # (N, 96)
 
         # ── Critic obs (无噪声 + privileged) ───────────────────
         # 门状态 (base_link 系)
@@ -348,18 +385,16 @@ class DoorPushEnv(DirectRLEnv):
             right_ee_la, right_ee_aa,
             # context + stability
             left_occ, right_occ, left_tilt, right_tilt,
-            # visual
-            self._door_embedding,
-            # privileged: door_pose(7) + door_joint(2) + domain_params(6) + cup_dropped(1) = 16
-            #   domain_params: cup_mass(1)+door_mass(1)+door_damping(1)+base_pos(3) = 6
+            # door_geometry（与 actor 相同）
+            door_geometry,
+            # privileged: door_pose(7) + door_joint(2) + domain_params(3) + cup_dropped(1) = 13
             door_pose_base,
             door_joint_pos, door_joint_vel,
             self._cup_mass.unsqueeze(-1),
             self._door_mass.unsqueeze(-1),
             self._door_damping.unsqueeze(-1),
-            self._base_pos,
             cup_dropped.float().unsqueeze(-1),
-        ], dim=-1)  # (N, 874)
+        ], dim=-1)  # (N, 109)
 
         return {"policy": actor_obs, "critic": critic_obs}
 
@@ -368,11 +403,13 @@ class DoorPushEnv(DirectRLEnv):
     # ═══════════════════════════════════════════════════════════════════
 
     def _get_rewards(self) -> Tensor:
-        """批量计算完整 12-term 奖励 — r_task + r_stab - r_safe。"""
+        """批量计算完整奖励，并缓存 TensorBoard 用分项信息。"""
         robot: Articulation = self.scene["robot"]
         door: Articulation = self.scene["door"]
         theta = door.data.joint_pos[:, 0]   # (N,)
         theta_prev = self._prev_door_angle
+
+        reward_info: dict[str, Tensor] = {}
 
         # ══════════════════════════════════════════════════════════════
         # §4 任务奖励：角度增量 + 一次性成功 bonus
@@ -386,11 +423,16 @@ class DoorPushEnv(DirectRLEnv):
             min=self.cfg.rew_alpha,
         )
         weight = torch.where(theta <= target, w_below, w_above)
-        r_task = weight * delta
+        r_task_delta = weight * delta
 
         newly_succeeded = (theta >= target) & ~self._already_succeeded
-        r_task = r_task + newly_succeeded.float() * self.cfg.rew_w_open
+        r_task_open_bonus = newly_succeeded.float() * self.cfg.rew_w_open
+        r_task = r_task_delta + r_task_open_bonus
         self._already_succeeded = self._already_succeeded | newly_succeeded
+
+        reward_info["task"] = r_task
+        reward_info["task/delta"] = r_task_delta
+        reward_info["task/open_bonus"] = r_task_open_bonus
 
         # ══════════════════════════════════════════════════════════════
         # §5 稳定性奖励：7 子项 × 双臂（使用缓存的加速度 + tilt_xy）
@@ -399,89 +441,115 @@ class DoorPushEnv(DirectRLEnv):
         m_r = self._right_occupied.float()
 
         all_tau = self._prev_action  # (N, 12) — 已 clip 后的力矩
+        r_stab_left = torch.zeros(self.num_envs, device=self.device)
+        r_stab_right = torch.zeros(self.num_envs, device=self.device)
 
-        r_stab = torch.zeros(self.num_envs, device=self.device)
-
-        for side_idx, (m, la, aa, tilt_xy, tau_slice) in enumerate([
-            (m_l, self._cached_left_ee_la,  self._cached_left_ee_aa,
-             self._cached_left_tilt_xy,  all_tau[:, :6]),
-            (m_r, self._cached_right_ee_la, self._cached_right_ee_aa,
+        for side_idx, (side_name, m, la, aa, tilt_xy, tau_slice) in enumerate([
+            ("left", m_l, self._cached_left_ee_la, self._cached_left_ee_aa,
+             self._cached_left_tilt_xy, all_tau[:, :6]),
+            ("right", m_r, self._cached_right_ee_la, self._cached_right_ee_aa,
              self._cached_right_tilt_xy, all_tau[:, 6:]),
         ]):
-            # 时间差分：当前步 clipped 力矩 vs 上一步 clipped 力矩
             prev_tau_slice = (
                 self._prev_prev_action[:, :6] if side_idx == 0
                 else self._prev_prev_action[:, 6:]
             )
 
-            la_sq = (la * la).sum(-1)          # (N,)
+            la_sq = (la * la).sum(-1)
             aa_sq = (aa * aa).sum(-1)
             tilt_sq = (tilt_xy * tilt_xy).sum(-1)
             tau_diff_sq = ((tau_slice - prev_tau_slice) ** 2).sum(-1)
             tau_sq = (tau_slice * tau_slice).sum(-1)
 
-            # §5.1-5.2 Gaussian bonus: 低加速度区域给高奖励
-            bonus = (
-                self.cfg.rew_w_zero_acc * torch.exp(-self.cfg.rew_lambda_acc * la_sq)
-                + self.cfg.rew_w_zero_ang * torch.exp(-self.cfg.rew_lambda_ang * aa_sq)
-            )
+            side_terms = {
+                "zero_acc": m * (
+                    self.cfg.rew_w_zero_acc * torch.exp(-self.cfg.rew_lambda_acc * la_sq)
+                ),
+                "zero_ang": m * (
+                    self.cfg.rew_w_zero_ang * torch.exp(-self.cfg.rew_lambda_ang * aa_sq)
+                ),
+                "acc": m * (-self.cfg.rew_w_acc * la_sq),
+                "ang": m * (-self.cfg.rew_w_ang * aa_sq),
+                "tilt": m * (-self.cfg.rew_w_tilt * tilt_sq),
+                "smooth": m * (-self.cfg.rew_w_smooth * tau_diff_sq),
+                "reg": m * (-self.cfg.rew_w_reg * tau_sq),
+            }
+            r_stab_side = sum(side_terms.values())
+            reward_info[f"stab_{side_name}"] = r_stab_side
+            for term_name, term_value in side_terms.items():
+                reward_info[f"stab_{side_name}/{term_name}"] = term_value
 
-            # §5.3-5.7 Quadratic penalty
-            penalty = (
-                - self.cfg.rew_w_acc * la_sq
-                - self.cfg.rew_w_ang * aa_sq
-                - self.cfg.rew_w_tilt * tilt_sq
-                - self.cfg.rew_w_smooth * tau_diff_sq
-                - self.cfg.rew_w_reg * tau_sq
-            )
-
-            r_stab = r_stab + m * (bonus + penalty)
+            if side_name == "left":
+                r_stab_left = r_stab_side
+            else:
+                r_stab_right = r_stab_side
 
         # ══════════════════════════════════════════════════════════════
-        # §6 安全惩罚：5 子项
+        # §6 安全惩罚：5 子项（正惩罚量）
         # ══════════════════════════════════════════════════════════════
-        r_safe = torch.zeros(self.num_envs, device=self.device)
-
-        # §6.1 自碰撞
         self_collision = self._compute_batch_self_collision()  # (N,) bool
-        r_safe = r_safe + self_collision.float() * self.cfg.rew_beta_self
+        r_safe_self_collision = self_collision.float() * self.cfg.rew_beta_self
 
-        # §6.2 关节限位逼近惩罚
         joint_pos = robot.data.joint_pos[:, self._arm_joint_ids]  # (N, 12)
         if hasattr(robot.data, "soft_joint_pos_limits"):
             joint_limits = robot.data.soft_joint_pos_limits[0, self._arm_joint_ids]  # (12, 2)
         else:
-            # 回退到默认 Z1 极限
-            joint_limits = torch.tensor(
-                [[-2.9, 2.9]] * 12, device=self.device
+            raise RuntimeError(
+                "robot.data.soft_joint_pos_limits 不可用，"
+                "无法获取关节物理限位。请检查 Isaac Lab 版本或 Articulation 配置。"
             )
         center = (joint_limits[:, 0] + joint_limits[:, 1]) / 2.0
         half_range = (joint_limits[:, 1] - joint_limits[:, 0]) / 2.0
         threshold = self.cfg.rew_mu * half_range
         excess = torch.clamp(torch.abs(joint_pos - center) - threshold, min=0)
-        r_safe = r_safe + self.cfg.rew_beta_limit * (excess ** 2).sum(-1)
+        r_safe_joint_limit = self.cfg.rew_beta_limit * (excess ** 2).sum(-1)
 
-        # §6.3 关节速度过大惩罚
         joint_vel = robot.data.joint_vel[:, self._arm_joint_ids]  # (N, 12)
-        vel_limit = torch.full((12,), 2.175, device=self.device)
+        if hasattr(robot.data, "soft_joint_vel_limits"):
+            vel_limit = robot.data.soft_joint_vel_limits[0, self._arm_joint_ids]  # (12,)
+        else:
+            raise RuntimeError(
+                "robot.data.soft_joint_vel_limits 不可用，"
+                "无法获取关节最大转速。请检查 Isaac Lab 版本或 Articulation 配置。"
+            )
         vel_threshold = self.cfg.rew_mu * vel_limit
         vel_excess = torch.clamp(torch.abs(joint_vel) - vel_threshold, min=0)
-        r_safe = r_safe + self.cfg.rew_beta_vel * (vel_excess ** 2).sum(-1)
+        r_safe_joint_vel = self.cfg.rew_beta_vel * (vel_excess ** 2).sum(-1)
 
-        # §6.4 原始控制力矩超限惩罚（使用 pre-clip action）
         torque_excess = torch.clamp(
             torch.abs(self._cached_raw_action) - self.cfg.effort_limit, min=0
         )
-        r_safe = r_safe + self.cfg.rew_beta_torque * (torque_excess ** 2).sum(-1)
+        r_safe_torque_limit = self.cfg.rew_beta_torque * (torque_excess ** 2).sum(-1)
 
-        # §6.5 杯体掉落惩罚（使用 _get_observations 已缓存的结果，避免重复 GPU 查询）
         cup_dropped = self._cached_cup_dropped
-        r_safe = r_safe + cup_dropped.float() * self.cfg.rew_w_drop
+        r_safe_cup_drop = cup_dropped.float() * self.cfg.rew_w_drop
+
+        r_safe = (
+            r_safe_self_collision
+            + r_safe_joint_limit
+            + r_safe_joint_vel
+            + r_safe_torque_limit
+            + r_safe_cup_drop
+        )
+
+        reward_info["safe"] = r_safe
+        reward_info["safe/self_collision"] = r_safe_self_collision
+        reward_info["safe/joint_limit"] = r_safe_joint_limit
+        reward_info["safe/joint_vel"] = r_safe_joint_vel
+        reward_info["safe/torque_limit"] = r_safe_torque_limit
+        reward_info["safe/cup_drop"] = r_safe_cup_drop
+
+        r_total = r_task + r_stab_left + r_stab_right - r_safe
+        reward_info["total"] = r_total
+
+        self.extras["reward_info"] = {
+            key: value.clone() for key, value in reward_info.items()
+        }
 
         # 更新门角度缓存
         self._prev_door_angle = theta.clone()
 
-        return r_task + r_stab - r_safe
+        return r_total
 
     # ═══════════════════════════════════════════════════════════════════
     # 终止判定
@@ -606,11 +674,7 @@ class DoorPushEnv(DirectRLEnv):
         self._prev_left_ee_ang_vel[env_ids] = 0.0
         self._prev_right_ee_lin_vel[env_ids] = 0.0
         self._prev_right_ee_ang_vel[env_ids] = 0.0
-        self._door_embedding[env_ids] = 0.0
-        self._visual_stale_steps[env_ids] = 0
         self._cached_cup_dropped[env_ids] = False
-        if self._camera is not None:
-            self._camera_capture_enabled = True
 
     # ═══════════════════════════════════════════════════════════════════
     # 课程注入接口
@@ -631,131 +695,9 @@ class DoorPushEnv(DirectRLEnv):
         self._left_occupied[:] = left_occupied
         self._right_occupied[:] = right_occupied
 
-    def update_visual_embedding(
-        self,
-        embedding: Tensor,
-    ) -> None:
-        """外部视觉感知运行时调用，更新所有 env 的视觉缓存。
-
-        Parameters
-        ----------
-        embedding : (N, 768)
-        """
-        self._door_embedding.copy_(embedding.to(self.device))
-
     def set_episode_reset_fn(self, fn) -> None:
         """注册 auto-reset 回调，在 `_reset_idx()` 中逐 env 调用。"""
         self._episode_reset_fn = fn
-
-    def get_visual_observations(self) -> list[dict[str, np.ndarray] | None]:
-        """导出当前帧 RGB-D 观测，供训练侧视觉运行时编码。"""
-        batch_observations = self.get_visual_observations_batch()
-        if batch_observations is None:
-            return [None] * self.num_envs
-
-        rgb_np = batch_observations["rgb"].detach().cpu().numpy().astype(
-            np.uint8, copy=False
-        )
-        depth_np = batch_observations["depth"].detach().cpu().numpy().astype(
-            np.float32, copy=False
-        )
-        extrinsic_np = batch_observations["extrinsic"].detach().cpu().numpy().astype(
-            np.float32, copy=False
-        )
-
-        observations: list[dict[str, np.ndarray]] = []
-        for env_idx in range(self.num_envs):
-            observations.append(
-                {
-                    "rgb": rgb_np[env_idx],
-                    "depth": depth_np[env_idx],
-                    "extrinsic": extrinsic_np[env_idx],
-                }
-            )
-        return observations
-
-    def get_visual_observations_batch(self) -> dict[str, Tensor] | None:
-        """导出当前帧 batched RGB-D 观测，保持 tensor-native。"""
-        if self._camera is None or not self._camera_capture_enabled:
-            return None
-
-        camera_data = self._read_camera_data()
-        if camera_data is None:
-            return None
-
-        outputs = camera_data.output
-        rgb = outputs.get("rgb")
-        depth = outputs.get("depth")
-        if rgb is None or depth is None:
-            return None
-
-        batch_size = int(self.num_envs)
-        rgb_tensor = align_camera_tensor_batch(
-            rgb[..., :3].contiguous(),
-            batch_size=batch_size,
-            name="rgb",
-        )
-        depth_tensor = align_camera_tensor_batch(
-            depth,
-            batch_size=batch_size,
-            name="depth",
-        )
-        if depth_tensor.ndim == 4 and depth_tensor.shape[-1] == 1:
-            depth_tensor = depth_tensor[..., 0]
-        depth_tensor = torch.where(
-            torch.isfinite(depth_tensor),
-            depth_tensor,
-            torch.zeros_like(depth_tensor),
-        ).to(dtype=torch.float32)
-
-        cam_pos_w, cam_quat_w_ros = align_camera_pose_batch(
-            camera_data.pos_w,
-            camera_data.quat_w_ros,
-            batch_size=batch_size,
-        )
-        cam_rot = batch_quat_to_rotation_matrix(cam_quat_w_ros)
-        extrinsic = torch.eye(
-            4, dtype=torch.float32, device=depth_tensor.device
-        ).repeat(batch_size, 1, 1)
-        extrinsic[:, :3, :3] = cam_rot.to(dtype=torch.float32)
-        extrinsic[:, :3, 3] = cam_pos_w.to(dtype=torch.float32)
-        return {
-            "rgb": rgb_tensor,
-            "depth": depth_tensor.contiguous(),
-            "extrinsic": extrinsic,
-        }
-
-    def _read_camera_data(self):
-        """读取相机数据；首帧/渲染未就绪时尝试恢复，失败则安全回退。"""
-        try:
-            return self._camera.data
-        except Exception as exc:
-            recovery_exc = self._recover_camera_read(exc)
-            if recovery_exc is not None:
-                self._camera_capture_enabled = False
-                if not self._camera_read_failure_warned:
-                    logger.warning(
-                        "Disabling tiled camera after failed recovery. "
-                        "Visual observations will fall back to None for this episode. "
-                        "initial_error=%r recovery_error=%r",
-                        exc,
-                        recovery_exc,
-                    )
-                    self._camera_read_failure_warned = True
-                return None
-        return self._camera.data
-
-    def _recover_camera_read(self, initial_exc: Exception) -> Exception | None:
-        """在首帧传感器未就绪时，补 render/update 后重试一次。"""
-        del initial_exc
-        try:
-            for _ in range(3):
-                self.sim.render()
-                self.scene.update(dt=self.physics_dt)
-            self._camera.update(self.physics_dt, force_recompute=True)
-            return None
-        except Exception as exc:
-            return exc
 
     def set_domain_params_batch(
         self, params_list: list[dict[str, float]]

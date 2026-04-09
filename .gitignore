@@ -6,3 +6,4 @@ outputs/
 .codex
 model/
 runs/
+checkpoints/

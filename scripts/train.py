@@ -61,6 +61,7 @@ def load_config(configs_dir: str | Path | None = None) -> dict[str, Any]:
         "policy": configs_dir / "policy/default.yaml",
         "task": configs_dir / "task/default.yaml",
         "curriculum": configs_dir / "curriculum/default.yaml",
+        "reward": configs_dir / "reward/default.yaml",
     }
 
     for key, path in config_files.items():
@@ -88,7 +89,7 @@ def _resolve_configs_root(configs_dir: str | Path | None) -> Path:
     if path.is_file():
         return path.parents[1]
 
-    if path.name in {"training", "env", "policy", "task", "curriculum"}:
+    if path.name in {"training", "env", "policy", "task", "curriculum", "reward"}:
         default_yaml = path / "default.yaml"
         if default_yaml.exists():
             return path.parent
@@ -188,17 +189,6 @@ def build_env_cfg(
         env_cfg.decimation = int(env_cfg_yaml["decimation"])
         env_cfg.sim.render_interval = env_cfg.decimation
 
-    visual_cfg = cfg.get("training", {}).get("visual", {})
-    env_cfg.visual_refresh_interval = int(
-        visual_cfg.get("refresh_interval", env_cfg.visual_refresh_interval)
-    )
-    if env_cfg.scene.tiled_camera is not None:
-        env_cfg.scene.tiled_camera.update_period = (
-            float(env_cfg.sim.dt)
-            * int(env_cfg.decimation)
-            * int(env_cfg.visual_refresh_interval)
-        )
-
     if not enable_cameras:
         env_cfg.scene.tiled_camera = None
 
@@ -208,7 +198,73 @@ def build_env_cfg(
     if "cup_drop_threshold" in task_cfg:
         env_cfg.cup_drop_threshold = float(task_cfg["cup_drop_threshold"])
 
+    # ── 从 reward YAML 注入奖励超参 ─────────────────────────────────
+    reward_cfg = cfg.get("reward", {})
+    _inject_reward_params(env_cfg, reward_cfg)
+
     return env_cfg
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 奖励参数注入
+# ═══════════════════════════════════════════════════════════════════════
+
+# YAML 键 → DoorPushEnvCfg 属性 的映射表
+_REWARD_PARAM_MAP: dict[str, dict[str, str]] = {
+    "task": {
+        "w_delta": "rew_w_delta",
+        "alpha": "rew_alpha",
+        "k_decay": "rew_k_decay",
+        "w_open": "rew_w_open",
+        "success_angle_threshold": "success_angle_threshold",
+    },
+    "stability": {
+        "w_zero_acc": "rew_w_zero_acc",
+        "lambda_acc": "rew_lambda_acc",
+        "w_zero_ang": "rew_w_zero_ang",
+        "lambda_ang": "rew_lambda_ang",
+        "w_acc": "rew_w_acc",
+        "w_ang": "rew_w_ang",
+        "w_tilt": "rew_w_tilt",
+        "w_smooth": "rew_w_smooth",
+        "w_reg": "rew_w_reg",
+    },
+    "safety": {
+        "beta_self": "rew_beta_self",
+        "beta_limit": "rew_beta_limit",
+        "mu": "rew_mu",
+        "beta_vel": "rew_beta_vel",
+        "beta_torque": "rew_beta_torque",
+        "w_drop": "rew_w_drop",
+    },
+}
+
+
+def _inject_reward_params(env_cfg: Any, reward_cfg: dict[str, Any]) -> None:
+    """将 reward YAML 中的参数注入到 DoorPushEnvCfg 实例。"""
+    for section, mapping in _REWARD_PARAM_MAP.items():
+        section_cfg = reward_cfg.get(section, {})
+        for yaml_key, cfg_attr in mapping.items():
+            if yaml_key in section_cfg:
+                setattr(env_cfg, cfg_attr, float(section_cfg[yaml_key]))
+
+
+_REWARD_SUMMARY_KEYS = frozenset({"total", "task", "stab_left", "stab_right", "safe"})
+
+
+def _iter_reward_scalar_tags(collect_stats: dict[str, float]):
+    """将 reward 统计路由到 TensorBoard 标签。
+
+    `reward/` 仅保留总项，细分子项统一写入 `reward_terms/`。
+    """
+    for key, val in collect_stats.items():
+        if not key.startswith("reward/"):
+            continue
+        suffix = key[len("reward/"):]
+        if suffix in _REWARD_SUMMARY_KEYS:
+            yield key, val
+        else:
+            yield f"reward_terms/{suffix}", val
 
 
 def build_curriculum_reset_batch(
@@ -229,9 +285,6 @@ def build_collector(
     """创建轨迹采集器和 RolloutBuffer 实例。"""
     from affordance_guided_interaction.training.rollout_buffer import RolloutBuffer
     from affordance_guided_interaction.training.rollout_collector import RolloutCollector
-    from affordance_guided_interaction.training.perception_runtime import (
-        PerceptionRuntime,
-    )
     from affordance_guided_interaction.policy import (
         batch_flatten_actor_obs,
         flatten_privileged,
@@ -254,14 +307,14 @@ def build_collector(
         "ee": 38,                                           # 双臂各 19
         "context": 2,                                       # left_occ + right_occ
         "stability": 2,                                     # left/right tilt
-        "visual": 768,                                      # Point-MAE 编码
+        "door_geometry": 6,                                 # center(3) + normal(3)
     }
 
     buffer = RolloutBuffer(
         n_envs=n_envs,
         n_steps=n_steps,
         actor_branch_dims=actor_branch_dims,
-        privileged_dim=16,
+        privileged_dim=13,
         action_dim=12,
         rnn_hidden_dim=actor_cfg.rnn_hidden,
         rnn_num_layers=actor_cfg.rnn_layers,
@@ -270,14 +323,6 @@ def build_collector(
 
     # partial 绑定展平函数
     batch_flatten_fn = partial(batch_flatten_actor_obs, cfg=actor_cfg)
-    visual_cfg = t_cfg.get("visual", {})
-    debug_cfg = t_cfg.get("debug", {})
-    perception_runtime = PerceptionRuntime(
-        refresh_interval=visual_cfg.get("refresh_interval", 4),
-        embedding_dim=768,  # Point-MAE embedding dim
-        visualize_detections=debug_cfg.get("visualize_detections", False),
-        strict_mode=debug_cfg.get("strict_mode", False),
-    )
 
     collector = RolloutCollector(
         actor=actor,
@@ -285,7 +330,7 @@ def build_collector(
         buffer=buffer,
         batch_actor_flatten_fn=batch_flatten_fn,
         priv_flatten_fn=flatten_privileged,
-        perception_runtime=perception_runtime,
+        perception_runtime=None,
         device=device,
     )
 
@@ -377,7 +422,7 @@ def main() -> int:
     log_interval = t_cfg.get("log_interval", 1)
     requested_headless = runtime_cfg.headless or ("--headless" in sys.argv[1:])
     headless = resolve_headless_mode(requested_headless, os.environ)
-    enable_cameras = device.type == "cuda"
+    enable_cameras = False  # door geometry replaces visual embedding; cameras not needed
 
     print(f"📋 训练配置:")
     print(f"   并行环境数: {n_envs}")
@@ -385,8 +430,6 @@ def main() -> int:
     print(f"   每轮采集步数: {n_steps_per_rollout}")
     print(f"   无头模式: {headless}")
     print(f"   随机种子: {runtime_cfg.seed}")
-    print(f"   启用视觉传感器: {enable_cameras}")
-    print("📈 Throughput profiling enabled: rollout / vision / ppo timing buckets")
 
     simulation_app = launch_simulation_app(
         headless=headless,
@@ -569,11 +612,6 @@ def main() -> int:
 
             iter_time = time.time() - iter_start
             fps = steps_this_iter / max(iter_time, 1e-6)
-            vision_s = collector._timings.get("vision_s", 0.0)
-            camera_fetch_s = collector._timings.get("camera_fetch_s", 0.0)
-            segmentation_s = collector._timings.get("segmentation_s", 0.0)
-            pointcloud_s = collector._timings.get("pointcloud_s", 0.0)
-            encoder_s = collector._timings.get("encoder_s", 0.0)
 
             # ── Step 6: 课程管理器跃迁判定 ─────────────────────
             mean_reward = collect_stats.get("collect/mean_reward", 0.0)
@@ -607,7 +645,6 @@ def main() -> int:
                     f"r̄={mean_reward:>.4f} | "
                     f"succ={epoch_success_rate:>5.3f} | "
                     f"rollout={rollout_s:>5.2f}s | "
-                    f"vision={vision_s:>5.2f}s | "
                     f"update={update_s:>5.2f}s | "
                     f"stage={curriculum.current_stage} | "
                     f"ETA={eta_h:.1f}h"
@@ -623,11 +660,6 @@ def main() -> int:
                 writer.add_scalar("train/explained_variance", update_metrics["explained_variance"], global_steps)
                 writer.add_scalar("train/fps", fps, global_steps)
                 writer.add_scalar("timing/rollout_s", rollout_s, global_steps)
-                writer.add_scalar("timing/vision_s", vision_s, global_steps)
-                writer.add_scalar("timing/camera_fetch_s", camera_fetch_s, global_steps)
-                writer.add_scalar("timing/segmentation_s", segmentation_s, global_steps)
-                writer.add_scalar("timing/pointcloud_s", pointcloud_s, global_steps)
-                writer.add_scalar("timing/encoder_s", encoder_s, global_steps)
                 writer.add_scalar("timing/update_s", update_s, global_steps)
                 writer.add_scalar(
                     "timing/env_steps_per_s",
@@ -635,6 +667,8 @@ def main() -> int:
                     global_steps,
                 )
                 writer.add_scalar("collect/mean_reward", mean_reward, global_steps)
+                for tag, val in _iter_reward_scalar_tags(collect_stats):
+                    writer.add_scalar(tag, val, global_steps)
                 writer.add_scalar("collect/completed_episodes", completed_eps, global_steps)
                 writer.add_scalar("collect/successful_episodes", successful_eps, global_steps)
                 writer.add_scalar("collect/episode_success_rate", epoch_success_rate, global_steps)
