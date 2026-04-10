@@ -1,19 +1,20 @@
 """Rollout 演示 — 加载训练好的策略执行可视化 rollout。
 
 用法:
-    # 使用随机策略运行一个 episode
+    # 使用 YAML 默认配置运行（推荐）
     python scripts/rollout_demo.py
 
-    # 加载 checkpoint 运行确定性策略
-    python scripts/rollout_demo.py --checkpoint checkpoints/ckpt_final.pt
+    # 指定自定义配置根目录
+    python scripts/rollout_demo.py --configs-dir /path/to/configs/
 
-    # 指定上下文并保存视频
-    python scripts/rollout_demo.py --checkpoint checkpoints/ckpt_final.pt \
-        --context both --episodes 3 --save-video rollout.mp4
+所有运行参数（checkpoint、contexts、帧率等）从 ``configs/visualization/default.yaml`` 读取，
+不再需要长命令行参数。如需修改配置，请直接编辑 YAML 文件。
 
-    # 保存逐帧图片
-    python scripts/rollout_demo.py --checkpoint checkpoints/ckpt_final.pt \
-        --save-frames frames/
+服务器/VS Code Remote 使用:
+    1. 确保配置中 ``headless: true``
+    2. 运行 ``python scripts/rollout_demo.py``
+    3. 在 ``artifacts/vis/`` 下查看生成的 mp4 或帧目录
+    4. 若 mp4 不可用（无 imageio[ffmpeg]），设 ``save_frames: true`` 获取逐帧图片
 """
 
 from __future__ import annotations
@@ -36,6 +37,10 @@ if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# 上下文映射
+# ═══════════════════════════════════════════════════════════════════════
+
 VALID_CONTEXTS = {
     "none": (False, False),
     "left_only": (True, False),
@@ -51,75 +56,22 @@ def _move_hidden_to_device(hidden, device: torch.device):
     return hidden.to(device)
 
 
-def _try_save_frame(env, frame_dir: Path | None, episode: int, step: int) -> np.ndarray | None:
-    """尝试从环境获取渲染帧并保存到磁盘。"""
-    if frame_dir is None:
-        return None
-
-    try:
-        vis_obs = env.get_visual_observation()
-        if vis_obs is None or "rgb" not in vis_obs:
-            return None
-
-        rgb = vis_obs["rgb"]  # (H, W, 3)
-        frame_dir.mkdir(parents=True, exist_ok=True)
-        frame_path = frame_dir / f"ep{episode:03d}_step{step:05d}.png"
-
-        try:
-            import imageio.v3 as iio
-            iio.imwrite(str(frame_path), rgb.astype(np.uint8))
-        except ImportError:
-            # 回退到简易 PPM 格式
-            _save_ppm(frame_path.with_suffix(".ppm"), rgb.astype(np.uint8))
-
-        return rgb
-    except Exception:
-        return None
-
-
-def _save_ppm(path: Path, rgb: np.ndarray) -> None:
-    """保存 RGB 帧为 PPM 格式（无依赖回退方案）。"""
-    h, w, _ = rgb.shape
-    with open(path, "wb") as f:
-        f.write(f"P6\n{w} {h}\n255\n".encode())
-        f.write(rgb.tobytes())
-
-
-def _assemble_video(frames: list[np.ndarray], output_path: Path, fps: int = 30) -> bool:
-    """将帧列表组装为视频文件。"""
-    if not frames:
-        print("  无可用帧，跳过视频生成")
-        return False
-
-    try:
-        import imageio.v3 as iio
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        iio.imwrite(str(output_path), frames, fps=fps)
-        size_mb = output_path.stat().st_size / (1024 * 1024)
-        print(f"  视频已保存: {output_path} ({size_mb:.2f} MB, {len(frames)} 帧)")
-        return True
-    except ImportError:
-        print("  imageio[ffmpeg] 不可用，无法生成视频。请安装: pip install imageio[ffmpeg]")
-        return False
-    except Exception as e:
-        print(f"  视频生成失败: {e}")
-        return False
-
-
 # ═══════════════════════════════════════════════════════════════════════
 # 单 Episode Rollout
 # ═══════════════════════════════════════════════════════════════════════
+
 
 def run_episode(
     envs,
     actor,
     actor_cfg,
-    runtime,
     *,
     device: torch.device,
     deterministic: bool = True,
     verbose: bool = True,
-    frame_dir: Path | None = None,
+    frame_stride: int = 1,
+    save_frames: bool = False,
+    frames_dir: Path | None = None,
     episode_idx: int = 0,
     context_name: str = "none",
 ) -> dict:
@@ -129,6 +81,12 @@ def run_episode(
     ----------
     envs:
         DirectRLEnvAdapter 实例（num_envs=1）。
+    frame_stride:
+        每隔 N 步捕获一帧。
+    save_frames:
+        是否将帧写入磁盘。
+    frames_dir:
+        帧图片保存目录。
 
     Returns
     -------
@@ -136,6 +94,11 @@ def run_episode(
         包含 success, total_reward, steps, termination_reason, frames 的结果字典。
     """
     from affordance_guided_interaction.policy import batch_flatten_actor_obs
+    from affordance_guided_interaction.visualization.rollout_artifacts import (
+        should_capture_step,
+        capture_frame,
+        save_frame_image,
+    )
 
     left_occupied, right_occupied = VALID_CONTEXTS[context_name]
 
@@ -143,14 +106,6 @@ def run_episode(
         door_types=["push"],
         left_occupied_list=[left_occupied],
         right_occupied_list=[right_occupied],
-    )
-
-    runtime.reset(1)
-    actor_obs_list, critic_obs_list = runtime.prepare_batch(
-        actor_obs_list=actor_obs_list,
-        critic_obs_list=critic_obs_list,
-        visual_observations=envs.get_visual_observations(),
-        force_refresh_mask=[True],
     )
     actor_obs = actor_obs_list[0]
 
@@ -162,6 +117,17 @@ def run_episode(
     frames: list[np.ndarray] = []
 
     while not done:
+        # ── 帧捕获 ──────────────────────────────────────────────
+        if should_capture_step(step, frame_stride):
+            frame = capture_frame(envs)
+            if frame is not None:
+                frames.append(frame)
+                if save_frames and frames_dir is not None:
+                    save_frame_image(
+                        frame,
+                        frames_dir / f"ep{episode_idx:03d}_step{step:05d}.png",
+                    )
+
         # 构建 batch 观测
         actor_branches = batch_flatten_actor_obs([actor_obs], cfg=actor_cfg)
         actor_branches = {k: v.to(device) for k, v in actor_branches.items()}
@@ -181,13 +147,6 @@ def run_episode(
         total_reward += float(rewards[0])
         step += 1
 
-        # 视觉 embedding 更新
-        actor_obs_list, critic_obs_list = runtime.prepare_batch(
-            actor_obs_list=actor_obs_list,
-            critic_obs_list=critic_obs_list,
-            visual_observations=envs.get_visual_observations(),
-            force_refresh_mask=[done],
-        )
         actor_obs = actor_obs_list[0]
 
         # 逐步诊断输出
@@ -218,76 +177,47 @@ def run_episode(
 # 主函数
 # ═══════════════════════════════════════════════════════════════════════
 
+
 def main() -> int:
-    """Rollout 演示主入口。"""
+    """Rollout 演示主入口 — YAML-first。"""
     parser = argparse.ArgumentParser(
         description="加载训练策略执行可视化 rollout 演示"
     )
     parser.add_argument(
-        "--checkpoint", default=None,
-        help="模型 checkpoint 路径（不指定则使用随机初始化策略）",
-    )
-    parser.add_argument(
-        "--config", default="configs/training/default.yaml",
-        help="配置文件路径",
-    )
-    parser.add_argument(
-        "--episodes", type=int, default=1,
-        help="运行 episode 数量 (默认: 1)",
-    )
-    parser.add_argument(
-        "--context",
-        choices=list(VALID_CONTEXTS.keys()),
-        default="none",
-        help="杯子占用上下文 (默认: none)",
-    )
-    parser.add_argument(
-        "--save-frames", default=None,
-        help="帧图片保存目录（可选）",
-    )
-    parser.add_argument(
-        "--save-video", default=None,
-        help="输出视频文件路径（可选，需要 imageio[ffmpeg]）",
-    )
-    parser.add_argument(
-        "--device", default="cpu",
-        help="推理设备 (默认: cpu)",
-    )
-    parser.add_argument(
-        "--seed", type=int, default=42,
-        help="随机种子 (默认: 42)",
-    )
-    parser.add_argument(
-        "--stochastic", action="store_true",
-        help="使用采样动作而非确定性动作",
-    )
-    parser.add_argument(
-        "--quiet", action="store_true",
-        help="减少逐步输出",
-    )
-    parser.add_argument(
-        "--headless", action="store_true",
-        help="以无窗口模式启动 Isaac Sim",
+        "--configs-dir",
+        default=None,
+        help="可选：指定配置根目录；默认读取项目根目录下的 configs/",
     )
     args = parser.parse_args()
 
     from train import build_env_cfg, load_config, build_models
+    from affordance_guided_interaction.visualization.rollout_config import (
+        resolve_visualization_config,
+    )
+    from affordance_guided_interaction.visualization.rollout_artifacts import (
+        build_video_path,
+        build_frames_dir,
+        assemble_video,
+    )
     from affordance_guided_interaction.utils.runtime_env import resolve_headless_mode
     from affordance_guided_interaction.utils.sim_runtime import launch_simulation_app
     from affordance_guided_interaction.envs.door_push_env import DoorPushEnv
     from affordance_guided_interaction.envs.direct_rl_env_adapter import DirectRLEnvAdapter
-    from affordance_guided_interaction.training.perception_runtime import PerceptionRuntime
+
+    # ── 从 YAML 加载配置 ─────────────────────────────────────
+    cfg = load_config(args.configs_dir)
+    vis_cfg = resolve_visualization_config(
+        cfg["visualization"], project_root=_PROJECT_ROOT
+    )
 
     # ── 初始化 ──────────────────────────────────────────────
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
+    np.random.seed(vis_cfg.seed)
+    torch.manual_seed(vis_cfg.seed)
 
-    device = torch.device(args.device)
-    config_path = str(_PROJECT_ROOT / args.config)
-    cfg = load_config(config_path)
+    device = torch.device(vis_cfg.device)
     simulation_app = launch_simulation_app(
-        headless=resolve_headless_mode(args.headless, os.environ),
-        enable_cameras=True,
+        headless=resolve_headless_mode(vis_cfg.headless, os.environ),
+        enable_cameras=False,
         import_error_message=(
             "未检测到 isaacsim 运行时，rollout_demo.py 需要在 Isaac Sim / Isaac Lab 运行时下执行。"
         ),
@@ -297,96 +227,142 @@ def main() -> int:
     actor.eval()
 
     # ── 加载 checkpoint（可选）─────────────────────────────
-    if args.checkpoint is not None:
-        ckpt_path = Path(args.checkpoint)
+    if vis_cfg.checkpoint is not None:
+        ckpt_path = vis_cfg.checkpoint
         if not ckpt_path.exists():
             print(f"错误: checkpoint 文件不存在: {ckpt_path}")
             return 1
         checkpoint = torch.load(str(ckpt_path), map_location=device, weights_only=False)
         actor.load_state_dict(checkpoint["actor_state_dict"])
         iteration = checkpoint.get("iteration", "?")
+        checkpoint_stem = ckpt_path.stem
         print(f"已加载 checkpoint: {ckpt_path} (iter={iteration})")
     else:
+        checkpoint_stem = "random_init"
         print("未指定 checkpoint，使用随机初始化策略")
 
-    # ── 创建环境和视觉运行时 ────────────────────────────────
-    runtime = PerceptionRuntime(refresh_interval=4, embedding_dim=768)
-
-    # 使用 GPU 环境 (num_envs=1 用于演示)
-    env_cfg = build_env_cfg(cfg, n_envs=1, device=str(device), seed=args.seed)
+    # ── 创建环境 ────────────────────────────────────────────
+    env_cfg = build_env_cfg(cfg, n_envs=1, device=str(device), seed=vis_cfg.seed, enable_cameras=False)
     _direct_env = DoorPushEnv(cfg=env_cfg)
     envs = DirectRLEnvAdapter(_direct_env)
 
-    frame_dir = Path(args.save_frames) if args.save_frames else None
-    deterministic = not args.stochastic
-    verbose = not args.quiet
+    verbose = True
 
     print(f"\n{'═' * 60}")
-    print(f"Rollout 演示配置:")
-    print(f"  上下文: {args.context}")
-    print(f"  Episode 数: {args.episodes}")
-    print(f"  动作模式: {'确定性' if deterministic else '随机采样'}")
+    print(f"Rollout 可视化配置 (from YAML):")
+    print(f"  Checkpoint: {vis_cfg.checkpoint or 'random_init'}")
+    print(f"  上下文: {', '.join(vis_cfg.contexts)}")
+    print(f"  每上下文 episode: {vis_cfg.episodes_per_context}")
+    print(f"  动作模式: {'确定性' if vis_cfg.deterministic else '随机采样'}")
     print(f"  设备: {device}")
-    if frame_dir:
-        print(f"  帧保存目录: {frame_dir}")
-    if args.save_video:
-        print(f"  视频输出: {args.save_video}")
+    print(f"  保存视频: {vis_cfg.save_video}")
+    print(f"  保存帧: {vis_cfg.save_frames}")
+    print(f"  帧步幅: {vis_cfg.frame_stride}")
+    print(f"  输出目录: {vis_cfg.output_root}")
     print(f"{'═' * 60}\n")
 
-    # ── 运行 Rollout ────────────────────────────────────────
-    all_frames: list[np.ndarray] = []
-    results: list[dict] = []
+    # ── 跨上下文 Rollout ────────────────────────────────────
+    all_results: list[dict] = []
+    all_frames_by_context: dict[str, list[np.ndarray]] = {}
+    video_skipped = False
+    generated_files: list[str] = []
 
     try:
-        for ep in range(args.episodes):
-            print(f"── Episode {ep + 1}/{args.episodes} ({args.context}) ──")
-            t0 = time.time()
+        for context_name in vis_cfg.contexts:
+            context_frames: list[np.ndarray] = []
 
-            result = run_episode(
-                envs=envs,
-                actor=actor,
-                actor_cfg=actor_cfg,
-                runtime=runtime,
-                device=device,
-                deterministic=deterministic,
-                verbose=verbose,
-                frame_dir=frame_dir,
-                episode_idx=ep,
-                context_name=args.context,
-            )
-            results.append(result)
-            all_frames.extend(result["frames"])
+            # 构建 artifact 路径
+            if vis_cfg.save_video:
+                video_path = build_video_path(
+                    vis_cfg.output_root,
+                    checkpoint_stem,
+                    context_name,
+                    vis_cfg.video_name_template,
+                )
+            else:
+                video_path = None
 
-            elapsed = time.time() - t0
-            status = "SUCCESS" if result["success"] else "FAILURE"
-            print(
-                f"  [{status}] "
-                f"steps={result['steps']}  "
-                f"reward={result['total_reward']:.4f}  "
-                f"reason={result['termination_reason']}  "
-                f"time={elapsed:.2f}s\n"
-            )
+            if vis_cfg.save_frames:
+                frames_dir = build_frames_dir(
+                    vis_cfg.output_root,
+                    checkpoint_stem,
+                    context_name,
+                    vis_cfg.frames_dir_template,
+                )
+            else:
+                frames_dir = None
+
+            for ep in range(vis_cfg.episodes_per_context):
+                print(
+                    f"── {context_name} | Episode {ep + 1}/{vis_cfg.episodes_per_context} ──"
+                )
+                t0 = time.time()
+
+                result = run_episode(
+                    envs=envs,
+                    actor=actor,
+                    actor_cfg=actor_cfg,
+                    device=device,
+                    deterministic=vis_cfg.deterministic,
+                    verbose=verbose,
+                    frame_stride=vis_cfg.frame_stride,
+                    save_frames=vis_cfg.save_frames,
+                    frames_dir=frames_dir,
+                    episode_idx=ep,
+                    context_name=context_name,
+                )
+                all_results.append(result)
+                context_frames.extend(result["frames"])
+
+                elapsed = time.time() - t0
+                status = "SUCCESS" if result["success"] else "FAILURE"
+                print(
+                    f"  [{status}] "
+                    f"steps={result['steps']}  "
+                    f"reward={result['total_reward']:.4f}  "
+                    f"reason={result['termination_reason']}  "
+                    f"time={elapsed:.2f}s\n"
+                )
+
+            all_frames_by_context[context_name] = context_frames
+
+            # ── 视频组装（按上下文） ──────────────────────────
+            if vis_cfg.save_video and video_path is not None and context_frames:
+                ok = assemble_video(context_frames, video_path, fps=vis_cfg.video_fps)
+                if ok:
+                    generated_files.append(str(video_path))
+                else:
+                    video_skipped = True
+
+            if vis_cfg.save_frames and frames_dir is not None and context_frames:
+                generated_files.append(str(frames_dir))
+
     finally:
         envs.close()
         if simulation_app is not None:
             simulation_app.close()
 
-    # ── 视频组装 ────────────────────────────────────────────
-    if args.save_video and all_frames:
-        _assemble_video(all_frames, Path(args.save_video))
-
     # ── 总结 ────────────────────────────────────────────────
-    n_success = sum(1 for r in results if r["success"])
-    avg_reward = sum(r["total_reward"] for r in results) / max(len(results), 1)
-    avg_steps = sum(r["steps"] for r in results) / max(len(results), 1)
+    n_success = sum(1 for r in all_results if r["success"])
+    avg_reward = sum(r["total_reward"] for r in all_results) / max(len(all_results), 1)
+    avg_steps = sum(r["steps"] for r in all_results) / max(len(all_results), 1)
+    total_frames = sum(len(f) for f in all_frames_by_context.values())
 
     print(f"{'═' * 60}")
-    print(f"Rollout 总结:")
-    print(f"  成功率: {n_success}/{len(results)} ({n_success / max(len(results), 1):.1%})")
+    print(f"Rollout 可视化总结:")
+    print(f"  Checkpoint: {vis_cfg.checkpoint or 'random_init'}")
+    print(f"  渲染上下文: {', '.join(vis_cfg.contexts)}")
+    print(f"  成功率: {n_success}/{len(all_results)} ({n_success / max(len(all_results), 1):.1%})")
     print(f"  平均奖励: {avg_reward:.4f}")
     print(f"  平均步数: {avg_steps:.1f}")
-    if all_frames:
-        print(f"  捕获帧数: {len(all_frames)}")
+    print(f"  总捕获帧数: {total_frames}")
+    if generated_files:
+        print(f"  生成的文件:")
+        for f in generated_files:
+            print(f"    - {f}")
+    if video_skipped:
+        print("  注意: mp4 生成被跳过（imageio[ffmpeg] 不可用）")
+        print("  请安装: pip install imageio[ffmpeg]")
     print(f"{'═' * 60}")
 
     return 0

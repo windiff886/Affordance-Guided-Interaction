@@ -11,7 +11,10 @@
 - :class:`DomainRandomizer`    — 域随机化采样器
 - :class:`RandomizationConfig` — 域随机化超参
 - :class:`TrainingMetrics`     — 训练指标聚合器
-- :class:`PerceptionRuntime`   — 训练侧固定频率视觉缓存运行时
+
+Note:
+    ``PerceptionRuntime`` 仍可从 ``training.perception_runtime`` 显式导入，
+    但已从默认 ``__init__.py`` 导出中移除。当前默认训练路径不使用视觉感知。
 """
 
 from .ppo_trainer import PPOTrainer, PPOConfig
@@ -20,7 +23,6 @@ from .rollout_collector import RolloutCollector
 from .curriculum_manager import CurriculumManager, StageConfig, STAGE_CONFIGS
 from .domain_randomizer import DomainRandomizer, RandomizationConfig
 from .metrics import TrainingMetrics
-from .perception_runtime import PerceptionRuntime
 
 __all__ = [
     "PPOTrainer",
@@ -33,5 +35,4 @@ __all__ = [
     "DomainRandomizer",
     "RandomizationConfig",
     "TrainingMetrics",
-    "PerceptionRuntime",
 ]

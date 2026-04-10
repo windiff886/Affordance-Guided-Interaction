@@ -1,0 +1,45 @@
+# ═══════════════════════════════════════════════════════════════════════
+# Rollout 可视化配置
+# 对应文档：configs/README.md § 可视化配置
+# ═══════════════════════════════════════════════════════════════════════
+
+# ── 使用方式说明 ─────────────────────────────────────────────────────
+# 可视化入口为：
+#   python scripts/rollout_demo.py
+#
+# 所有运行参数都在本文件中修改，不再依赖命令行覆盖。
+#
+# 输出 artifact 结构示例：
+#   artifacts/vis/
+#     iter_010000/
+#       none.mp4
+#       both.mp4
+#       none_frames/
+#         ep000_step00000.png
+#         ep000_step00001.png
+#         ...
+# ── 运行时参数（当前生效值）──────────────────────────────────────────
+checkpoint: null                # 模型 checkpoint 路径（相对项目根目录）；null 使用随机初始化策略
+device: cpu                     # 推理设备：cpu / cuda
+seed: 42                        # 全局随机种子
+headless: true                  # 是否以无窗口模式启动 Isaac Sim
+deterministic: true             # true → 确定性动作；false → 采样动作
+
+# ── 上下文与回合 ──────────────────────────────────────────────────────
+contexts:                       # 要渲染的杯子占用上下文列表
+  - none                        # 无持杯
+  - left_only                   # 仅左手持杯
+  - right_only                  # 仅右手持杯
+  - both                        # 双手持杯
+episodes_per_context: 1         # 每个上下文运行的 episode 数
+
+# ── 帧捕获与视频 ─────────────────────────────────────────────────────
+save_video: true                # 是否生成 mp4 视频（需要 imageio[ffmpeg]）
+save_frames: false              # 是否保存逐帧图片
+frame_stride: 1                 # 每隔 N 步捕获一帧；1 = 每步都捕获
+video_fps: 30                   # 输出视频帧率
+
+# ── Artifact 输出 ────────────────────────────────────────────────────
+output_root: artifacts/vis      # artifact 输出根目录（相对项目根目录）
+video_name_template: "{checkpoint_stem}/{context}.mp4"
+frames_dir_template: "{checkpoint_stem}/{context}_frames"

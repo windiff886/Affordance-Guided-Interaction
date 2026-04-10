@@ -1,6 +1,10 @@
 # Door Perception Pipeline
 
-> **Note:** This module is an optional research/experimental path and is **no longer part of the default training observation pipeline**. The default training path now uses simulation ground-truth `door_geometry` (6-dim: center + normal in base frame) instead of the visual embedding produced by this pipeline. This module is retained for future visual perception experiments.
+> **[历史实验模块 — 非默认路径]**
+>
+> 当前默认项目路径 **不依赖本目录**。默认训练使用仿真 ground-truth `door_geometry`（6 维: base 系下 center + normal）作为唯一门相关输入。
+>
+> 本目录仅保留为历史实验与后续感知研究参考。若未来恢复视觉感知实验，应在独立分支或实验配置中接入，不应修改默认训练入口。
 
 从单帧 RGB-D 中提取门相关点云，并通过**开箱即用、完全冻结的视觉点云编码器（Vision Encoder）**，直接将其编码为 policy 可用的高维门特征 embedding（`door_embedding`）。
 全流程严格坚持**现成预训练大模型直出，绝对不包含任何训练感知/分割模型的步骤**。

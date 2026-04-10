@@ -1,6 +1,6 @@
 # Affordance-Guided Interaction
 
-基于 **Isaac Lab** 仿真器与 **PPO** 强化学习算法，训练双臂机器人（Unitree Z1 × 2 + Dingo 底座）在持杯约束下完成推门任务。策略通过 affordance 视觉编码提取门相关特征，并在当前的三阶段 push-only 课程中逐步引入持杯约束。
+基于 **Isaac Lab** 仿真器与 **PPO** 强化学习算法，训练双臂机器人（Unitree Z1 × 2 + Dingo 底座）在持杯约束下完成推门任务。策略通过仿真 ground truth 计算的 `door_geometry`（6 维门几何信号）作为唯一门相关输入，并在当前的三阶段 push-only 课程中逐步引入持杯约束。
 
 ---
 
@@ -157,7 +157,7 @@ ppo:
 
 | 阶段 | 门类型 | 持杯概率 | 学习目标 |
 |---|---|---|---|
-| Stage 1 | push | 0% | 基础视觉引导接触 |
+| Stage 1 | push | 0% | 基础推门接触 |
 | Stage 2 | push | 100% | 力控与稳定性约束 |
 | Stage 3 | push | 50% | 有杯 / 无杯混合场景下的稳定推门 |
 
@@ -199,8 +199,8 @@ Affordance-Guided-Interaction/
 │   │   ├── episode_stats.py      #   EpisodeStats — 回合统计
 │   │   ├── metrics.py            #   Metrics — TensorBoard 日志
 │   │   ├── evaluation.py         #   Evaluation — 评估管线
-│   │   └── perception_runtime.py #   PerceptionRuntime — 视觉推理桥接
-│   ├── door_perception/          # 视觉感知模块（独立）
+│   │   └── perception_runtime.py #   [历史] 视觉推理桥接（默认训练不使用）
+│   ├── door_perception/          # [历史] 视觉感知模块（默认训练不使用）
 │   │   ├── affordance_pipeline.py #  Affordance 检测管线
 │   │   ├── frozen_encoder.py     #   冻结视觉编码器
 │   │   ├── segmentation.py       #   门体分割
@@ -273,7 +273,7 @@ Affordance-Guided-Interaction/
 - **无 Python 循环**：所有 per-env 状态为 `(num_envs, ...)` 形状的 torch tensor，观测 / 奖励 / 终止判定均为纯 tensor 操作
 - **Cloner 自动复制**：`DoorPushSceneCfg` 声明式定义场景（机器人、门、杯体、接触传感器），Isaac Lab Cloner 自动为 N 个并行环境复制完整场景子树
 - **自包含环境**：`DoorPushEnv` 内置 12 项奖励计算（任务进展 + 稳定性约束 + 安全惩罚）、非对称 Actor/Critic 观测构建、批量杯体抓取初始化，无需外部 Manager
-- **非对称观测**：Actor 含传感器噪声 + 视觉 embedding；Critic 含无噪声物理状态 + 门关节角/速度/质量等 privileged 信息
+- **非对称观测**：Actor 含传感器噪声 + door_geometry(6D)；Critic 含无噪声物理状态 + 门关节角/速度/质量等 privileged 信息
 - **适配器桥接**：`DirectRLEnvAdapter` 将 tensor 接口转换为训练管线 (`RolloutCollector`) 期望的 `VecEnvProtocol`
 
 ---

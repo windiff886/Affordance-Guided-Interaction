@@ -101,9 +101,9 @@ def launch_simulation_app(
 def _configure_isaaclab_camera_settings(*, headless: bool) -> None:
     """Set the Isaac Lab carb flags needed by camera sensors.
 
-    This mirrors the minimal camera-related state that ``AppLauncher`` normally
-    injects after startup, while avoiding a hard dependency on Isaac Lab's
-    experience files.
+    .. deprecated::
+        当前默认训练路径不使用相机传感器。此函数仅为历史兼容保留，
+        不应在新代码中依赖。若未来需要恢复相机实验，应在独立实验配置中启用。
     """
     try:
         import carb

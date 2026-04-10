@@ -118,6 +118,8 @@ class DoorPushEnv(DirectRLEnv):
         self._left_ee_body_idx = robot.find_bodies([LEFT_EE_LINK_NAME])[0][0]
         self._right_ee_body_idx = robot.find_bodies([RIGHT_EE_LINK_NAME])[0][0]
 
+        # NOTE: 相机传感器已从默认场景配置移除。环境不再持有相机句柄。
+
         # 门铰链（通常只有 1 个关节）
         self._door_hinge_ids, _ = door.find_joints(".*")
         self._door_panel_body_idx = door.find_bodies([DOOR_LEAF_BODY_NAME])[0][0]

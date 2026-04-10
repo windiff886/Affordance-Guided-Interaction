@@ -40,7 +40,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
 _EE_DIM = 38
 _CONTEXT_DIM = 2
 _STAB_DIM = 2
-_VISUAL_DIM = 768
+_DOOR_GEOMETRY_DIM = 6
 
 
 def _compute_proprio_dim(include_torques: bool) -> int:
@@ -62,7 +62,7 @@ class ActorExportWrapper(nn.Module):
 
     输入张量拼接顺序::
 
-        [proprio | ee | context | stability | visual]
+        [proprio | ee | context | stability | door_geometry]
 
     Parameters
     ----------
@@ -81,14 +81,14 @@ class ActorExportWrapper(nn.Module):
         self.ee_dim = _EE_DIM
         self.context_dim = _CONTEXT_DIM
         self.stab_dim = _STAB_DIM
-        self.visual_dim = _VISUAL_DIM
+        self.door_geometry_dim = _DOOR_GEOMETRY_DIM
 
         self.flat_dim = (
             self.proprio_dim
             + self.ee_dim
             + self.context_dim
             + self.stab_dim
-            + self.visual_dim
+            + self.door_geometry_dim
         )
 
         # 记录切分索引
@@ -97,7 +97,7 @@ class ActorExportWrapper(nn.Module):
             self.ee_dim,
             self.context_dim,
             self.stab_dim,
-            self.visual_dim,
+            self.door_geometry_dim,
         ]
 
     def forward(
@@ -111,7 +111,7 @@ class ActorExportWrapper(nn.Module):
         Parameters
         ----------
         flat_input : ``(batch, flat_dim)``
-            所有分支按 [proprio, ee, context, stability, visual] 顺序拼接。
+            所有分支按 [proprio, ee, context, stability, door_geometry] 顺序拼接。
         h_in : ``(num_layers, batch, hidden_dim)``
             RNN 隐状态 h。
         c_in : ``(num_layers, batch, hidden_dim)``
@@ -125,7 +125,7 @@ class ActorExportWrapper(nn.Module):
             对 GRU，c_out 始终为全零。
         """
         # 切分为各分支
-        proprio, ee, context, stability, visual = torch.split(
+        proprio, ee, context, stability, door_geometry = torch.split(
             flat_input, self._splits, dim=-1
         )
 
@@ -134,7 +134,7 @@ class ActorExportWrapper(nn.Module):
             "ee": ee,
             "context": context,
             "stability": stability,
-            "visual": visual,
+            "door_geometry": door_geometry,
         }
 
         # 构造隐状态

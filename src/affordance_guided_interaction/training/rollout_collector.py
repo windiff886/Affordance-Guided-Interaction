@@ -138,7 +138,7 @@ class RolloutCollector:
         self.buffer = buffer
         self.batch_actor_flatten_fn = batch_actor_flatten_fn
         self.priv_flatten_fn = priv_flatten_fn
-        self.perception_runtime = perception_runtime
+        self.perception_runtime = perception_runtime  # legacy: 默认 None，仅历史视觉实验使用
         self.device = torch.device(device)
 
         # 隐状态缓存
@@ -457,6 +457,7 @@ class RolloutCollector:
         critic_obs_list: list[dict] | torch.Tensor,
         force_refresh_mask: list[bool],
     ) -> tuple[list[dict] | torch.Tensor, list[dict] | torch.Tensor]:
+        """.. deprecated:: 视觉 batch 准备逻辑。默认路径 perception_runtime=None 时立即返回，不做任何处理。"""
         if self.perception_runtime is None:
             return actor_obs_list, critic_obs_list
 

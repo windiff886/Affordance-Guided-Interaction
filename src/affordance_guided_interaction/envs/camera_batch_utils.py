@@ -1,3 +1,10 @@
+"""相机 tensor 批量对齐工具。
+
+.. deprecated::
+    当前默认训练路径不使用相机传感器。本模块仅为历史视觉实验保留。
+    若无调用方依赖，可在后续清理中移除。
+"""
+
 from __future__ import annotations
 
 from torch import Tensor

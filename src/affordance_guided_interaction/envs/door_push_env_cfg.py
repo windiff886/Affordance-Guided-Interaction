@@ -289,23 +289,9 @@ class DoorPushSceneCfg(InteractiveSceneCfg):
         history_length=4,
     )
 
-    # ── 机器人头部 D455 相机（视觉 embedding 输入）───────────────────
-    tiled_camera: TiledCameraCfg = TiledCameraCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/.*/head_d455_link/Camera",
-        offset=TiledCameraCfg.OffsetCfg(),
-        update_period=0.0,
-        data_types=["rgb", "depth"],
-        depth_clipping_behavior="zero",
-        spawn=sim_utils.PinholeCameraCfg(
-            focal_length=_CAMERA_FOCAL_LENGTH,
-            focus_distance=400.0,
-            horizontal_aperture=_CAMERA_HORIZONTAL_APERTURE,
-            vertical_aperture=_CAMERA_VERTICAL_APERTURE,
-            clipping_range=(0.01, 100.0),
-        ),
-        width=_CAMERA_WIDTH,
-        height=_CAMERA_HEIGHT,
-    )
+    # NOTE: tiled_camera 已从默认场景移除。当前训练使用 door_geometry(6D) 作为
+    # 唯一门相关输入，不需要相机传感器。若未来实验需恢复，可在子配置中重新声明
+    # TiledCameraCfg 并在 launch_simulation_app(enable_cameras=True) 中启用。
 
 
 # ═══════════════════════════════════════════════════════════════════════

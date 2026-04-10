@@ -42,13 +42,13 @@ log_dir: runs               # TensorBoard 日志根目录
 ckpt_dir: checkpoints       # checkpoint 输出目录
 
 # ── 基本训练参数（当前生效值）────────────────────────────────────────
-num_envs: 256                 # 并行环境数量
-total_steps: 500_000_000         # 总训练步数
-n_steps_per_rollout: 64    # 每轮 rollout 采集步数 T
+num_envs: 1024                # 并行环境数量
+total_steps: 300_000_000      # 总训练步数
+n_steps_per_rollout: 64       # 每轮 rollout 采集步数 T
 
 # ── 日志与 checkpoint ────────────────────────────────────────────────
-log_interval: 5             # 每 N 轮迭代打印日志
-checkpoint_interval: 100     # 每 N 轮迭代保存 checkpoint
+log_interval: 2             # 每 N 轮迭代打印日志
+checkpoint_interval: 50     # 每 N 轮迭代保存 checkpoint
 
 # ── PPO 算法超参（§2, §6, §7.1）──────────────────────────────────────
 ppo:
@@ -60,15 +60,14 @@ ppo:
   entropy_coef: 0.01        # 熵正则化系数 c_e
   value_coef: 0.5           # Critic 损失权重 c_v
   max_grad_norm: 1.0        # 全局梯度范数上限 g_max
-  actor_lr: 3.0e-4          # Actor 学习率
-  critic_lr: 3.0e-4         # Critic 学习率
-  num_mini_batches: 8       # Mini-batch 数量 N_mb
-  num_epochs: 4             # 优化轮数 K
+  actor_lr: 2.5e-4          # Actor 学习率
+  critic_lr: 2.5e-4         # Critic 学习率
+  num_mini_batches: 16      # Mini-batch 数量 N_mb
+  num_epochs: 3             # 优化轮数 K
   seq_length: 16            # TBPTT 截断长度 L
   normalize_advantages: true
 
 # ── 调试选项 ──────────────────────────────────────────────────────────
 debug:
-  visualize_detections: false  # 是否用 OpenCV 弹窗显示视觉检测结果（mask + bbox + 点云投影）
-  strict_mode: true           # 正式训练设 true → 缺 Isaac Lab 或视觉依赖时直接报错退出
+  strict_mode: true           # 正式训练设 true → 缺 Isaac Lab 时直接报错退出
                                # 本地开发设 false → 保持 placeholder 退化行为

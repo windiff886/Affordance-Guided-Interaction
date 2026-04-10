@@ -1,5 +1,10 @@
 """训练侧在线视觉缓存运行时。
 
+.. deprecated::
+    当前默认训练路径使用 ground-truth ``door_geometry(6D)`` 替代视觉 embedding，
+    本模块不再被默认入口引用。仅保留为历史实验与后续感知研究参考。
+    若未来需恢复视觉感知实验，应在独立实验配置或分支中接入。
+
 负责按固定频率刷新 ``door_embedding``，并把最近一次缓存结果注入
 actor / critic observation。当前实现支持两种模式：
 

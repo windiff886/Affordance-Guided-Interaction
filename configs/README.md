@@ -1,10 +1,11 @@
 # configs/ — 配置参数总览与审计报告
 
-> **审计日期**：2026-04-06
+> **审计日期**：2026-04-09
 >
-> 本文档对 6 个 YAML 配置文件的全部参数逐一追溯到源代码消费点，说明其含义与作用。
+> 本文档对 7 个 YAML 配置文件的全部参数逐一追溯到源代码消费点，说明其含义与作用。
 > 旧路径（VecDoorEnv）已删除，仅保留 GPU 批量并行路径（DoorPushEnv + DirectRLEnvAdapter）。
 > 训练入口默认会加载 `reward/default.yaml`，并通过 `train.py` 的 `_inject_reward_params()` 将奖励超参数覆盖写入 `DoorPushEnvCfg`；`DoorPushEnvCfg` 中保留同名默认值作为回退。
+> 可视化入口从 `visualization/default.yaml` 读取运行参数，生成 MP4 视频和/或逐帧图片。
 
 ---
 
@@ -18,8 +19,9 @@
 | `curriculum/default.yaml` | 3 | 100% |
 | `task/default.yaml` | 2 | 100% |
 | `reward/default.yaml` | 22 | 100% |
+| `visualization/default.yaml` | 14 | 100% |
 
-**整体**：65 个参数，全部被代码消费。
+**整体**：79 个参数，全部被代码消费。
 
 > **已恢复**: `reward/default.yaml`（22 参数）— 奖励超参数从 `DoorPushEnvCfg` 迁移到独立 YAML 配置文件，由 `train.py` 的 `_inject_reward_params()` 注入。
 > 数学公式参考见 `envs/Reward.md`。
@@ -28,16 +30,17 @@
 
 ## 2. 配置加载机制
 
-`scripts/train.py` 中的 `load_config()` 从 `configs/` 目录加载 6 个 YAML 文件，返回字典：
+`scripts/train.py` 中的 `load_config()` 从 `configs/` 目录加载 7 个 YAML 文件，返回字典：
 
 ```python
 cfg = {
-    "training":   ...,  # configs/training/default.yaml
-    "env":        ...,  # configs/env/default.yaml
-    "policy":     ...,  # configs/policy/default.yaml
-    "task":       ...,  # configs/task/default.yaml
-    "curriculum": ...,  # configs/curriculum/default.yaml
-    "reward":     ...,  # configs/reward/default.yaml
+    "training":      ...,  # configs/training/default.yaml
+    "env":           ...,  # configs/env/default.yaml
+    "policy":        ...,  # configs/policy/default.yaml
+    "task":          ...,  # configs/task/default.yaml
+    "curriculum":    ...,  # configs/curriculum/default.yaml
+    "reward":        ...,  # configs/reward/default.yaml
+    "visualization": ...,  # configs/visualization/default.yaml
 }
 ```
 
@@ -100,8 +103,9 @@ cfg = {
 
 | YAML 键 | 默认值 | 消费位置 | 含义 |
 |---------|--------|---------|------|
-| `debug.visualize_detections` | `false` | `train.py` → `PerceptionRuntime` → `AffordancePipelineConfig` → `AffordancePipeline` | 启用后在每次视觉编码时弹出 OpenCV 窗口，叠加显示分割 mask、bbox 和点云回投影 |
-| `debug.strict_mode` | `false` | `train.py`（物理引擎检查）、`PerceptionRuntime`（视觉管线检查） | 启用后，缺少 Isaac Lab 或视觉依赖时直接报错退出，而非静默退化为 placeholder。正式训练应设为 `true` |
+| `debug.strict_mode` | `true` | `train.py`（物理引擎检查） | 启用后，缺少 Isaac Lab 时直接报错退出，而非静默退化为 placeholder |
+
+> **已移除**：`debug.visualize_detections`（视觉调试开关）和 `debug.strict_mode` 中的视觉管线检查部分。当前默认训练不使用视觉感知，这些配置项已清理。
 
 ---
 
@@ -154,7 +158,7 @@ cfg = {
 
 | 阶段 | 上下文分布 | 门类型 | 学习目标 |
 |------|-----------|-------|---------|
-| Stage 1 | `none: 1.0` | push | 无持杯条件下学会基础视觉引导接触 |
+| Stage 1 | `none: 1.0` | push | 无持杯条件下学会基础推门接触 |
 | Stage 2 | `left_only: 0.5, right_only: 0.5` | push | 单臂持杯约束下学会稳定推门 |
 | Stage 3 | `none/left_only/right_only/both` 各 `0.25` | push | 最终混合分布，统一覆盖所有持杯组合 |
 
@@ -233,3 +237,58 @@ $$
 
 - Stage 1: `m_L = m_R = 0`，稳定性项整体关闭
 - Stage 2/3: 持杯侧稳定性项从 episode 起点开始全量生效
+
+---
+
+### 3.7 `visualization/default.yaml` — Rollout 可视化配置（14 参数）
+
+> **已新增**: rollout 可视化配置，用于 `scripts/rollout_demo.py` 入口脚本。
+> 所有可视化运行参数统一从本文件读取，不再依赖命令行覆盖。
+
+#### 运行时参数
+
+| YAML 键 | 默认值 | 消费位置 | 含义 |
+|---------|--------|---------|------|
+| `checkpoint` | `null` | `rollout_config.py` → `rollout_demo.py` | 模型 checkpoint 路径（相对项目根）；`null` 使用随机初始化策略 |
+| `device` | `cpu` | `rollout_config.py` → `rollout_demo.py` | 推理设备 |
+| `seed` | `42` | `rollout_config.py` → `rollout_demo.py` | 随机种子 |
+| `headless` | `true` | `rollout_config.py` → `rollout_demo.py` | 是否以无窗口模式启动 Isaac Sim |
+| `deterministic` | `true` | `rollout_config.py` → `rollout_demo.py` | 确定性/采样动作模式 |
+
+#### 上下文与回合
+
+| YAML 键 | 默认值 | 消费位置 | 含义 |
+|---------|--------|---------|------|
+| `contexts` | `[none, left_only, right_only, both]` | `rollout_config.py` → `rollout_demo.py` | 要渲染的杯子占用上下文列表 |
+| `episodes_per_context` | `1` | `rollout_config.py` → `rollout_demo.py` | 每个上下文运行的 episode 数 |
+
+#### 帧捕获与视频
+
+| YAML 键 | 默认值 | 消费位置 | 含义 |
+|---------|--------|---------|------|
+| `save_video` | `true` | `rollout_config.py` → `rollout_artifacts.py` | 是否生成 MP4 视频（需要 imageio[ffmpeg]） |
+| `save_frames` | `false` | `rollout_config.py` → `rollout_artifacts.py` | 是否保存逐帧图片 |
+| `frame_stride` | `1` | `rollout_config.py` → `rollout_artifacts.py` | 每隔 N 步捕获一帧 |
+| `video_fps` | `30` | `rollout_config.py` → `rollout_artifacts.py` | 输出视频帧率 |
+
+#### Artifact 输出
+
+| YAML 键 | 默认值 | 消费位置 | 含义 |
+|---------|--------|---------|------|
+| `output_root` | `artifacts/vis` | `rollout_config.py` → `rollout_artifacts.py` | artifact 输出根目录（相对项目根） |
+| `video_name_template` | `{checkpoint_stem}/{context}.mp4` | `rollout_artifacts.py` | 视频文件路径模板 |
+| `frames_dir_template` | `{checkpoint_stem}/{context}_frames` | `rollout_artifacts.py` | 帧目录路径模板 |
+
+#### Artifact 输出结构
+
+```
+artifacts/vis/
+  iter_010000/           ← checkpoint_stem
+    none.mp4             ← 单个 context 的视频
+    both.mp4
+    none_frames/         ← 单个 context 的帧目录
+      ep000_step00000.png
+      ep000_step00001.png
+    both_frames/
+      ...
+```

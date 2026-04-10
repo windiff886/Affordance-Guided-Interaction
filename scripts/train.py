@@ -62,6 +62,7 @@ def load_config(configs_dir: str | Path | None = None) -> dict[str, Any]:
         "task": configs_dir / "task/default.yaml",
         "curriculum": configs_dir / "curriculum/default.yaml",
         "reward": configs_dir / "reward/default.yaml",
+        "visualization": configs_dir / "visualization/default.yaml",
     }
 
     for key, path in config_files.items():
@@ -89,7 +90,7 @@ def _resolve_configs_root(configs_dir: str | Path | None) -> Path:
     if path.is_file():
         return path.parents[1]
 
-    if path.name in {"training", "env", "policy", "task", "curriculum", "reward"}:
+    if path.name in {"training", "env", "policy", "task", "curriculum", "reward", "visualization"}:
         default_yaml = path / "default.yaml"
         if default_yaml.exists():
             return path.parent
@@ -189,8 +190,8 @@ def build_env_cfg(
         env_cfg.decimation = int(env_cfg_yaml["decimation"])
         env_cfg.sim.render_interval = env_cfg.decimation
 
-    if not enable_cameras:
-        env_cfg.scene.tiled_camera = None
+    # NOTE: tiled_camera 已从 DoorPushSceneCfg 默认配置中移除，
+    # 不再需要 env_cfg.scene.tiled_camera = None 的守卫逻辑。
 
     task_cfg = cfg.get("task", {})
     if "door_angle_target" in task_cfg:

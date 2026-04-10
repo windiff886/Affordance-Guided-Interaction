@@ -52,10 +52,6 @@ def main() -> int:
     from affordance_guided_interaction.training.evaluation import (
         summarize_evaluation_outcomes,
     )
-    from affordance_guided_interaction.training.perception_runtime import (
-        PerceptionRuntime,
-    )
-
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
@@ -63,7 +59,7 @@ def main() -> int:
     cfg = load_config(args.config)
     simulation_app = launch_simulation_app(
         headless=resolve_headless_mode(args.headless, os.environ),
-        enable_cameras=True,
+        enable_cameras=False,
         import_error_message=(
             "未检测到 isaacsim 运行时，evaluate.py 需要在 Isaac Sim / Isaac Lab 运行时下执行。"
         ),
@@ -75,10 +71,8 @@ def main() -> int:
         checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
         actor.load_state_dict(checkpoint["actor_state_dict"])
 
-    runtime = PerceptionRuntime(refresh_interval=4, embedding_dim=768)
-
     # 使用 GPU 环境 (num_envs=1 用于评估)
-    env_cfg = build_env_cfg(cfg, n_envs=1, device=str(device), seed=args.seed)
+    env_cfg = build_env_cfg(cfg, n_envs=1, device=str(device), seed=args.seed, enable_cameras=False)
     _direct_env = DoorPushEnv(cfg=env_cfg)
     envs = DirectRLEnvAdapter(_direct_env)
 
@@ -97,13 +91,6 @@ def main() -> int:
                     door_types=["push"],
                     left_occupied_list=[left_occupied],
                     right_occupied_list=[right_occupied],
-                )
-                runtime.reset(1)
-                actor_obs_list, critic_obs_list = runtime.prepare_batch(
-                    actor_obs_list=actor_obs_list,
-                    critic_obs_list=critic_obs_list,
-                    visual_observations=envs.get_visual_observations(),
-                    force_refresh_mask=[True],
                 )
                 actor_obs = actor_obs_list[0]
 
@@ -129,13 +116,6 @@ def main() -> int:
                     )
                     done = bool(dones[0])
                     last_info = infos[0]
-
-                    actor_obs_list, critic_obs_list = runtime.prepare_batch(
-                        actor_obs_list=actor_obs_list,
-                        critic_obs_list=critic_obs_list,
-                        visual_observations=envs.get_visual_observations(),
-                        force_refresh_mask=[done],
-                    )
                     actor_obs = actor_obs_list[0]
 
                 outcomes.append(

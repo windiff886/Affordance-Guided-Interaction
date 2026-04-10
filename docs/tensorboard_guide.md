@@ -96,7 +96,7 @@ env_steps_per_s = steps_this_iter / rollout_s
 | `update_s` 很大 | PPO 更新有问题（不太可能） |
 | `train/fps` 远小于 `timing/env_steps_per_s` | PPO 更新占了大量时间 |
 
-> **注**：视觉感知管线（相机图像获取、语义分割、点云构建、Point-MAE 编码）的子计时（`vision_s`、`camera_fetch_s`、`segmentation_s`、`pointcloud_s`、`encoder_s`）在 `rollout_collector.py` 内部已实现计时，但当前版本**未暴露到 TensorBoard**。这些管线仅在 `enable_cameras=True` 时启用，而当前训练配置中 `enable_cameras=False`，使用仿真器 ground truth 的 door geometry（6维）替代视觉 embedding。
+> **注**：视觉感知管线的子计时（`vision_s`、`camera_fetch_s` 等）为历史实验代码残留，仅在显式启用 `perception_runtime` 时有效。当前默认训练路径使用仿真 ground truth 的 door geometry（6 维），不涉及任何视觉管线计时。
 
 ### `collect/` — 环境交互指标
 
@@ -150,7 +150,7 @@ env_steps_per_s = steps_this_iter / rollout_s
 | **window_mean** | 最近 N 个 episode 的滑动窗口平均成功率 |
 
 课程学习分三个阶段，逐步增加持杯难度：
-- **Stage 1** — 无杯推门（学习基础视觉引导）
+- **Stage 1** — 无杯推门（学习基础推门接触）
 - **Stage 2** — 单臂持杯推门（left_only / right_only 各 50%）
 - **Stage 3** — 混合分布（none / left_only / right_only / both 各 25%）
 
