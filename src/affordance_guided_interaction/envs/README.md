@@ -24,7 +24,7 @@ envs 层是整个系统中**唯一直接与 Isaac Lab 物理引擎交互的层**
          │  _reset_idx()           选择性重置 + 持杯初始化   │
          │  _pre_physics_step()    力矩注入                  │
          │  _get_observations()    Actor(96D)/Critic(109D)  │
-         │  _get_rewards()         12-term 奖励              │
+         │  _get_rewards()         11-term 奖励              │
          │  _get_dones()           终止判定                  │
          └─────────────────────────────────────────────────┘
          │                                                  │
@@ -35,7 +35,7 @@ envs 层是整个系统中**唯一直接与 Isaac Lab 物理引擎交互的层**
          │  GPU tensor 四元数 / 坐标变换工具                 │
          │                                                  │
          │  Reward.md                                       │
-         │  12-term 奖励函数的数学参考文档                   │
+         │  11-term 奖励函数的数学参考文档                   │
          └──────────────────────────────────────────────────┘
 ```
 
@@ -49,7 +49,7 @@ envs 层是整个系统中**唯一直接与 Isaac Lab 物理引擎交互的层**
 | `door_push_env_cfg.py` | **DoorPushEnvCfg** + **DoorPushSceneCfg** — 声明式 `@configclass` 配置 |
 | `direct_rl_env_adapter.py` | **DirectRLEnvAdapter** — 将 tensor 接口包装为 `VecEnvProtocol`，桥接 RolloutCollector |
 | `batch_math.py` | GPU 批量四元数运算、坐标系变换、基座位姿采样 |
-| `Reward.md` | 12-term 奖励函数的数学定义与超参参考 |
+| `Reward.md` | 11-term 奖励函数的数学定义与超参参考 |
 | `__init__.py` | 对外导出 `DoorPushEnv`、`DoorPushEnvCfg`、`DoorPushSceneCfg`、`DirectRLEnvAdapter` |
 
 ---
@@ -66,7 +66,6 @@ envs 层是整个系统中**唯一直接与 Isaac Lab 物理引擎交互的层**
 | 推门 | `ArticulationCfg` | `{ENV_REGEX_NS}/Door` | 单铰链门，无主动力矩，阻尼可随机化 |
 | 左杯体 | `RigidObjectCfg` | `{ENV_REGEX_NS}/CupLeft` | 预生成在远处，reset 时按 occupancy teleport |
 | 右杯体 | `RigidObjectCfg` | `{ENV_REGEX_NS}/CupRight` | 同上 |
-| 接触传感器 | `ContactSensorCfg` | `{ENV_REGEX_NS}/Robot/.*` | 覆盖机器人全身，用于自碰撞检测 |
 | 地面 + 照明 | `AssetBaseCfg` | 全局 | `GroundPlaneCfg` + `DomeLightCfg` |
 
 `{ENV_REGEX_NS}` 是 Isaac Lab Cloner 的占位符，Cloner 会将整棵场景子树自动复制到 `/World/envs/env_0`、`env_1`、……，实现 GPU 批量并行。
@@ -78,8 +77,7 @@ envs 层是整个系统中**唯一直接与 Isaac Lab 物理引擎交互的层**
 核心生命周期：
 
 ```
-_setup_scene()        ──▶  向 InteractiveScene 注册 5 种资产
-                            Cloner 自动复制
+_setup_scene()        ──▶  场景实体由配置声明并由 Cloner 自动复制
 
 _reset_idx(env_ids)   ──▶  采样域随机化参数
                             写入 base pose + 关节默认值
@@ -88,7 +86,7 @@ _reset_idx(env_ids)   ──▶  采样域随机化参数
                             应用物理参数（质量 / 阻尼）
                             清零 per-env 状态
 
-_pre_physics_step()   ──▶  缓存 raw action（用于 §6.4 力矩超限惩罚）
+_pre_physics_step()   ──▶  缓存 raw action（用于 §6.3 力矩超限惩罚）
                             clamp + 注入步级噪声
                             写入 arm 关节 effort target
 
@@ -101,7 +99,7 @@ _get_observations()   ──▶  读取关节状态 + body 状态
 
 _get_rewards()        ──▶  §4 任务奖励（角度增量 + 一次性成功 bonus）
                             §5 稳定性奖励（7 子项 × 双臂，mask 条件化）
-                            §6 安全惩罚（5 子项，始终激活）
+                            §6 安全惩罚（4 子项，始终激活）
 
 _get_dones()          ──▶  杯体脱落 → terminated
                             门角度达标 → terminated
@@ -159,7 +157,7 @@ Critic 观测 = Actor 观测（无噪声版） + privileged 信息：
 
 执行流程：
 
-1. 缓存 raw action（用于 §6.4 力矩超限惩罚）
+1. 缓存 raw action（用于 §6.3 力矩超限惩罚）
 2. 硬裁剪至 $[-\tau_{\text{limit}}, \tau_{\text{limit}}]$（默认 33.5 N·m，来自 URDF effort_limit）
 3. 注入步级高斯噪声 $\sigma_a$（训练时）
 4. 写入 arm 关节 effort target（gripper 和 wheel 关节不受策略控制）
@@ -170,7 +168,7 @@ Critic 观测 = Actor 观测（无噪声版） + privileged 信息：
 
 ## 6. 奖励函数概要
 
-DoorPushEnv 内置完整的 12-term 奖励计算（详见 `Reward.md`）。总体公式：
+DoorPushEnv 内置完整的 11-term 奖励计算（详见 `Reward.md`）。总体公式：
 
 $$
 r_t = r_{\text{task}} + m_L \cdot r_{\text{stab}}^L + m_R \cdot r_{\text{stab}}^R - r_{\text{safe}}
@@ -197,11 +195,10 @@ $$
 | 力矩平滑项 | 二次 penalty | 抑制力矩抖动 |
 | 力矩正则项 | 二次 penalty | 约束力矩幅值 |
 
-### §6 安全惩罚（5 项，始终激活）
+### §6 安全惩罚（4 项，始终激活）
 
 | 子项 | 触发条件 |
 |---|---|
-| 自碰撞 | 交叉分组 body 对同时有力 → 固定惩罚 $\beta_{\text{self}}$ |
 | 关节限位逼近 | $\|q_i - q_i^c\| > \mu \cdot \delta_i$ → 二次惩罚 |
 | 关节速度过大 | $\|\dot{q}_i\| > \mu \cdot \dot{q}_i^{\max}$ → 二次惩罚 |
 | 力矩超限 | raw action 超出 effort_limit → 二次惩罚 |
@@ -318,7 +315,7 @@ door_normal_in_base  # (N, 3)  门叶法向量在 base_link 系下的方向
 
 - **任务奖励 (§4)**：`rew_w_delta`, `rew_alpha`, `rew_k_decay`, `rew_w_open`
 - **稳定性奖励 (§5)**：`rew_w_zero_acc`, `rew_lambda_acc`, `rew_w_zero_ang`, `rew_lambda_ang`, `rew_w_acc`, `rew_w_ang`, `rew_w_tilt`, `rew_w_smooth`, `rew_w_reg`
-- **安全惩罚 (§6)**：`rew_beta_self`, `rew_beta_limit`, `rew_mu`, `rew_beta_vel`, `rew_beta_torque`, `rew_w_drop`
+- **安全惩罚 (§6)**：`rew_beta_limit`, `rew_mu`, `rew_beta_vel`, `rew_beta_torque`, `rew_w_drop`
 
 具体数值和数学定义见 `Reward.md`。
 

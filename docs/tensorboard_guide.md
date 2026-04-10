@@ -135,7 +135,7 @@ env_steps_per_s = steps_this_iter / rollout_s
 
 - `reward_terms/task/*`：`delta`、`open_bonus`
 - `reward_terms/stab_left/*` 与 `reward_terms/stab_right/*`：`zero_acc`、`zero_ang`、`acc`、`ang`、`tilt`、`smooth`、`reg`
-- `reward_terms/safe/*`：`self_collision`、`joint_limit`、`joint_vel`、`torque_limit`、`cup_drop`
+- `reward_terms/safe/*`：`joint_limit`、`joint_vel`、`torque_limit`、`cup_drop`
 
 **解释时要注意符号：**
 - `reward/task`、`reward/stab_left`、`reward/stab_right` 和对应的 `reward_terms/stab_*/*` / `reward_terms/task/*` 都按进入总奖励的有符号贡献记录。

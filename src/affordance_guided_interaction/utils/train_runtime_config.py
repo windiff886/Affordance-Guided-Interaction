@@ -16,6 +16,7 @@ class TrainRuntimeConfig:
     log_dir: Path
     ckpt_dir: Path
     num_envs: int | None
+    env_variant: str
 
 
 def resolve_train_runtime_config(
@@ -25,6 +26,7 @@ def resolve_train_runtime_config(
 ) -> TrainRuntimeConfig:
     """Resolve train runtime settings from the merged YAML config."""
     t_cfg = cfg.get("training", {})
+    env_variant = _normalize_optional_str(t_cfg.get("env_variant")) or "full"
 
     return TrainRuntimeConfig(
         headless=bool(t_cfg.get("headless", False)),
@@ -36,6 +38,7 @@ def resolve_train_runtime_config(
             project_root, t_cfg.get("ckpt_dir", "checkpoints")
         ),
         num_envs=_normalize_optional_int(t_cfg.get("num_envs")),
+        env_variant=env_variant,
     )
 
 

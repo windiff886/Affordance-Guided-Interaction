@@ -7,7 +7,6 @@
     - 双臂移动机器人 (UniDingo Dual-Arm Z1)
     - 推门 (minimal_push_door)
     - 左/右杯体（预生成，按课程 occupancy 启停）
-    - 接触传感器（机器人全身）
     - 地面平面 + 照明
 """
 
@@ -20,7 +19,6 @@ from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg, RigidObjectCfg
 from isaaclab.envs import DirectRLEnvCfg
 from isaaclab.scene import InteractiveSceneCfg
-from isaaclab.sensors import ContactSensorCfg
 from isaaclab.sensors import TiledCameraCfg  # optional, kept for future visual experiments
 from isaaclab.utils import configclass
 
@@ -34,6 +32,7 @@ _THIS_DIR = Path(__file__).resolve().parent
 _PROJECT_ROOT = _THIS_DIR.parents[2]  # src/affordance_.../envs → 项目根
 
 _ROBOT_USD = str(_PROJECT_ROOT / "assets/robot/usd/uni_dingo_dual_arm.usd")
+_LITE_ROBOT_USD = str(_PROJECT_ROOT / "assets/robot/usd/uni_dingo_lite.usd")
 _DOOR_USD = str(_PROJECT_ROOT / "assets/minimal_push_door/solid_push_door.usda")
 _ROOM_USD = str(_PROJECT_ROOT / "assets/minimal_push_door/room_shell.usda")
 _CUP_USD = str(_PROJECT_ROOT / "assets/grasp_objects/cup/carry_cup.usda")
@@ -181,7 +180,6 @@ class DoorPushSceneCfg(InteractiveSceneCfg):
                 solver_position_iteration_count=8,
                 solver_velocity_iteration_count=4,
             ),
-            activate_contact_sensors=True,
         ),
         init_state=ArticulationCfg.InitialStateCfg(
             # 标称初始位置：推板正前方，在采样范围中心
@@ -282,12 +280,6 @@ class DoorPushSceneCfg(InteractiveSceneCfg):
         ),
     )
 
-    # ── 接触传感器（机器人全身，用于碰撞检测）──────────────────────
-    contact_sensor: ContactSensorCfg = ContactSensorCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/uni_dingo_dual_arm/.*",
-        update_period=0.0,  # 每个物理步都更新
-        history_length=4,
-    )
 
     # NOTE: tiled_camera 已从默认场景移除。当前训练使用 door_geometry(6D) 作为
     # 唯一门相关输入，不需要相机传感器。若未来实验需恢复，可在子配置中重新声明
@@ -309,9 +301,15 @@ class DoorPushEnvCfg(DirectRLEnvCfg):
     # ── 场景 ────────────────────────────────────────────────────────
     ui_window_class_type = DirectRLEnvWindow
 
+    sim: sim_utils.SimulationCfg = sim_utils.SimulationCfg(
+        create_stage_in_memory=True,
+    )
+
     scene: DoorPushSceneCfg = DoorPushSceneCfg(
         num_envs=64,
         env_spacing=10.0,
+        replicate_physics=True,
+        clone_in_fabric=True,
     )
 
     # ── 仿真步进 ────────────────────────────────────────────────────
@@ -387,7 +385,6 @@ class DoorPushEnvCfg(DirectRLEnvCfg):
     rew_w_reg: float = 0.01
 
     # 安全惩罚 (§6)
-    rew_beta_self: float = 5.0
     rew_beta_limit: float = 1.0
     rew_mu: float = 0.9
     rew_beta_vel: float = 0.5
@@ -397,3 +394,52 @@ class DoorPushEnvCfg(DirectRLEnvCfg):
     # ── 门几何观测 ────────────────────────────────────────────────────
     door_geometry_dim: int = 6  # center(3) + normal(3)
     visual_refresh_interval: int = 4  # deprecated, kept for config compat
+
+
+@configclass
+class DoorPushLiteSceneCfg(DoorPushSceneCfg):
+    """门-杯-双臂训练轻量版场景。
+
+    Phase 2 轻量化：
+    - 使用精简版机器人 USD（uni_dingo_lite.usd，无轮子/云台/相机/支架）
+    - 删除 room
+    - 固定机器人 root
+    - 仅保留双臂 actuator
+    - 维持现有 DoorPushEnv 逻辑兼容
+
+    注意：uni_dingo_lite.usd 需要先通过
+    ``python assets/robot/scripts/convert_lite_urdf_to_usd.py``
+    从 uni_dingo_lite.urdf 转换生成。
+    如果 lite USD 尚未生成，会回退到完整机器人 USD。
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.room = None
+        # 切换到轻量版机器人 USD（如文件存在）
+        if Path(_LITE_ROBOT_USD).exists():
+            self.robot.spawn.usd_path = _LITE_ROBOT_USD
+        self.robot.spawn.articulation_props.fix_root_link = True
+        self.robot.actuators.pop("wheels", None)
+        self.robot.actuators.pop("pan_tilt", None)
+        self.robot.init_state.joint_pos.pop(".*wheel", None)
+        self.robot.init_state.joint_pos.pop("pan_tilt_.*", None)
+
+
+@configclass
+class DoorPushLiteEnvCfg(DoorPushEnvCfg):
+    """固定底座双臂持杯推门训练配置。"""
+
+    scene: DoorPushLiteSceneCfg = DoorPushLiteSceneCfg(
+        num_envs=64,
+        env_spacing=4.0,
+        replicate_physics=True,
+        clone_in_fabric=True,
+    )
+
+    def __post_init__(self):
+        super().__post_init__()
+        # 固定在当前标称门前位姿，避免把底盘采样当作训练内容。
+        self.base_radius_range = (0.74, 0.74)
+        self.base_sector_half_angle_deg = 0.0
+        self.base_yaw_delta_deg = 0.0

@@ -9,49 +9,33 @@
 #
 # 所有运行参数都在本文件中修改，不再依赖命令行覆盖。
 #
-# 4060 Laptop 本地验证建议（手动切换下面的生效值）：
-# headless: false
-# device: null
-# seed: 42
-# resume: null
-# log_dir: runs
-# ckpt_dir: checkpoints
-# num_envs: 2
-# total_steps: 50_000
-# n_steps_per_rollout: 128
-# checkpoint_interval: 100
+# ── 快捷切换说明 ─────────────────────────────────────────────────────
+# 只需要修改下面这 1 行里的 profile 引用：
+#   <<: [*runtime_defaults, *profile_env1024]
 #
-# A100 正式训练建议（手动切换下面的生效值）：
-# headless: true
-# device: cuda
-# seed: 42
-# resume: null
-# log_dir: runs
-# ckpt_dir: checkpoints
-# num_envs: 64
-# total_steps: 10_000_000
-# n_steps_per_rollout: 128
-# checkpoint_interval: 50
+# 可选 profile：
+#   *profile_env256
+#   *profile_env512
+#   *profile_env1024
+#   *profile_env2048
+#   *profile_env4096
 #
-# ── 运行时参数（当前生效值）──────────────────────────────────────────
-headless: true             # 是否以无窗口模式启动仿真
-device: cuda                # null 表示自动选择 cuda/cpu
-seed: 42                    # 全局随机种子
-resume: null                # 恢复训练的 checkpoint 路径；null 表示从头开始
-log_dir: runs               # TensorBoard 日志根目录
-ckpt_dir: checkpoints       # checkpoint 输出目录
+# 说明：
+# 1. runtime_defaults 提供公共运行时参数。
+# 2. 每个 profile 提供一整套可直接生效的训练参数。
+# 3. 4096 档为了控制单轮 batch，额外把 n_steps_per_rollout 调成 16。
+# 4. 当前默认激活的是 1024 档；切换时只改 merge 行里的锚点即可。
 
-# ── 基本训练参数（当前生效值）────────────────────────────────────────
-num_envs: 1024                # 并行环境数量
-total_steps: 300_000_000      # 总训练步数
-n_steps_per_rollout: 64       # 每轮 rollout 采集步数 T
+runtime_defaults: &runtime_defaults
+  headless: true             # 是否以无窗口模式启动仿真
+  device: cuda              # null 表示自动选择 cuda/cpu
+  seed: 42                  # 全局随机种子
+  resume: null              # 恢复训练的 checkpoint 路径；null 表示从头开始
+  log_dir: runs             # TensorBoard 日志根目录
+  ckpt_dir: checkpoints     # checkpoint 输出目录
+  env_variant: lite       # full | lite，控制训练使用的环境变体
 
-# ── 日志与 checkpoint ────────────────────────────────────────────────
-log_interval: 2             # 每 N 轮迭代打印日志
-checkpoint_interval: 50     # 每 N 轮迭代保存 checkpoint
-
-# ── PPO 算法超参（§2, §6, §7.1）──────────────────────────────────────
-ppo:
+ppo_common: &ppo_common
   gamma: 0.99               # 折扣因子 γ
   lam: 0.95                 # GAE 偏差-方差权衡 λ
   clip_eps: 0.2             # PPO-Clip 策略比率裁剪参数 ε
@@ -60,14 +44,79 @@ ppo:
   entropy_coef: 0.01        # 熵正则化系数 c_e
   value_coef: 0.5           # Critic 损失权重 c_v
   max_grad_norm: 1.0        # 全局梯度范数上限 g_max
-  actor_lr: 2.5e-4          # Actor 学习率
-  critic_lr: 2.5e-4         # Critic 学习率
-  num_mini_batches: 16      # Mini-batch 数量 N_mb
-  num_epochs: 3             # 优化轮数 K
   seq_length: 16            # TBPTT 截断长度 L
   normalize_advantages: true
 
+profiles:
+  env_256: &profile_env256
+    num_envs: 256
+    total_steps: 500_000_000
+    n_steps_per_rollout: 64
+    log_interval: 5
+    checkpoint_interval: 100
+    ppo:
+      <<: *ppo_common
+      actor_lr: 3.0e-4
+      critic_lr: 3.0e-4
+      num_mini_batches: 8
+      num_epochs: 4
+
+  env_512: &profile_env512
+    num_envs: 512
+    total_steps: 400_000_000
+    n_steps_per_rollout: 64
+    log_interval: 3
+    checkpoint_interval: 75
+    ppo:
+      <<: *ppo_common
+      actor_lr: 3.0e-4
+      critic_lr: 3.0e-4
+      num_mini_batches: 16
+      num_epochs: 4
+
+  env_1024: &profile_env1024
+    num_envs: 1024
+    total_steps: 300_000_000
+    n_steps_per_rollout: 64
+    log_interval: 2
+    checkpoint_interval: 50
+    ppo:
+      <<: *ppo_common
+      actor_lr: 2.5e-4
+      critic_lr: 2.5e-4
+      num_mini_batches: 16
+      num_epochs: 3
+
+  env_2048: &profile_env2048
+    num_envs: 2048
+    total_steps: 200_000_000
+    n_steps_per_rollout: 64
+    log_interval: 1
+    checkpoint_interval: 25
+    ppo:
+      <<: *ppo_common
+      actor_lr: 2.0e-4
+      critic_lr: 2.0e-4
+      num_mini_batches: 32
+      num_epochs: 3
+
+  env_4096: &profile_env4096
+    num_envs: 4096
+    total_steps: 300_000_000
+    n_steps_per_rollout: 16
+    log_interval: 1
+    checkpoint_interval: 20
+    ppo:
+      <<: *ppo_common
+      actor_lr: 2.0e-4
+      critic_lr: 2.0e-4
+      num_mini_batches: 16
+      num_epochs: 3
+
+# ── 当前生效值（切换这里即可）────────────────────────────────────────
+<<: [*runtime_defaults, *profile_env4096]
+
 # ── 调试选项 ──────────────────────────────────────────────────────────
 debug:
-  strict_mode: true           # 正式训练设 true → 缺 Isaac Lab 时直接报错退出
-                               # 本地开发设 false → 保持 placeholder 退化行为
+  strict_mode: true         # 正式训练设 true → 缺 Isaac Lab 时直接报错退出
+                             # 本地开发设 false → 保持 placeholder 退化行为

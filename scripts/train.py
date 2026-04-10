@@ -170,11 +170,20 @@ def build_env_cfg(
     device: str | None = None,
     seed: int | None = None,
     enable_cameras: bool = True,
+    variant: str = "full",
 ):
     """基于 YAML 配置构建 DoorPushEnvCfg。"""
-    from affordance_guided_interaction.envs.door_push_env_cfg import DoorPushEnvCfg
+    from affordance_guided_interaction.envs.door_push_env_cfg import (
+        DoorPushEnvCfg,
+        DoorPushLiteEnvCfg,
+    )
 
-    env_cfg = DoorPushEnvCfg()
+    if variant == "lite":
+        env_cfg = DoorPushLiteEnvCfg()
+    elif variant == "full":
+        env_cfg = DoorPushEnvCfg()
+    else:
+        raise ValueError(f"Unsupported env variant: {variant}")
     env_cfg.scene.num_envs = int(n_envs)
     env_cfg.sim.render_interval = int(env_cfg.decimation)
 
@@ -231,7 +240,6 @@ _REWARD_PARAM_MAP: dict[str, dict[str, str]] = {
         "w_reg": "rew_w_reg",
     },
     "safety": {
-        "beta_self": "rew_beta_self",
         "beta_limit": "rew_beta_limit",
         "mu": "rew_mu",
         "beta_vel": "rew_beta_vel",
@@ -431,6 +439,7 @@ def main() -> int:
     print(f"   每轮采集步数: {n_steps_per_rollout}")
     print(f"   无头模式: {headless}")
     print(f"   随机种子: {runtime_cfg.seed}")
+    print(f"   环境变体: {runtime_cfg.env_variant}")
 
     simulation_app = launch_simulation_app(
         headless=headless,
@@ -454,6 +463,7 @@ def main() -> int:
         device=str(device),
         seed=runtime_cfg.seed,
         enable_cameras=enable_cameras,
+        variant=runtime_cfg.env_variant,
     )
     _direct_env = DoorPushEnv(cfg=env_cfg)
     envs = DirectRLEnvAdapter(_direct_env)

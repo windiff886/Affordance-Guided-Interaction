@@ -23,7 +23,6 @@ from torch import Tensor
 
 from isaaclab.assets import Articulation, RigidObject
 from isaaclab.envs import DirectRLEnv
-from isaaclab.sensors import ContactSensor
 
 from .door_push_env_cfg import (
     DoorPushEnvCfg,
@@ -172,8 +171,6 @@ class DoorPushEnv(DirectRLEnv):
         # L12: 每步在 _get_observations() 中缓存，供 _get_rewards/_get_dones 共用
         self._cached_cup_dropped = torch.zeros(N, dtype=torch.bool, device=dev)
 
-        # 自碰撞检测分组索引（一次性解析）
-        self._self_collision_groups = self._resolve_collision_groups(robot)
 
     # ═══════════════════════════════════════════════════════════════════
     # 场景装配（由 Cloner 调用）
@@ -189,7 +186,7 @@ class DoorPushEnv(DirectRLEnv):
 
     def _pre_physics_step(self, actions: Tensor) -> None:
         """将策略输出的力矩写入关节 — 批量操作所有 env。"""
-        # 缓存原始动作（clip 前），用于力矩超限惩罚 §6.4
+        # 缓存原始动作（clip 前），用于力矩超限惩罚 §6.3
         self._cached_raw_action = actions.clone()
 
         # 力矩裁剪
@@ -487,11 +484,8 @@ class DoorPushEnv(DirectRLEnv):
                 r_stab_right = r_stab_side
 
         # ══════════════════════════════════════════════════════════════
-        # §6 安全惩罚：5 子项（正惩罚量）
+        # §6 安全惩罚：4 子项（正惩罚量）
         # ══════════════════════════════════════════════════════════════
-        self_collision = self._compute_batch_self_collision()  # (N,) bool
-        r_safe_self_collision = self_collision.float() * self.cfg.rew_beta_self
-
         joint_pos = robot.data.joint_pos[:, self._arm_joint_ids]  # (N, 12)
         if hasattr(robot.data, "soft_joint_pos_limits"):
             joint_limits = robot.data.soft_joint_pos_limits[0, self._arm_joint_ids]  # (12, 2)
@@ -527,15 +521,13 @@ class DoorPushEnv(DirectRLEnv):
         r_safe_cup_drop = cup_dropped.float() * self.cfg.rew_w_drop
 
         r_safe = (
-            r_safe_self_collision
-            + r_safe_joint_limit
+            r_safe_joint_limit
             + r_safe_joint_vel
             + r_safe_torque_limit
             + r_safe_cup_drop
         )
 
         reward_info["safe"] = r_safe
-        reward_info["safe/self_collision"] = r_safe_self_collision
         reward_info["safe/joint_limit"] = r_safe_joint_limit
         reward_info["safe/joint_vel"] = r_safe_joint_vel
         reward_info["safe/torque_limit"] = r_safe_torque_limit
@@ -885,71 +877,6 @@ class DoorPushEnv(DirectRLEnv):
         ).squeeze(-1)  # (N, 3)
         tilt_xy = g_local[:, :2]  # (N, 2)
         return tilt_xy.norm(dim=-1, keepdim=True), tilt_xy  # (N, 1), (N, 2)
-
-    def _resolve_collision_groups(
-        self, robot: Articulation
-    ) -> list[tuple[list[int], list[int]]]:
-        """一次性解析自碰撞检测分组的 body 索引。
-
-        Returns
-        -------
-        list of (group_a_indices, group_b_indices)
-        """
-        body_names = robot.body_names
-
-        left_arm_links = {
-            "left_link00", "left_link01", "left_link02",
-            "left_link03", "left_link04", "left_link05", "left_link06",
-            "left_gripperStator", "left_gripperMover",
-        }
-        right_arm_links = {
-            "right_link00", "right_link01", "right_link02",
-            "right_link03", "right_link04", "right_link05", "right_link06",
-            "right_gripperStator", "right_gripperMover",
-        }
-        base_links = {"base_link"}
-
-        def _name_to_indices(names: set[str]) -> list[int]:
-            return [i for i, n in enumerate(body_names) if n in names]
-
-        left_ids = _name_to_indices(left_arm_links)
-        right_ids = _name_to_indices(right_arm_links)
-        base_ids = _name_to_indices(base_links)
-
-        groups = []
-        if left_ids and right_ids:
-            groups.append((left_ids, right_ids))
-        if left_ids and base_ids:
-            groups.append((left_ids, base_ids))
-        if right_ids and base_ids:
-            groups.append((right_ids, base_ids))
-        return groups
-
-    def _compute_batch_self_collision(self) -> Tensor:
-        """检测自碰撞 — 使用 contact sensor 的交叉分组方法。
-
-        NOTE: 这是一个近似检测。检查两个 body 分组是否*同时*有接触力，
-        作为自碰撞的代理指标。较高的力阈值（1.0N）减少环境接触的误报。
-
-        Returns
-        -------
-        (N,) bool — 每个环境是否发生自碰撞
-        """
-        contact_sensor: ContactSensor = self.scene["contact_sensor"]
-        # net_forces_w: (N, num_bodies, 3)
-        net_forces = contact_sensor.data.net_forces_w
-
-        # 使用较高的力阈值减少误报（地面接触、杯体接触等）
-        force_mag = net_forces.norm(dim=-1)  # (N, num_bodies)
-        active = force_mag > 1.0  # (N, num_bodies) bool
-
-        result = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        for group_a_ids, group_b_ids in self._self_collision_groups:
-            a_active = active[:, group_a_ids].any(dim=-1)  # (N,)
-            b_active = active[:, group_b_ids].any(dim=-1)  # (N,)
-            result = result | (a_active & b_active)
-
-        return result
 
     def _check_cup_dropped(self) -> Tensor:
         """检测杯体是否脱落 — 通过 cup-EE 距离阈值判定。

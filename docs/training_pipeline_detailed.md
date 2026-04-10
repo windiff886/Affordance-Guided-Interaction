@@ -48,7 +48,6 @@
 |------|------|
 | 关节/body 索引解析 | 一次性从 `Articulation` 中查找 12 个臂关节 (`ARM_JOINT_NAMES`)、2 个 gripper 关节、`base_link`/`left_gripper_link`/`right_gripper_link` body 索引、门铰链关节索引 |
 | Per-env 状态 tensor | 分配 `(N, ...)` 形状的零值 tensor：`_prev_action`、`_left_occupied`/`_right_occupied`、`_step_count`、`_prev_door_angle`、`_already_succeeded`、域随机化参数缓存、EE 速度缓存 |
-| 自碰撞分组 | 解析左臂/右臂/底座三组 body 索引，建立交叉碰撞检测分组 |
 
 环境不持有独立的子组件实例 — 所有逻辑（观测构建、奖励计算、终止判定、接触检测、杯体脱落判定）都作为 `DoorPushEnv` 的方法直接实现。
 
@@ -70,9 +69,6 @@ class DoorPushSceneCfg(InteractiveSceneCfg):
     )
     cup_right: RigidObjectCfg = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/CupRight", ...
-    )
-    contact_sensor: ContactSensorCfg = ContactSensorCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/.*", ...
     )
 ```
 
@@ -329,7 +325,7 @@ DoorPushEnv._reset_idx(env_ids)
 ```
 actions (N, 12) 策略输出的力矩
   │
-  ├── 缓存原始动作（clip 前），用于力矩超限惩罚 §6.4
+  ├── 缓存原始动作（clip 前），用于力矩超限惩罚 §6.3
   ├── 力矩裁剪到 [-effort_limit, +effort_limit]
   ├── 注入步级动作噪声 ε_a (σ = action_noise_std)
   ├── 重新裁剪以保证安全
@@ -369,7 +365,7 @@ actions (N, 12) 策略输出的力矩
 
 #### 4.2.3 `_get_rewards()` — 奖励计算
 
-奖励由 12 个子项组成，按任务/稳定性/安全三类组织：
+奖励由 11 个子项组成，按任务/稳定性/安全三类组织：
 
 $$r = r_\text{task} + r_\text{stab} - r_\text{safe}$$
 
@@ -392,15 +388,14 @@ $$r = r_\text{task} + r_\text{stab} - r_\text{safe}$$
 | 5.6 | 力矩平滑惩罚 | $-w_\text{smooth} \cdot \|\Delta\tau\|^2$ |
 | 5.7 | 力矩正则惩罚 | $-w_\text{reg} \cdot \|\tau\|^2$ |
 
-**§6 安全惩罚** (5 子项)：
+**§6 安全惩罚** (4 子项)：
 
 | 编号 | 子项 | 公式 |
 |------|------|------|
-| 6.1 | 自碰撞 | $\beta_\text{self} \cdot \mathbb{1}[\text{collision}]$ |
-| 6.2 | 关节限位 | $\beta_\text{limit} \cdot \sum_j [\max(0, |q_j - c_j| - \mu \cdot h_j)]^2$ |
-| 6.3 | 关节速度 | $\beta_\text{vel} \cdot \sum_j [\max(0, |\dot{q}_j| - \mu \cdot v_j^\text{lim})]^2$ |
-| 6.4 | 力矩超限 | $\beta_\text{torque} \cdot \sum_j [\max(0, |a_j^\text{raw}| - \tau^\text{lim})]^2$ |
-| 6.5 | 杯体掉落 | $w_\text{drop} \cdot \mathbb{1}[\text{cup\_dropped}]$ |
+| 6.1 | 关节限位 | $\beta_\text{limit} \cdot \sum_j [\max(0, |q_j - c_j| - \mu \cdot h_j)]^2$ |
+| 6.2 | 关节速度 | $\beta_\text{vel} \cdot \sum_j [\max(0, |\dot{q}_j| - \mu \cdot v_j^\text{lim})]^2$ |
+| 6.3 | 力矩超限 | $\beta_\text{torque} \cdot \sum_j [\max(0, |a_j^\text{raw}| - \tau^\text{lim})]^2$ |
+| 6.4 | 杯体掉落 | $w_\text{drop} \cdot \mathbb{1}[\text{cup\_dropped}]$ |
 
 #### 4.2.4 `_get_dones()` — 终止判定
 
@@ -434,7 +429,7 @@ truncated  = step_count >= max_episode_length   # 超时(5400 步 = 90 秒)
 
 训练过程中，场景的物理拓扑在 Cloner 复制后**永不改变**。与旧架构不同，新架构没有"装配"和"拆解"的概念，只有状态重写。
 
-**一次性场景创建**：`DoorPushEnv.__init__()` → `_setup_scene()` 将 robot/door/cup_left/cup_right/contact_sensor 注册到 `InteractiveScene`，Cloner 为 $N$ 个环境复制完整场景子树。此后场景拓扑固定。
+**一次性场景创建**：`DoorPushEnv.__init__()` → `_setup_scene()` 将 robot/door/cup_left/cup_right 等场景实体注册到 `InteractiveScene`，Cloner 为 $N$ 个环境复制完整场景子树。此后场景拓扑固定。
 
 **episode 内**：只做物理步进。每步向关节施加力矩、推进仿真、读取新状态。
 

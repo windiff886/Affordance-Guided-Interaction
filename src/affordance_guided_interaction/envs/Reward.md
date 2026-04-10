@@ -13,7 +13,7 @@
 envs/ ──→ next_state, contact_events
   │
   ├── 任务进展（门角度、回合结果事件 ...）
-  ├── 接触事件（冲击力、自碰撞 ...）
+  ├── 接触相关事件（如杯体脱落）
   └── 精确物理状态（杯体位姿、双臂关节状态 ...）
           │
           ▼
@@ -256,15 +256,7 @@ $$
 
 当前任务是显式接触任务，末端与门板/把手发生接触属于完成任务的必要条件。因此安全项不再直接惩罚接触力，而只保留与设备保护和持杯安全直接相关的约束。需要特别区分：仿真执行前的力矩 clip 由 env / 仿真层负责，而“力矩超限惩罚”基于 policy 原始输出的控制力矩计算，用于惩罚超限控制意图。
 
-### 6.1 自碰撞惩罚
-
-机器人任意两个 link 之间发生接触时给予固定惩罚：
-
-$$
-r_{\text{self}} = \beta_1 \cdot \mathbf{1}[\text{self-collision detected}]
-$$
-
-### 6.2 关节限位逼近惩罚
+### 6.1 关节限位逼近惩罚
 
 当关节角度逼近物理限位时施加递增惩罚，防止机构损伤。
 
@@ -278,12 +270,12 @@ $$
 设第 $i$ 关节的角度范围为 $[q_i^{\min}, q_i^{\max}]$，中心为 $q_i^c$，半范围为 $\delta_i = (q_i^{\max} - q_i^{\min}) / 2$，惩罚项的计算公式为：
 
 $$
-r_{\text{limit}} = \beta_2 \cdot \sum_{i=1}^{12} \max\!\left(0,\ \left| q_i - q_i^c \right| - \mu \cdot \delta_i \right)^2
+r_{\text{limit}} = \beta_1 \cdot \sum_{i=1}^{12} \max\!\left(0,\ \left| q_i - q_i^c \right| - \mu \cdot \delta_i \right)^2
 $$
 
 其中 $\mu \in (0, 1)$ 为触发比例（如 0.9，即偏移量超过允许半范围的 90% 时，才开始产生向上生长的二次幂惩罚）。
 
-### 6.3 关节速度过大惩罚
+### 6.2 关节速度过大惩罚
 
 与角度极限类似，防止过快运动超出关节减速器与电机的额定承载能力。
 
@@ -295,12 +287,12 @@ $$
 在运行时，系统通过物理引擎接口（如 `ArticulationView.get_dof_max_velocities()`）直接获取这组速度上限，并以此设置速度阈值 $v_{\text{thresh}}^{(i)}$ （通常取物理极限的一个安全系数比如 0.9）。
 
 $$
-r_{\text{vel}} = \beta_3 \cdot \sum_{i=1}^{12} \max\!\left(0,\ |\dot{q}_i| - \mu \cdot \dot{q}_i^{\max} \right)^2
+r_{\text{vel}} = \beta_2 \cdot \sum_{i=1}^{12} \max\!\left(0,\ |\dot{q}_i| - \mu \cdot \dot{q}_i^{\max} \right)^2
 $$
 
 超过该动态截断阈值的部分以平方惩罚，阈值内不惩罚。这样当更换其他具有不同传动比的机械臂配置时，无需修改训练超参。
 
-### 6.4 原始控制力矩超限惩罚
+### 6.3 原始控制力矩超限惩罚
 
 设 policy 在当前步输出的原始控制力矩为 $\boldsymbol{\tau}^{\text{raw}}_t$，每个关节的力矩上限为 $\boldsymbol{\tau}^{\max}$。env 会在送入物理引擎前执行：
 
@@ -311,7 +303,7 @@ $$
 但安全检测不会使用 $\boldsymbol{\tau}^{\text{applied}}_t$ 掩盖超限行为，而是直接对原始输出中的超限部分施加惩罚：
 
 $$
-r_{\text{torque}} = \beta_4 \cdot \sum_{i=1}^{12} \max\!\left(0,\ |\tau^{\text{raw}}_i| - \tau^{\max}_i \right)^2
+r_{\text{torque}} = \beta_3 \cdot \sum_{i=1}^{12} \max\!\left(0,\ |\tau^{\text{raw}}_i| - \tau^{\max}_i \right)^2
 $$
 
 这样可以同时满足两点：
@@ -319,7 +311,7 @@ $$
 - 物理仿真始终安全，只执行 clip 后的力矩；
 - 策略如果持续输出越界力矩，仍会在奖励层受到明确惩罚。
 
-### 6.5 杯体脱落惩罚
+### 6.4 杯体脱落惩罚
 
 如果机械臂或环境的交互动作导致杯子不可逆地脱离了末端原有的持握状态（例如掉落、被外力撞飞），系统会给出极其严厉的单次截断性惩罚，以保证模型学会安全稳定的接触操作：
 
@@ -356,7 +348,6 @@ $$
 | $\mathbf{q}, \dot{\mathbf{q}}$ | `robot.data.joint_pos` / `joint_vel` | 关节限位/速度惩罚 |
 | 关节限位 $[q_i^{\min}, q_i^{\max}]$ | `robot.data.soft_joint_pos_limits`（物理引擎提供） | 关节限位惩罚 |
 | 关节速度上限 $\dot{q}_i^{\max}$ | `robot.data.soft_joint_vel_limits`（物理引擎提供） | 速度惩罚 |
-| 自碰撞标志 | `_compute_batch_self_collision()`（contact sensor 代理检测） | 自碰撞惩罚 |
 | 杯体脱落标志 | `_check_cup_dropped()`（EE-杯体距离阈值检测） | 杯体脱落惩罚 |
 
 注意：奖励计算使用仿真地面真值（不依赖 critic 的 privileged 信息）。
@@ -395,11 +386,10 @@ $$
 
 | 参数 | YAML 键 | 含义 |
 |------|---------|------|
-| $\beta_1$ | `safety.beta_self` | 自碰撞固定惩罚 |
-| $\beta_2$ | `safety.beta_limit` | 关节限位系数 |
+| $\beta_1$ | `safety.beta_limit` | 关节限位系数 |
 | $\mu$ | `safety.mu` | 关节限位/速度触发比例 |
-| $\beta_3$ | `safety.beta_vel` | 关节速度系数 |
-| $\beta_4$ | `safety.beta_torque` | 原始控制力矩超限系数 |
+| $\beta_2$ | `safety.beta_vel` | 关节速度系数 |
+| $\beta_3$ | `safety.beta_torque` | 原始控制力矩超限系数 |
 | $w_{\text{drop}}$ | `safety.w_drop` | 杯体脱落惩罚 |
 
 ### 9.4 课程阶段下的稳定性项开关
