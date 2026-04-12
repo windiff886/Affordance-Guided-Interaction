@@ -12,9 +12,19 @@
 <robot name="uni_dingo_lite">
 
   <!-- ═══════════════════════════════════════════════════════════════ -->
-  <!-- Root: base_link (empty, acts as articulation root)            -->
+  <!-- Root: base_link (visual-only placeholder keeps minimal USD import clean) -->
   <!-- ═══════════════════════════════════════════════════════════════ -->
-  <link name="base_link"/>
+  <link name="base_link">
+    <visual>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry>
+        <box size="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="root_placeholder_black">
+        <color rgba="0 0 0 1.0"/>
+      </material>
+    </visual>
+  </link>
 
   <!-- ═══════════════════════════════════════════════════════════════ -->
   <!-- Chassis: box proxy (replaces 25MB omni_chassis mesh)         -->
@@ -57,6 +67,15 @@
     <child link="leftarm_link"/>
   </joint>
   <link name="leftarm_link">
+    <visual>
+      <origin rpy="0 0 0" xyz="0 0 -0.23614"/>
+      <geometry>
+        <cylinder length="0.47228" radius="0.02"/>
+      </geometry>
+      <material name="arm_support_grey">
+        <color rgba="0.3 0.3 0.3 1.0"/>
+      </material>
+    </visual>
     <collision>
       <origin rpy="0 0 0" xyz="0 0 -0.23614"/>
       <geometry>
@@ -80,6 +99,15 @@
     <child link="rightarm_link"/>
   </joint>
   <link name="rightarm_link">
+    <visual>
+      <origin rpy="0 0 0" xyz="0 0 -0.23614"/>
+      <geometry>
+        <cylinder length="0.47228" radius="0.02"/>
+      </geometry>
+      <material name="arm_support_grey">
+        <color rgba="0.3 0.3 0.3 1.0"/>
+      </material>
+    </visual>
     <collision>
       <origin rpy="0 0 0" xyz="0 0 -0.23614"/>
       <geometry>
@@ -104,6 +132,12 @@
     <child link="left_link00"/>
   </joint>
   <link name="left_link00">
+    <visual>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry>
+        <mesh filename="package://z1_description/meshes/visual/z1_Link00.dae" scale="1 1 1"/>
+      </geometry>
+    </visual>
     <collision>
       <origin rpy="0 0 0" xyz="0 0 0.0255"/>
       <geometry><cylinder length="0.051" radius="0.0325"/></geometry>
@@ -123,6 +157,12 @@
     <limit lower="-2.6179938779914944" upper="2.6179938779914944" effort="30.0" velocity="3.1415"/>
   </joint>
   <link name="left_link01">
+    <visual>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry>
+        <mesh filename="package://z1_description/meshes/visual/z1_Link01.dae" scale="1 1 1"/>
+      </geometry>
+    </visual>
     <collision>
       <origin rpy="0 0 0" xyz="0 0 0"/>
       <geometry><mesh filename="package://z1_description/meshes/collision/z1_Link01.STL" scale="1 1 1"/></geometry>
@@ -142,6 +182,12 @@
     <limit lower="0.0" upper="2.9670597283903604" effort="60.0" velocity="3.1415"/>
   </joint>
   <link name="left_link02">
+    <visual>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry>
+        <mesh filename="package://z1_description/meshes/visual/z1_Link02.dae" scale="1 1 1"/>
+      </geometry>
+    </visual>
     <collision>
       <origin rpy="1.5707963267948966 0 0" xyz="0 0 0"/>
       <geometry><cylinder length="0.102" radius="0.0325"/></geometry>
@@ -161,6 +207,12 @@
     <limit lower="-2.8797932657906435" upper="0.0" effort="30.0" velocity="3.1415"/>
   </joint>
   <link name="left_link03">
+    <visual>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry>
+        <mesh filename="package://z1_description/meshes/visual/z1_Link03.dae" scale="1 1 1"/>
+      </geometry>
+    </visual>
     <collision>
       <origin rpy="0 1.5707963267948966 0" xyz="0.128 0 0.055"/>
       <geometry><cylinder length="0.116" radius="0.02"/></geometry>
@@ -180,6 +232,12 @@
     <limit lower="-1.5184364492350666" upper="1.5184364492350666" effort="30.0" velocity="3.1415"/>
   </joint>
   <link name="left_link04">
+    <visual>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry>
+        <mesh filename="package://z1_description/meshes/visual/z1_Link04.dae" scale="1 1 1"/>
+      </geometry>
+    </visual>
     <collision>
       <origin rpy="0 0 0" xyz="0.072 0 0"/>
       <geometry><cylinder length="0.067" radius="0.0325"/></geometry>
@@ -199,6 +257,12 @@
     <limit lower="-1.3439035240356338" upper="1.3439035240356338" effort="30.0" velocity="3.1415"/>
   </joint>
   <link name="left_link05">
+    <visual>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry>
+        <mesh filename="package://z1_description/meshes/visual/z1_Link05.dae" scale="1 1 1"/>
+      </geometry>
+    </visual>
     <collision>
       <origin rpy="0 0 0" xyz="0 0 0"/>
       <geometry><mesh filename="package://z1_description/meshes/collision/z1_Link05.STL" scale="1 1 1"/></geometry>
@@ -218,6 +282,12 @@
     <limit lower="-2.792526803190927" upper="2.792526803190927" effort="30.0" velocity="3.1415"/>
   </joint>
   <link name="left_link06">
+    <visual>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry>
+        <mesh filename="package://z1_description/meshes/visual/z1_Link06.dae" scale="1 1 1"/>
+      </geometry>
+    </visual>
     <collision>
       <origin rpy="0 1.5707963267948966 0" xyz="0.0255 0 0"/>
       <geometry><cylinder length="0.051" radius="0.0325"/></geometry>
@@ -235,6 +305,11 @@
     <parent link="left_link06"/><child link="left_gripperStator"/>
   </joint>
   <link name="left_gripperStator">
+    <visual>
+      <geometry>
+        <mesh filename="package://z1_description/meshes/visual/z1_GripperStator.dae" scale="1 1 1"/>
+      </geometry>
+    </visual>
     <collision>
       <geometry><mesh filename="package://z1_description/meshes/collision/z1_GripperStator.STL" scale="1 1 1"/></geometry>
     </collision>
@@ -253,6 +328,11 @@
     <limit lower="-1.5707963267948966" upper="0.0" effort="30.0" velocity="3.1415"/>
   </joint>
   <link name="left_gripperMover">
+    <visual>
+      <geometry>
+        <mesh filename="package://z1_description/meshes/visual/z1_GripperMover.dae" scale="1 1 1"/>
+      </geometry>
+    </visual>
     <collision>
       <geometry><mesh filename="package://z1_description/meshes/collision/z1_GripperMover.STL" scale="1 1 1"/></geometry>
     </collision>
@@ -273,6 +353,12 @@
     <child link="right_link00"/>
   </joint>
   <link name="right_link00">
+    <visual>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry>
+        <mesh filename="package://z1_description/meshes/visual/z1_Link00.dae" scale="1 1 1"/>
+      </geometry>
+    </visual>
     <collision>
       <origin rpy="0 0 0" xyz="0 0 0.0255"/>
       <geometry><cylinder length="0.051" radius="0.0325"/></geometry>
@@ -292,6 +378,12 @@
     <limit lower="-2.6179938779914944" upper="2.6179938779914944" effort="30.0" velocity="3.1415"/>
   </joint>
   <link name="right_link01">
+    <visual>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry>
+        <mesh filename="package://z1_description/meshes/visual/z1_Link01.dae" scale="1 1 1"/>
+      </geometry>
+    </visual>
     <collision>
       <origin rpy="0 0 0" xyz="0 0 0"/>
       <geometry><mesh filename="package://z1_description/meshes/collision/z1_Link01.STL" scale="1 1 1"/></geometry>
@@ -311,6 +403,12 @@
     <limit lower="0.0" upper="2.9670597283903604" effort="60.0" velocity="3.1415"/>
   </joint>
   <link name="right_link02">
+    <visual>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry>
+        <mesh filename="package://z1_description/meshes/visual/z1_Link02.dae" scale="1 1 1"/>
+      </geometry>
+    </visual>
     <collision>
       <origin rpy="1.5707963267948966 0 0" xyz="0 0 0"/>
       <geometry><cylinder length="0.102" radius="0.0325"/></geometry>
@@ -330,6 +428,12 @@
     <limit lower="-2.8797932657906435" upper="0.0" effort="30.0" velocity="3.1415"/>
   </joint>
   <link name="right_link03">
+    <visual>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry>
+        <mesh filename="package://z1_description/meshes/visual/z1_Link03.dae" scale="1 1 1"/>
+      </geometry>
+    </visual>
     <collision>
       <origin rpy="0 1.5707963267948966 0" xyz="0.128 0 0.055"/>
       <geometry><cylinder length="0.116" radius="0.02"/></geometry>
@@ -349,6 +453,12 @@
     <limit lower="-1.5184364492350666" upper="1.5184364492350666" effort="30.0" velocity="3.1415"/>
   </joint>
   <link name="right_link04">
+    <visual>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry>
+        <mesh filename="package://z1_description/meshes/visual/z1_Link04.dae" scale="1 1 1"/>
+      </geometry>
+    </visual>
     <collision>
       <origin rpy="0 0 0" xyz="0.072 0 0"/>
       <geometry><cylinder length="0.067" radius="0.0325"/></geometry>
@@ -368,6 +478,12 @@
     <limit lower="-1.3439035240356338" upper="1.3439035240356338" effort="30.0" velocity="3.1415"/>
   </joint>
   <link name="right_link05">
+    <visual>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry>
+        <mesh filename="package://z1_description/meshes/visual/z1_Link05.dae" scale="1 1 1"/>
+      </geometry>
+    </visual>
     <collision>
       <origin rpy="0 0 0" xyz="0 0 0"/>
       <geometry><mesh filename="package://z1_description/meshes/collision/z1_Link05.STL" scale="1 1 1"/></geometry>
@@ -387,6 +503,12 @@
     <limit lower="-2.792526803190927" upper="2.792526803190927" effort="30.0" velocity="3.1415"/>
   </joint>
   <link name="right_link06">
+    <visual>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry>
+        <mesh filename="package://z1_description/meshes/visual/z1_Link06.dae" scale="1 1 1"/>
+      </geometry>
+    </visual>
     <collision>
       <origin rpy="0 1.5707963267948966 0" xyz="0.0255 0 0"/>
       <geometry><cylinder length="0.051" radius="0.0325"/></geometry>
@@ -404,6 +526,11 @@
     <parent link="right_link06"/><child link="right_gripperStator"/>
   </joint>
   <link name="right_gripperStator">
+    <visual>
+      <geometry>
+        <mesh filename="package://z1_description/meshes/visual/z1_GripperStator.dae" scale="1 1 1"/>
+      </geometry>
+    </visual>
     <collision>
       <geometry><mesh filename="package://z1_description/meshes/collision/z1_GripperStator.STL" scale="1 1 1"/></geometry>
     </collision>
@@ -422,6 +549,11 @@
     <limit lower="-1.5707963267948966" upper="0.0" effort="30.0" velocity="3.1415"/>
   </joint>
   <link name="right_gripperMover">
+    <visual>
+      <geometry>
+        <mesh filename="package://z1_description/meshes/visual/z1_GripperMover.dae" scale="1 1 1"/>
+      </geometry>
+    </visual>
     <collision>
       <geometry><mesh filename="package://z1_description/meshes/collision/z1_GripperMover.STL" scale="1 1 1"/></geometry>
     </collision>

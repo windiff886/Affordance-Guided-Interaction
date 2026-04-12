@@ -408,7 +408,7 @@ class DoorPushLiteSceneCfg(DoorPushSceneCfg):
     - 维持现有 DoorPushEnv 逻辑兼容
 
     注意：uni_dingo_lite.usd 需要先通过
-    ``python assets/robot/scripts/convert_lite_urdf_to_usd.py``
+    ``python assets/robot/scripts/convert_lite_urdf_to_usd_basic.py``
     从 uni_dingo_lite.urdf 转换生成。
     如果 lite USD 尚未生成，会回退到完整机器人 USD。
     """

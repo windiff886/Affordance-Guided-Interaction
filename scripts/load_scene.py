@@ -3,12 +3,12 @@
 
 功能:
     1. 创建新 stage，以 sublayer 方式加载 minimal_push_door.usda
-    2. 以 reference 方式加载预转换的机器人 USD (含自碰撞 + 关节驱动)
+    2. 以 reference 方式加载预转换的轻量机器人 USD
     3. 提供交互式 UI 控制面板（滑块控制关节角度、底盘速度）
 
 前置条件:
-    先运行一次 convert_urdf_to_usd.py 生成机器人 USD 文件:
-        python assets/robot/scripts/convert_urdf_to_usd.py
+    先运行一次 convert_lite_urdf_to_usd_basic.py 生成机器人 USD 文件:
+        python assets/robot/scripts/convert_lite_urdf_to_usd_basic.py
 
 用法:
     conda activate isaaclab
@@ -108,7 +108,7 @@ import omni.kit.commands
 from pxr import Usd, UsdGeom, UsdLux, Sdf, Gf, UsdPhysics, PhysicsSchemaTools
 
 DOOR_SCENE = PROJECT_ROOT / "assets/minimal_push_door/minimal_push_door.usda"
-ROBOT_USD = PROJECT_ROOT / "assets/robot/usd/uni_dingo_dual_arm.usd"
+ROBOT_USD = PROJECT_ROOT / "assets/robot/usd/uni_dingo_lite.usd"
 
 
 def find_first_named_prim(stage: Usd.Stage, prim_names: list[str]) -> Usd.Prim:
