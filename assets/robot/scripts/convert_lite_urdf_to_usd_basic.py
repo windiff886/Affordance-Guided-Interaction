@@ -9,12 +9,15 @@ URDFCreateImportConfig + URDFParseAndImportFile 导入，不做任何额外
     assets/robot/usd/uni_dingo_lite.usd
 
 明确不做：
-    - convex decomposition
     - 空碰撞修复
     - RobotAsset 打包
     - colliders 内联
     - deinstance
-    - 关节驱动重写
+
+已加入：
+    - convex decomposition (凸分解)
+    - 关节驱动配置 (force drive, stiffness=1000, damping=100)
+    - 自碰撞启用
 
 用法:
     python assets/robot/scripts/convert_lite_urdf_to_usd_basic.py
@@ -112,6 +115,56 @@ def configure_lite_mesh_package(env: dict[str, str]) -> None:
     env["ROS_PACKAGE_PATH"] = ":".join([overlay_entry] + [entry for entry in existing if entry != overlay_entry])
 
 
+# lite 版本所有 actuated 关节（无轮子/云台）
+_LITE_ARM_JOINTS = [
+    "left_joint1", "left_joint2", "left_joint3",
+    "left_joint4", "left_joint5", "left_joint6", "left_jointGripper",
+    "right_joint1", "right_joint2", "right_joint3",
+    "right_joint4", "right_joint5", "right_joint6", "right_jointGripper",
+]
+
+
+def configure_joint_drives(stage, robot_prim_path: str) -> int:
+    """为所有 arm 关节配置力矩驱动 (PD position tracker)。"""
+    from pxr import UsdPhysics
+
+    drive_count = 0
+    for prim in stage.Traverse():
+        if not (prim.IsA(UsdPhysics.RevoluteJoint) or prim.IsA(UsdPhysics.Joint)):
+            continue
+        name = prim.GetName()
+        prim_path = str(prim.GetPath())
+        if robot_prim_path not in prim_path:
+            continue
+        if not any(joint_name in name for joint_name in _LITE_ARM_JOINTS):
+            continue
+        drive = UsdPhysics.DriveAPI.Apply(prim, "angular")
+        drive.CreateTypeAttr("force")
+        drive.CreateStiffnessAttr(1000.0)
+        drive.CreateDampingAttr(100.0)
+        drive_count += 1
+    return drive_count
+
+
+def enable_self_collision(stage, robot_prim_path: str) -> None:
+    """在 articulation root 上启用自碰撞检测。"""
+    from pxr import PhysxSchema, Sdf
+
+    robot_prim = stage.GetPrimAtPath(robot_prim_path)
+    if not robot_prim or not robot_prim.IsValid():
+        return
+    if not robot_prim.HasAPI(PhysxSchema.PhysxArticulationAPI):
+        PhysxSchema.PhysxArticulationAPI.Apply(robot_prim)
+    attr = robot_prim.GetAttribute("physxArticulation:enabledSelfCollisions")
+    if not attr.IsValid():
+        attr = robot_prim.CreateAttribute(
+            "physxArticulation:enabledSelfCollisions",
+            Sdf.ValueTypeNames.Bool,
+            True,
+        )
+    attr.Set(True)
+
+
 def run_conversion(args: argparse.Namespace) -> int:
     urdf_path = args.urdf.resolve()
     output_path = args.output.resolve()
@@ -147,6 +200,7 @@ def run_conversion(args: argparse.Namespace) -> int:
             return 1
 
         import_config.merge_fixed_joints = False
+        import_config.convex_decomp = True
         import_config.fix_base = False
         import_config.make_default_prim = True
         import_config.import_inertia_tensor = True
@@ -166,6 +220,14 @@ def run_conversion(args: argparse.Namespace) -> int:
         if not status or not robot_prim_path:
             log("❌ Lite URDF 导入失败")
             return 1
+
+        log(f"✅ Lite URDF 已导入: {robot_prim_path}")
+
+        drive_count = configure_joint_drives(stage, robot_prim_path)
+        log(f"✅ 已配置 {drive_count} 个臂关节驱动 (force, stiffness=1000, damping=100)")
+
+        enable_self_collision(stage, robot_prim_path)
+        log("✅ 已启用 Articulation 自碰撞检测")
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
         stage.GetRootLayer().Export(str(output_path))

@@ -86,16 +86,15 @@ TRAY_SIZE = [0.12, 0.12, 0.008]
 # ===================================================================
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-ROBOT_USD = os.path.join(PROJECT_ROOT, "assets", "robot", "usd", "uni_dingo_dual_arm.usd")
-ROBOT_URDF = os.path.join(PROJECT_ROOT, "assets", "robot", "urdf", "uni_dingo_dual_arm_absolute.urdf")
+ROBOT_USD = os.path.join(PROJECT_ROOT, "assets", "robot", "usd", "uni_dingo_lite.usd")
+ROBOT_URDF = os.path.join(PROJECT_ROOT, "assets", "robot", "urdf", "uni_dingo_lite.urdf")
 CUP_USDA = os.path.join(PROJECT_ROOT, "assets", "grasp_objects", "cup", "carry_cup.usda")
 
 # ===================================================================
 # 从 URDF 解析关节信息
 # ===================================================================
 
-WHEEL_JOINTS = {"front_left_wheel", "front_right_wheel",
-                "rear_left_wheel", "rear_right_wheel"}
+WHEEL_JOINTS = set()  # lite 版本无轮子
 
 
 def collect_link_names(urdf_path):
@@ -195,7 +194,18 @@ for p in Usd.PrimRange(robot_prim):
     if p.HasAPI(UsdPhysics.CollisionAPI):
         set_tight_contact(p)
         tight_count += 1
-print(f"Set tight contactOffset on {tight_count} robot collision prims")
+# lite USD 可能未对 collision mesh 施加 CollisionAPI，主动修复
+repaired = 0
+for p in Usd.PrimRange(robot_prim):
+    if p.GetName() == "collisions" or str(p.GetPath()).endswith("/collisions"):
+        for child in p.GetChildren():
+            if child.IsValid() and child.GetTypeName() in ("Mesh", "Cube", "Cylinder", "Sphere", "Cone", "Capsule"):
+                if not child.HasAPI(UsdPhysics.CollisionAPI):
+                    UsdPhysics.CollisionAPI.Apply(child)
+                set_tight_contact(child)
+                repaired += 1
+tight_count += repaired
+print(f"Set tight contactOffset on {tight_count} robot collision prims (repaired {repaired})")
 sim_app.update()
 
 # ── 找到机器人根路径 ──
@@ -306,6 +316,9 @@ def get_body_pos(path):
 
 
 def get_base_link_pos():
+    # lite USD 的根 prim 就是 base_link，无需再拼子路径
+    if robot_root_path.endswith("/base_link"):
+        return get_body_pos(robot_root_path)
     return get_body_pos(f"{robot_root_path}/base_link")
 
 # ===================================================================
@@ -365,8 +378,7 @@ for s in ["left", "right"]:
     for i in range(1, 7):
         set_joint(f"{s}_joint{i}", 0.0)
     set_joint(f"{s}_jointGripper", 0.0)
-set_joint("pan_tilt_yaw_joint", 0.0)
-set_joint("pan_tilt_pitch_joint", 0.0)
+# lite 版本无 pan_tilt 关节，跳过
 
 for _ in range(240):
     sim_app.update()
