@@ -104,6 +104,7 @@ RIGHT_ARM_GRASP_INIT_DEG: dict[str, float] = {
 # Gripper 角度
 GRIPPER_OPEN_DEG: float = -90.0
 GRIPPER_CLOSE_DEG: float = -34.0
+GRIPPER_FULLY_CLOSED_DEG: float = 0.0
 
 # 持杯初始化物理步进数
 POSE_SETTLE_STEPS: int = 240
@@ -217,8 +218,8 @@ class DoorPushSceneCfg(InteractiveSceneCfg):
                 joint_names_expr=["left_jointGripper", "right_jointGripper"],
                 effort_limit=30.0,
                 velocity_limit=2.175,
-                stiffness=0.0,
-                damping=0.0,
+                stiffness=400.0,
+                damping=40.0,
             ),
             "wheels": ImplicitActuatorCfg(
                 joint_names_expr=[".*wheel"],

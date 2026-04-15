@@ -40,6 +40,7 @@ from .door_push_env_cfg import (
     RIGHT_ARM_GRASP_INIT_DEG,
     GRIPPER_OPEN_DEG,
     GRIPPER_CLOSE_DEG,
+    GRIPPER_FULLY_CLOSED_DEG,
     POSE_SETTLE_STEPS,
     POST_SPAWN_SETTLE_STEPS,
     GRIPPER_CLOSE_STEPS,
@@ -60,6 +61,7 @@ from .batch_math import (
     batch_yaw_from_quat,
     sample_base_poses,
 )
+from .gripper_hold import build_gripper_hold_targets
 from .physx_mass_ops import (
     build_articulation_mass_update,
     build_rigid_body_mass_update,
@@ -185,6 +187,35 @@ class DoorPushEnv(DirectRLEnv):
         """场景实体已由 ``DoorPushSceneCfg`` 自动注册，此处无需额外装配。"""
         return
 
+    def _set_gripper_hold_targets(self, env_ids: Tensor | None = None) -> None:
+        """刷新夹爪保持目标。
+
+        持杯侧保持在预设抓持角，非持杯侧保持完全闭合，避免 episode 开始后
+        gripper 因无持续控制而被接触力顶开。
+        """
+        if env_ids is not None and env_ids.numel() == 0:
+            return
+
+        robot: Articulation = self.scene["robot"]
+        left_occupied = self._left_occupied if env_ids is None else self._left_occupied[env_ids]
+        right_occupied = self._right_occupied if env_ids is None else self._right_occupied[env_ids]
+        hold_targets = build_gripper_hold_targets(
+            left_occupied=left_occupied,
+            right_occupied=right_occupied,
+            occupied_deg=GRIPPER_CLOSE_DEG,
+            unoccupied_deg=GRIPPER_FULLY_CLOSED_DEG,
+        )
+        robot.set_joint_position_target(
+            hold_targets,
+            joint_ids=self._gripper_joint_ids,
+            env_ids=env_ids,
+        )
+        robot.set_joint_velocity_target(
+            torch.zeros_like(hold_targets),
+            joint_ids=self._gripper_joint_ids,
+            env_ids=env_ids,
+        )
+
     # ═══════════════════════════════════════════════════════════════════
     # 动作执行
     # ═══════════════════════════════════════════════════════════════════
@@ -213,6 +244,7 @@ class DoorPushEnv(DirectRLEnv):
         )
         efforts[:, self._arm_joint_ids] = clipped
         robot.set_joint_effort_target(efforts)
+        self._set_gripper_hold_targets()
 
         # 保存动作供下一步 obs 使用
         self._prev_prev_action = self._prev_action.clone()
@@ -665,6 +697,9 @@ class DoorPushEnv(DirectRLEnv):
         if need_cup.any():
             cup_env_ids = env_ids[need_cup]
             self._batch_cup_grasp_init(cup_env_ids)
+
+        # 重置完成后立即刷新 gripper hold target，避免沿用上一回合目标。
+        self._set_gripper_hold_targets(env_ids)
 
         # ── 6. 应用域随机化物理参数 ──────────────────────────────
         self._apply_domain_params(env_ids)
