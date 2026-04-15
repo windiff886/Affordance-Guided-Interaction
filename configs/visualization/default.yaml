@@ -19,8 +19,8 @@
 #         ep000_step00001.png
 #         ...
 # ── 运行时参数（当前生效值）──────────────────────────────────────────
-checkpoint: null                # 模型 checkpoint 路径（相对项目根目录）；null 使用随机初始化策略
-device: cpu                     # 推理设备：cpu / cuda
+checkpoint: checkpoints/ckpt_iter_1320.pt                # 模型 checkpoint 路径（相对项目根目录）；null 使用随机初始化策略
+device: cuda                     # 推理设备：cpu / cuda
 seed: 42                        # 全局随机种子
 headless: true                  # 是否以无窗口模式启动 Isaac Sim
 deterministic: true             # true → 确定性动作；false → 采样动作
@@ -38,6 +38,8 @@ save_video: true                # 是否生成 mp4 视频（需要 imageio[ffmpe
 save_frames: false              # 是否保存逐帧图片
 frame_stride: 1                 # 每隔 N 步捕获一帧；1 = 每步都捕获
 video_fps: 30                   # 输出视频帧率
+viewer_eye: [6.0, 3.0, 3.2]     # rollout viewer 相机位置 (x, y, z)
+viewer_lookat: [3.0, 0.3, 1.0]  # rollout viewer 目标点 (x, y, z)
 
 # ── Artifact 输出 ────────────────────────────────────────────────────
 output_root: artifacts/vis      # artifact 输出根目录（相对项目根目录）

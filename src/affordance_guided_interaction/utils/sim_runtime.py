@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import inspect
 from typing import Any, Callable
 
 from .runtime_env import (
@@ -96,6 +97,34 @@ def launch_simulation_app(
     if enable_cameras:
         _configure_isaaclab_camera_settings(headless=resolved_headless)
     return app
+
+
+def close_simulation_app(
+    app: Any | None,
+    *,
+    wait_for_replicator: bool = False,
+    skip_cleanup: bool = False,
+) -> None:
+    """Close a SimulationApp-compatible object without assuming every runtime supports the same kwargs."""
+    if app is None:
+        return
+
+    close_fn = getattr(app, "close", None)
+    if close_fn is None:
+        return
+
+    kwargs: dict[str, object] = {}
+    try:
+        params = inspect.signature(close_fn).parameters
+    except (TypeError, ValueError):
+        params = {}
+
+    if "wait_for_replicator" in params:
+        kwargs["wait_for_replicator"] = wait_for_replicator
+    if "skip_cleanup" in params:
+        kwargs["skip_cleanup"] = skip_cleanup
+
+    close_fn(**kwargs)
 
 
 def _configure_isaaclab_camera_settings(*, headless: bool) -> None:

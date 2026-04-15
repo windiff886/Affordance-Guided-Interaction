@@ -240,7 +240,7 @@ $$
 
 ---
 
-### 3.7 `visualization/default.yaml` — Rollout 可视化配置（14 参数）
+### 3.7 `visualization/default.yaml` — Rollout 可视化配置（16 参数）
 
 > **已新增**: rollout 可视化配置，用于 `scripts/rollout_demo.py` 入口脚本。
 > 所有可视化运行参数统一从本文件读取，不再依赖命令行覆盖。
@@ -270,6 +270,8 @@ $$
 | `save_frames` | `false` | `rollout_config.py` → `rollout_artifacts.py` | 是否保存逐帧图片 |
 | `frame_stride` | `1` | `rollout_config.py` → `rollout_artifacts.py` | 每隔 N 步捕获一帧 |
 | `video_fps` | `30` | `rollout_config.py` → `rollout_artifacts.py` | 输出视频帧率 |
+| `viewer_eye` | `[6.0, 3.0, 3.2]` | `rollout_config.py` → `rollout_demo.py` | rollout viewer 相机位置 |
+| `viewer_lookat` | `[3.0, 0.3, 1.0]` | `rollout_config.py` → `rollout_demo.py` | rollout viewer 相机目标点 |
 
 #### Artifact 输出
 

@@ -160,6 +160,11 @@ class DoorPushEnv(DirectRLEnv):
         # 预计算控制 dt
         self._control_dt = self.physics_dt * self.cfg.decimation
 
+        # Per-joint effort limits tensor (1, 12)，来自 Z1 URDF
+        self._effort_limits = torch.tensor(
+            cfg.effort_limits, device=self.device
+        ).unsqueeze(0)  # (1, 12) for broadcasting with (N, 12)
+
         # ── 奖励计算用缓存（由 _get_observations 填充）───────────
         self._cached_left_ee_la = torch.zeros(N, 3, device=dev)
         self._cached_left_ee_aa = torch.zeros(N, 3, device=dev)
@@ -189,16 +194,16 @@ class DoorPushEnv(DirectRLEnv):
         # 缓存原始动作（clip 前），用于力矩超限惩罚 §6.3
         self._cached_raw_action = actions.clone()
 
-        # 力矩裁剪
-        clipped = torch.clamp(actions, -self.cfg.effort_limit, self.cfg.effort_limit)
+        # 力矩裁剪（per-joint limits，来自 Z1 URDF）
+        clipped = torch.clamp(actions, -self._effort_limits, self._effort_limits)
 
         # 注入步级动作噪声 (training only)
         if self.cfg.action_noise_std > 0:
             noise = torch.randn_like(clipped) * self.cfg.action_noise_std
             clipped = torch.clamp(
                 clipped + noise,
-                -self.cfg.effort_limit,
-                self.cfg.effort_limit,
+                -self._effort_limits,
+                self._effort_limits,
             )
 
         # 构建全关节力矩向量（策略只控制 12 个臂关节）
@@ -513,7 +518,7 @@ class DoorPushEnv(DirectRLEnv):
         r_safe_joint_vel = self.cfg.rew_beta_vel * (vel_excess ** 2).sum(-1)
 
         torque_excess = torch.clamp(
-            torch.abs(self._cached_raw_action) - self.cfg.effort_limit, min=0
+            torch.abs(self._cached_raw_action) - self._effort_limits, min=0
         )
         r_safe_torque_limit = self.cfg.rew_beta_torque * (torque_excess ** 2).sum(-1)
 
@@ -576,6 +581,12 @@ class DoorPushEnv(DirectRLEnv):
         # occupancy，adapter 需要读到完成 episode 的 occupancy 而非新 episode 的
         self.extras["episode_left_occupied"] = self._left_occupied.clone()
         self.extras["episode_right_occupied"] = self._right_occupied.clone()
+
+        # 暴露门角度和终止原因，供 rollout_demo 等下游消费
+        self.extras["door_angle"] = theta.clone()
+        self.extras["termination_reason"] = self._build_termination_reason(
+            terminated, truncated, cup_dropped, angle_reached,
+        )
 
         return terminated, truncated
 
@@ -669,6 +680,104 @@ class DoorPushEnv(DirectRLEnv):
         self._prev_right_ee_lin_vel[env_ids] = 0.0
         self._prev_right_ee_ang_vel[env_ids] = 0.0
         self._cached_cup_dropped[env_ids] = False
+
+    # ═══════════════════════════════════════════════════════════════════
+    # 终止原因构建
+    # ═══════════════════════════════════════════════════════════════════
+
+    def _build_termination_reason(
+        self,
+        terminated: Tensor,
+        truncated: Tensor,
+        cup_dropped: Tensor,
+        angle_reached: Tensor,
+    ) -> list[str]:
+        """为每个 env 构建终止原因字符串。"""
+        reasons: list[str] = []
+        for i in range(self.num_envs):
+            if bool(truncated[i]):
+                reasons.append("max_steps")
+            elif bool(cup_dropped[i]):
+                reasons.append("cup_dropped")
+            elif bool(angle_reached[i]):
+                reasons.append("door_opened")
+            else:
+                reasons.append("ongoing")
+        return reasons
+
+    # ═══════════════════════════════════════════════════════════════════
+    # 视口帧捕获
+    # ═══════════════════════════════════════════════════════════════════
+
+    def get_visual_observation(self) -> dict | None:
+        """捕获当前视口渲染帧，返回 ``{"rgb": ndarray(H, W, 3)}``。
+
+        需要在 Isaac Sim 运行时且渲染已启用时才能工作。
+        不可用时返回 ``None``。
+        """
+        import numpy as np
+
+        # ── 初始化 RGB annotator（仅首次调用）──────────────────────
+        if not hasattr(self, "_rgb_annotator"):
+            self._rgb_annotator = None
+            try:
+                import omni.replicator.core as rep
+                from omni.kit.viewport.utility import get_active_viewport
+
+                vp = get_active_viewport()
+                if vp is None:
+                    print("[DIAG] get_active_viewport() 返回 None")
+                else:
+                    # ── 一次性诊断：列出 viewport 可用方法 ──
+                    vp_methods = [m for m in dir(vp) if not m.startswith("_")]
+                    print(f"[DIAG] ViewportAPI type: {type(vp)}")
+                    print(f"[DIAG] ViewportAPI methods: {vp_methods}")
+
+                    rp_path = getattr(vp, "render_product_path", None)
+                    print(f"[DIAG] render_product_path: {rp_path}")
+
+                    # 尝试直接 get_texture
+                    get_tex = getattr(vp, "get_texture", None)
+                    print(f"[DIAG] get_texture method: {get_tex}")
+
+                    if get_tex is not None:
+                        self.sim.render()
+                        tex = get_tex()
+                        print(f"[DIAG] texture object: {tex}, type={type(tex)}")
+                        if tex is not None:
+                            tex_methods = [m for m in dir(tex) if not m.startswith("_")]
+                            print(f"[DIAG] texture methods: {tex_methods}")
+                            data = getattr(tex, "get_byte_array", lambda: None)()
+                            print(f"[DIAG] byte_array: size={len(data) if data is not None else None}")
+                            res = getattr(vp, "get_texture_resolution", lambda: (0,0))()
+                            print(f"[DIAG] texture resolution: {res}")
+
+                    # 也尝试 annotator 方式作为备选
+                    if rp_path:
+                        self._rgb_annotator = rep.AnnotatorRegistry.get_annotator("rgb")
+                        self._rgb_annotator.attach([rp_path])
+                        print(f"[DIAG] RGB annotator 已绑定到 {rp_path}")
+            except Exception as e:
+                print(f"[DIAG] 初始化失败: {e}")
+                import traceback; traceback.print_exc()
+
+        # ── 获取帧数据 ─────────────────────────────────────────────
+        # 模式：先 render()，再从 annotator 读上一帧的结果。
+        # 这有一帧延迟，但对可视化 rollout 无影响。
+        # 不要用 rep.orchestrator.step() — 它会阻塞/死锁。
+        if self._rgb_annotator is not None:
+            try:
+                self.sim.render()
+                data = self._rgb_annotator.get_data()
+                if data is not None and data.size > 0:
+                    rgb = data[:, :, :3] if data.shape[-1] >= 3 else data
+                    return {"rgb": np.asarray(rgb, dtype=np.uint8).copy()}
+                # 首帧可能为空（渲染尚未完成），不打印重复警告
+                return None
+            except Exception as e:
+                logger.warning("get_visual_observation: 获取帧失败: %s", e)
+
+        return None
 
     # ═══════════════════════════════════════════════════════════════════
     # 课程注入接口

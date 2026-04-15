@@ -7,3 +7,5 @@ outputs/
 model/
 runs/
 checkpoints/
+tests/
+artifacts/

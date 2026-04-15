@@ -138,11 +138,12 @@ class RolloutCollector:
         self.buffer = buffer
         self.batch_actor_flatten_fn = batch_actor_flatten_fn
         self.priv_flatten_fn = priv_flatten_fn
-        self.perception_runtime = perception_runtime  # legacy: 默认 None，仅历史视觉实验使用
+        self.perception_runtime = perception_runtime  # 仅视觉感知实验使用，默认 None
         self.device = torch.device(device)
 
         # 隐状态缓存
         self._hidden = None
+        # 计时桶：仅 perception_runtime 启用时通过 measure() 累积视觉管线子阶段耗时
         self._timings: dict[str, float] = {}
 
     # ═══════════════════════════════════════════════════════════════════
@@ -208,15 +209,16 @@ class RolloutCollector:
             "both": 0,
         }
 
-        current_actor_obs, current_critic_obs = self.measure(
-            "vision_s",
-            lambda: self._prepare_visual_batch(
-                envs=envs,
-                actor_obs_list=current_actor_obs,
-                critic_obs_list=current_critic_obs,
-                force_refresh_mask=[True] * n_envs,
-            ),
-        )
+        if self.perception_runtime is not None:
+            current_actor_obs, current_critic_obs = self.measure(
+                "vision_s",
+                lambda: self._prepare_visual_batch(
+                    envs=envs,
+                    actor_obs_list=current_actor_obs,
+                    critic_obs_list=current_critic_obs,
+                    force_refresh_mask=[True] * n_envs,
+                ),
+            )
 
         for step in range(n_steps):
             # ── 1. 展平观测为分支张量字典 ────────────────────────
@@ -309,15 +311,18 @@ class RolloutCollector:
             )
 
             # ── 8. 推进观测 ──────────────────────────────────────
-            current_actor_obs, current_critic_obs = self.measure(
-                "vision_s",
-                lambda: self._prepare_visual_batch(
-                    envs=envs,
-                    actor_obs_list=next_actor_obs,
-                    critic_obs_list=next_critic_obs,
-                    force_refresh_mask=[bool(x) for x in dones_np],
-                ),
-            )
+            if self.perception_runtime is not None:
+                current_actor_obs, current_critic_obs = self.measure(
+                    "vision_s",
+                    lambda: self._prepare_visual_batch(
+                        envs=envs,
+                        actor_obs_list=next_actor_obs,
+                        critic_obs_list=next_critic_obs,
+                        force_refresh_mask=[bool(x) for x in dones_np],
+                    ),
+                )
+            else:
+                current_actor_obs, current_critic_obs = next_actor_obs, next_critic_obs
 
         # ── 计算最终 bootstrap value ─────────────────────────────
         last_actor_branches = self._build_actor_branches(current_actor_obs)
@@ -354,7 +359,6 @@ class RolloutCollector:
             "collect/success_both": self._safe_rate(
                 context_successes["both"], context_totals["both"]
             ),
-            "collect/total_steps": float(total_steps),
         }
         for key, total in reward_sums.items():
             count = max(reward_counts[key], 1)

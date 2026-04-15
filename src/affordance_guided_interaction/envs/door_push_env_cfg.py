@@ -193,9 +193,29 @@ class DoorPushSceneCfg(InteractiveSceneCfg):
             },
         ),
         actuators={
-            "arms": ImplicitActuatorCfg(
-                joint_names_expr=["left_joint.*", "right_joint.*"],
-                effort_limit=33.5,
+            # 肩关节 (joint2) 力矩上限 60 N·m，其余臂关节 30 N·m（来自 Z1 URDF）
+            "shoulder_joints": ImplicitActuatorCfg(
+                joint_names_expr=["left_joint2", "right_joint2"],
+                effort_limit=60.0,
+                velocity_limit=2.175,
+                stiffness=0.0,
+                damping=0.0,
+            ),
+            "arm_joints": ImplicitActuatorCfg(
+                joint_names_expr=[
+                    "left_joint1", "left_joint3", "left_joint4",
+                    "left_joint5", "left_joint6",
+                    "right_joint1", "right_joint3", "right_joint4",
+                    "right_joint5", "right_joint6",
+                ],
+                effort_limit=30.0,
+                velocity_limit=2.175,
+                stiffness=0.0,
+                damping=0.0,
+            ),
+            "gripper": ImplicitActuatorCfg(
+                joint_names_expr=["left_jointGripper", "right_jointGripper"],
+                effort_limit=30.0,
                 velocity_limit=2.175,
                 stiffness=0.0,
                 damping=0.0,
@@ -314,7 +334,7 @@ class DoorPushEnvCfg(DirectRLEnvCfg):
 
     # ── 仿真步进 ────────────────────────────────────────────────────
     decimation: int = 2           # 策略频率 = physics_dt / decimation = 60 Hz
-    episode_length_s: float = 90.0  # 5400 steps × (1/60 s)
+    episode_length_s: float = 15.0  # 900 steps × (1/60 s)
     num_rerenders_on_reset: int = 3
 
     # ── 动作空间：双臂 6+6 = 12 关节力矩 ──────────────────────────
@@ -341,8 +361,13 @@ class DoorPushEnvCfg(DirectRLEnvCfg):
     # 杯体脱落距离检测阈值 (m)
     cup_drop_threshold: float = 0.15
 
-    # ── 力矩限幅 ────────────────────────────────────────────────────
-    effort_limit: float = 33.5
+    # ── 力矩限幅（来自 Z1 URDF，per-joint）───────────────────────
+    # 顺序与 ARM_JOINT_NAMES 一致：left_joint1..6, right_joint1..6
+    # joint2（肩关节）为 60 N·m，其余为 30 N·m
+    effort_limits: tuple[float, ...] = (
+        30.0, 60.0, 30.0, 30.0, 30.0, 30.0,   # left arm
+        30.0, 60.0, 30.0, 30.0, 30.0, 30.0,   # right arm
+    )
 
     # ── 域随机化范围（回合级静态参数）──────────────────────────────
     cup_mass_range: tuple[float, float] = (0.1, 0.8)

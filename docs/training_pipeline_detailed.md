@@ -1,455 +1,1124 @@
-# 训练流程详解
-
-本文档描述 `scripts/train.py` 从启动到结束的完整训练流程。
+# Affordance-Guided Interaction 训练管线技术文档
 
 ---
 
-## 1. 启动
+## 0. 文档定位与适用范围
 
-运行 `python scripts/train.py` 后，系统依次完成以下准备工作。
+本文档是 Affordance-Guided Interaction 项目的训练系统技术规格说明书（Technical Specification），面向需要系统性理解项目整体架构、训练闭环机制与各层协作关系的工程与研究人员。
 
-### 1.1 读取配置
+文档以训练管线为主线，按"全局架构 → 模块职责 → 数学形式化 → 数据流与接口契约"的层次组织。各节在阐述模块功能的同时，给出关键的数学定义与算法伪代码，使读者能够建立对系统行为的精确理解。子模块的实现细节（逐行注释、API 参考等）由各模块 README 承担；本文聚焦于跨模块的协作方式与系统级行为。
 
-系统从项目根目录的 `configs/` 下读取五份配置文件并合并为一份统一配置：
+**关联文档**：
+- 奖励函数完整推导：[envs/Reward.md](../src/affordance_guided_interaction/envs/Reward.md)
+- 训练算法形式化：[training/README.md](../src/affordance_guided_interaction/training/README.md)
+- 环境层实现：[envs/README.md](../src/affordance_guided_interaction/envs/README.md)
+- 观测层语义规范：[observations/README.md](../src/affordance_guided_interaction/observations/README.md)
+- 策略网络架构：[policy/README.md](../src/affordance_guided_interaction/policy/README.md)
+- 域随机化参数表：[docs/randomization.md](./randomization.md)
+- TensorBoard 指标释义：[docs/tensorboard_guide.md](./tensorboard_guide.md)
 
-- `training/default.yaml` — 训练超参数、运行时设置
-- `env/default.yaml` — 环境物理参数
-- `policy/default.yaml` — 网络结构
-- `task/default.yaml` — 任务目标
-- `curriculum/default.yaml` — 课程阶段定义
+除非特别注明，本文以当前默认实现（default training path）为准。
 
-其中 `training/default.yaml` 同时包含运行时设置：设备选择、随机种子、是否无头模式、日志目录、checkpoint 目录、是否从 checkpoint 恢复等。这些参数不通过命令行传入，直接修改 yaml 文件即可切换本地验证和服务器训练。
+---i
 
-### 1.2 初始化设备与随机种子
+## 1. 项目概述与任务定义
 
-系统根据配置选择计算设备（CUDA 或 CPU），然后设置 PyTorch 和 NumPy 的随机种子，保证训练可复现。
+### 1.1 任务描述
 
-### 1.3 启动仿真运行时
+本项目研究的核心任务是在 Isaac Lab GPU 并行仿真环境中，训练一台双臂移动机器人（Dingo 底座 + 双 Unitree Z1 机械臂）在持杯约束下完成推门动作。形式化地，任务可表述为受限双臂操作问题：
 
-在构建环境之前，系统先通过 `launch_simulation_app()` 启动 Isaac Sim 仿真后端，然后基于 `env/default.yaml` 中的 `physics_dt` 与 `decimation` 显式创建 `SimulationContext`。若当前 Python 环境中没有安装 Isaac Sim / Isaac Lab，系统会打印提示并终止。
+给定机器人状态 $\mathbf{s}_t \in \mathcal{S}$、门体状态 $\mathbf{g}_t$、持杯上下文 $c \in \{\text{none}, \text{left\_only}, \text{right\_only}, \text{both}\}$，策略 $\pi_\theta$ 需输出连续力矩 $\mathbf{a}_t \in \mathbb{R}^{12}$，使得门铰链角度 $\theta_t$ 单调递增至目标值 $\theta^* = \frac{\pi}{2}$，同时满足持杯稳定性约束。
+
+### 1.2 问题特征
+
+该任务具有以下关键性质：
+
+**接触丰富的时序控制问题**。门体动力学未知（质量、阻尼由域随机化采样），策略必须通过交互历史进行在线辨识。设门铰链动力学为 $\dot{\theta} = f(\tau_{\text{ext}}, m_{\text{door}}, d_{\text{hinge}}, \theta)$，其中 $f$ 对策略不可直接观测，必须通过 RNN 隐状态 $h_t$ 间接推断。
+
+**约束驱动的双臂协调问题**。在四种正式上下文 $c \in \mathcal{C}$ 下，策略需在统一动作空间 $\mathbb{R}^{12}$ 中学会差异化的动作模式，而非依赖硬编码角色分配。持杯侧（$m_{\text{occupied}} = 1$）需同时满足稳定性约束，自由侧（$m_{\text{occupied}} = 0$）负责主动施力。
+
+**部分可观测性（POMDP）**。策略无法直接观测门板质量 $m_{\text{door}} \sim \mathcal{U}(5.0, 20.0)$、门铰链阻尼 $d_{\text{hinge}} \sim \mathcal{U}(0.5, 5.0)$、杯体质量 $m_{\text{cup}} \sim \mathcal{U}(0.1, 0.8)$ 等隐藏参数，构成典型的 POMDP 结构。此性质决定了 Actor 必须采用循环结构以积累时序信息。
+
+**Sim-to-Real 鲁棒性要求**。域随机化覆盖质量、阻尼、基座位姿、动作噪声与观测噪声五个维度，策略需在参数扰动下保持行为稳定。
+
+### 1.3 默认路径的设计取舍
+
+当前默认训练路径采用 6 维结构化门几何信号 $\mathbf{d}_t \in \mathbb{R}^6$（`base_link` 坐标系下的门叶中心坐标 $\mathbf{p}_c \in \mathbb{R}^3$ 与门叶法向量 $\mathbf{n} \in \mathbb{R}^3$）作为门相关输入，由仿真 ground truth 直接计算，不经过视觉感知模型。此取舍将问题定义为"基于结构化低维几何信号的双臂受约束推门控制"，而非"端到端视觉控制"。
+
+### 1.4 系统目标
+
+项目训练系统需满足以下工程目标：
+
+1. 在统一策略下覆盖四种正式上下文 $c \in \mathcal{C}$。
+2. 在域随机化扰动下保持训练稳定性与执行鲁棒性。
+3. 维持 Actor-Critic 信息边界：训练期使用 privileged information，部署期不依赖仿真 oracle。
+4. 提供完整的监控、日志、checkpoint、导出与可视化工程链路。
 
 ---
 
-## 2. 组件构建
+## 2. 仓库结构与模块职责
 
-所有训练组件在进入主循环前按以下顺序创建。
+```
+Affordance-Guided-Interaction/
+├── scripts/          # 训练、评估、导出、场景调试入口脚本
+├── configs/          # YAML 配置体系（7 份配置文件）
+├── assets/           # USD 资产（机器人、门、杯体、房间）
+├── src/affordance_guided_interaction/
+│   ├── envs/         # GPU 批量并行仿真环境（DirectRLEnv）
+│   ├── observations/ # 观测层语义规范与通用工具
+│   ├── policy/       # Actor-Critic 网络与动作头
+│   ├── training/     # Rollout、Buffer、PPO、课程、随机化
+│   ├── visualization/# Rollout artifact 配置与输出
+│   ├── utils/        # 运行时启动、路径、环境检测
+│   └── door_perception/ # [历史] 视觉感知实验模块
+├── docs/             # 设计文档
+├── tests/            # 回归测试
+└── configs/          # 参数配置
+```
 
-### 2.1 GPU 批量并行环境
+### 模块职责矩阵
 
-系统创建一个 `DoorPushEnv` 实例（`DirectRLEnv` 子类），内含 $N$ 个 GPU 并行仿真的门推交互环境。$N$ 的值由 `training/default.yaml` 中的 `num_envs` 决定，写入 `DoorPushEnvCfg.scene.num_envs`。
+| 模块 | 职责 | 默认路径参与度 |
+|------|------|---------------|
+| `scripts/train.py` | 装配并驱动完整训练循环 | 核心入口 |
+| `configs/` | 统一管理训练、环境、策略、任务、课程、奖励与可视化参数 | 配置来源 |
+| `assets/` | USD 物理资产声明 | 底层资源 |
+| `envs/` | GPU batched 仿真环境：物理交互、观测构建、奖励计算、终止判定 | 核心 |
+| `observations/` | 观测层结构边界与语义规范定义 | 接口规范层 |
+| `policy/` | Actor-Critic 网络定义与前向推理 | 核心 |
+| `training/` | 轨迹采集、GAE 估计、PPO 更新、课程推进、随机化调度 | 核心 |
+| `visualization/` | Rollout artifact（视频、帧图）生成 | 输出链路 |
+| `door_perception/` | [历史] RGB-D → Point-MAE 视觉感知管线 | 非默认路径 |
 
-`DoorPushEnv` 是**自包含**的环境类，一个类承担了旧架构中 `DoorInteractionEnv`、`SceneFactory`、`ContactMonitor`、`TaskManager`、`ActorObsBuilder`、`RewardManager` 六个组件的全部职责。所有 per-env 状态使用 `(N, ...)` 形状的 torch tensor 表示，观测/奖励/终止判定均为纯 tensor 操作，无 Python 循环。
+---
 
-#### 2.1.1 DoorPushEnv 内部结构
+## 3. 系统架构
 
-`DoorPushEnv` 继承自 Isaac Lab 的 `DirectRLEnv`，在 `__init__()` 中完成以下初始化：
+系统的六层架构遵循单向依赖原则：上层消费下层提供的能力，下层不反向依赖上层的训练细节。
 
-| 初始化步骤 | 内容 |
+```text
+┌──────────────────────────────────────────────────────┐
+│                 监控与输出层                           │
+│  TensorBoard · 控制台日志 · Checkpoint · 导出脚本       │
+├──────────────────────────────────────────────────────┤
+│                 训练优化层                             │
+│  PPOTrainer · RolloutBuffer · RolloutCollector        │
+│  CurriculumManager · DomainRandomizer                 │
+├──────────────────────────────────────────────────────┤
+│                 策略网络层                             │
+│  Actor (多分支编码器 + RNN + ActionHead)               │
+│  Critic (多分支编码器 + privileged编码器 + MLP)         │
+├──────────────────────────────────────────────────────┤
+│                 观测与状态表示层                        │
+│  Actor Obs (96D) · Critic Obs (109D) · privileged (13D)│
+├──────────────────────────────────────────────────────┤
+│                 仿真环境层                             │
+│  DoorPushEnv (DirectRLEnv) · DirectRLEnvAdapter       │
+├──────────────────────────────────────────────────────┤
+│                 资源与配置层                           │
+│  DoorPushEnvCfg · DoorPushSceneCfg · 7×YAML · USD     │
+└──────────────────────────────────────────────────────┘
+```
+
+**数据流方向**：
+
+```text
+configs/ + assets/
+      │
+      ▼
+DoorPushEnvCfg ──► DoorPushEnv (DirectRLEnv)
+      │                 │
+      │    ┌────────────┼──────────────┐
+      │    │            │              │
+      │    ▼            ▼              ▼
+      │  观测构建    动作执行       奖励/done
+      │  (96D/109D)  (12D torque)   (标量+分项)
+      │    │            │              │
+      ▼    ▼            ▼              ▼
+DirectRLEnvAdapter ──► RolloutCollector
+                         │
+                         ▼
+                    RolloutBuffer
+                         │
+                         ▼
+                    PPOTrainer ──► Actor/Critic 参数更新
+                         │
+              ┌──────────┴──────────┐
+              ▼                     ▼
+       TensorBoard/日志          Checkpoint/导出
+```
+
+---
+
+## 4. 资源与配置体系
+
+### 4.1 物理资产
+
+默认训练路径依赖以下物理资产，均位于 `assets/` 目录下，由 `DoorPushSceneCfg` 以声明式 `@configclass` 引用：
+
+| 资产 | USD 路径 | 关键属性 |
+|------|---------|---------|
+| 双臂机器人 | `assets/robot/usd/uni_dingo_dual_arm.usd` | 12 个臂关节 + 4 个轮关节 + 2 个云台关节；臂关节力矩上限 joint2=60 N·m，其余=30 N·m |
+| 轻量机器人 | `assets/robot/usd/uni_dingo_lite.usd` | 移除轮子、云台、支架；固定底座；关闭自碰撞 |
+| 推门 | `assets/minimal_push_door/solid_push_door.usda` | 单铰链关节；默认阻尼 2.0 N·m·s/rad |
+| 杯体 | `assets/grasp_objects/cup/carry_cup.usda` | 默认质量 0.3 kg（域随机化覆盖范围 0.1–0.8 kg） |
+| 房间 | `assets/minimal_push_door/room_shell.usda` | 碰撞几何边界 |
+
+环境配置类支持以下变体，各变体代表不同的场景规模与训练速度权衡：
+
+| 配置类 | 特征 |
+|--------|------|
+| `DoorPushEnvCfg` | 完整场景、完整机器人、自碰撞启用 |
+| `DoorPushLiteEnvCfg` | 移除 room、固定底座、裁减 wheels/pan-tilt |
+| `DoorPushLiteTrainEnvCfg` | 轻量版 + 训练门资产 + visual-free 机器人 + 关闭自碰撞 |
+
+### 4.2 配置文件体系
+
+训练过程统一加载 7 份 YAML 配置文件：
+
+| 配置文件 | 核心参数 | 消费者 |
+|---------|---------|--------|
+| `configs/training/default.yaml` | `total_steps`, `n_steps_per_rollout`, PPO 超参数, profile 系统 | `train.py`, `PPOTrainer` |
+| `configs/env/default.yaml` | `physics_dt = 1/120$ s, `decimation = 2` | `build_env_cfg()` |
+| `configs/policy/default.yaml` | `rnn_hidden = 512`, `rnn_layers = 1`, `log_std_init = -0.5` | `build_models()` |
+| `configs/task/default.yaml` | `door_angle_target = 1.57` rad, `cup_drop_threshold = 0.15` m | `DoorPushEnvCfg` |
+| `configs/curriculum/default.yaml` | `initial_stage`, `window_size = 50`, `threshold = 0.8` | `CurriculumManager` |
+| `configs/reward/default.yaml` | 奖励权重 17 项（详见 §8.3） | `_inject_reward_params()` → `DoorPushEnvCfg` |
+| `configs/visualization/default.yaml` | rollout 可视化参数 | `rollout_demo.py` |
+
+**训练 profile 系统**：`training/default.yaml` 内置 5 档可扩展 profile，通过 `num_envs` 选择：
+
+| Profile | `num_envs` | `n_steps` | `actor_lr` | `mini_batches` | `epochs` | `seq_length` |
+|---------|-----------|-----------|-----------|----------------|----------|-------------|
+| `env_256` | 256 | 64 | 3×10⁻⁴ | 8 | 4 | 16 |
+| `env_512` | 512 | 64 | 3×10⁻⁴ | 16 | 4 | 16 |
+| `env_1024` | 1024 | 64 | 2.5×10⁻⁴ | 16 | 3 | 16 |
+| `env_2048` | 2048 | 64 | 2×10⁻⁴ | 32 | 3 | 16 |
+| `env_4096` | 4096 | 16 | 2×10⁻⁴ | 16 | 3 | 16 |
+
+### 4.3 运行时配置解析
+
+`training/default.yaml` 中的字段分为两类：
+
+1. **运行时设置**：由 `resolve_train_runtime_config()` 提取为 `TrainRuntimeConfig` 数据类，包含 `headless`、`device`、`seed`、`resume`、`log_dir`、`ckpt_dir`、`num_envs`、`env_variant`。
+
+2. **训练过程参数**：保留在合并后的 `cfg` 字典中，由 `train.py` 直接读取，包含 `total_steps`、`n_steps_per_rollout`、`ppo.*`、`log_interval`、`checkpoint_interval` 等。
+
+### 4.4 奖励参数注入机制
+
+奖励超参数的默认来源为独立的 `configs/reward/default.yaml`。`train.py` 在构建环境配置时通过 `_inject_reward_params()` 将 `task`、`stability` 和 `safety` 三组参数覆盖写入 `DoorPushEnvCfg`。此设计实现了环境逻辑（通过 `cfg.rew_*` 字段计算奖励）与奖励设计（通过 YAML 管理）的解耦。
+
+---
+
+## 5. 仿真环境层
+
+`envs/` 是唯一与 Isaac Lab 物理引擎直接交互的层。默认环境实现为 `DoorPushEnv`，以 Isaac Lab 的 `DirectRLEnv` 为基类，在单块 GPU 上批量并行运行 $N$ 个环境实例。
+
+### 5.1 场景声明与 Cloner 机制
+
+场景由 `DoorPushSceneCfg` 以声明式定义。机器人、门、杯体、地面、照明等对象注册为 `InteractiveSceneCfg` 的配置条目，通过 `{ENV_REGEX_NS}` 占位符交由 Isaac Lab Cloner 自动复制至 `/World/envs/env_0`、`env_1`、...、`env_{N-1}` 子树。
+
+Cloner 在 GPU 批量语义下统一完成场景实例化，无需显式编写逐环境加载逻辑。因此 `door_push_env.py` 中的 `_setup_scene()` 几乎为空——场景拓扑已由配置声明提前固定。
+
+### 5.2 DoorPushEnv 核心接口
+
+`DoorPushEnv` 作为 `DirectRLEnv` 的子类，实现以下六个核心接口方法：
+
+| 方法 | 职责 | 输入 → 输出 |
+|------|------|-------------|
+| `_setup_scene()` | 注册场景 prim 路径索引 | — |
+| `_reset_idx(env_ids)` | 选择性环境重置、域随机化采样、持杯初始化 | `env_ids: Tensor` → 更新仿真状态 |
+| `_pre_physics_step(actions)` | 力矩裁剪、噪声注入、写入关节目标 | `actions: (N, 12)` → 物理引擎 |
+| `_get_observations()` | 构造 Actor/Critic 观测张量 | — → `obs_dict: {actor: (N,96), critic: (N,109)}` |
+| `_get_rewards()` | 计算任务奖励、稳定性奖励、安全惩罚 | — → `rewards: (N,)`, `extras["reward_info"]` |
+| `_get_dones()` | 判定成功、掉杯、超时 | — → `terminated: (N,)`, `truncated: (N,)`, `extras` |
+
+**关键工程约束**：上述所有方法均操作 `(N, ...)` 批量张量，不存在逐环境的 Python 循环。中间计算结果（末端加速度、tilt proxy、`cup_dropped`）在 `_get_observations()` 中缓存，供后续 `_get_rewards()` 和 `_get_dones()` 复用，避免重复计算。
+
+### 5.3 动作执行与噪声注入
+
+`_pre_physics_step()` 中的动作处理流程为：
+
+$$\tilde{\mathbf{a}}_t = \text{clip}(\mathbf{a}_t,\; -\tau_{\max},\; \tau_{\max})$$
+
+$$\hat{\mathbf{a}}_t = \text{clip}\!\left(\tilde{\mathbf{a}}_t + \boldsymbol{\epsilon}_a,\; -\tau_{\max},\; \tau_{\max}\right), \quad \boldsymbol{\epsilon}_a \sim \mathcal{N}(\mathbf{0},\; \sigma_a^2 \mathbf{I}_{12})$$
+
+其中 $\boldsymbol{\tau}_{\max} \in \mathbb{R}^{12}$ 为 per-joint 力矩上限向量，$\sigma_a = 0.02$ 为动作噪声标准差。力矩上限来自 Z1 URDF 硬件规格，按 `ARM_JOINT_NAMES` 顺序排列：
+
+$$\boldsymbol{\tau}_{\max} = (30, 60, 30, 30, 30, 30,\; 30, 60, 30, 30, 30, 30) \text{ N·m}$$
+
+其中 joint2（肩关节）上限为 60 N·m，其余 5 个关节上限均为 30 N·m，双臂对称。`DoorPushSceneCfg` 中 actuator 配置按此拆分为 `shoulder_joints`（60 N·m）和 `arm_joints`（30 N·m）两组。裁剪执行两次：第一次移除策略输出的超限分量，第二次保证噪声注入后仍处于物理安全范围。
+
+### 5.4 观测构建的数学过程
+
+#### 5.4.1 坐标系变换
+
+所有几何量均在 `base_link` 坐标系下表达，以消除对世界坐标的依赖。设机器人基座在世界系下的位姿为 $(\mathbf{p}_b, \mathbf{q}_b)$，对应旋转矩阵为 $\mathbf{R}_b \in SO(3)$，则任意世界系向量 $\mathbf{v}^W$ 到 base 系的变换为：
+
+$$\mathbf{v}^B = \mathbf{R}_b^\top (\mathbf{v}^W - \mathbf{p}_b)$$
+
+此变换应用于末端执行器位置、速度和门几何信息。
+
+#### 5.4.2 末端加速度的数值微分
+
+末端线加速度与角加速度通过一阶后向差分计算：
+
+$$\mathbf{a}_t = \frac{\mathbf{v}_t - \mathbf{v}_{t-1}}{\Delta t_{\text{ctrl}}}, \quad \boldsymbol{\alpha}_t = \frac{\boldsymbol{\omega}_t - \boldsymbol{\omega}_{t-1}}{\Delta t_{\text{ctrl}}}$$
+
+其中 $\Delta t_{\text{ctrl}} = \text{physics\_dt} \times \text{decimation} = \frac{1}{120} \times 2 = \frac{1}{60}$ s 为控制步长。
+
+#### 5.4.3 Tilt Proxy 计算
+
+持杯稳定性信号 tilt 的计算方式为：将世界系重力向量 $\mathbf{g}^W = (0, 0, -9.81)^\top$ 变换至末端执行器局部坐标系，取其水平分量之范数：
+
+$$\mathbf{g}^{\text{local}} = \mathbf{R}_{\text{EE}}^\top \mathbf{g}^W$$
+
+$$\text{tilt} = \left\| P_{xy}(\mathbf{g}^{\text{local}}) \right\| = \sqrt{(g_x^{\text{local}})^2 + (g_y^{\text{local}})^2}$$
+
+物理含义：当末端执行器保持水平时，$\mathbf{g}^{\text{local}} = (0, 0, -g)^\top$，tilt $= 0$；倾斜越大，tilt 值越大。
+
+#### 5.4.4 门几何观测计算
+
+6 维 `door_geometry` 信号的计算过程为：
+
+1. 获取门叶 body 在世界系下的位姿 $(\mathbf{p}_d^W, \mathbf{q}_d^W)$，构造旋转矩阵 $\mathbf{R}_d$。
+2. 计算门叶中心在世界系下的坐标：$\mathbf{c}^W = \mathbf{p}_d^W + \mathbf{R}_d \cdot \mathbf{o}_{\text{center}}$，其中 $\mathbf{o}_{\text{center}}$ 为门叶几何中心在门叶局部系下的固定偏移。
+3. 计算门叶法向量在世界系下：$\mathbf{n}^W = \mathbf{R}_d \cdot \mathbf{n}_{\text{local}}$。
+4. 变换至 base 系：$\mathbf{c}^B = \mathbf{R}_b^\top(\mathbf{c}^W - \mathbf{p}_b)$，$\mathbf{n}^B = \mathbf{R}_b^\top \mathbf{n}^W$。
+
+最终输出 $\mathbf{d}_t = [\mathbf{c}^B;\; \mathbf{n}^B] \in \mathbb{R}^6$。
+
+### 5.5 DirectRLEnvAdapter
+
+`DirectRLEnvAdapter` 将 `DoorPushEnv` 的 batch tensor 输出包装为训练侧可稳定消费的接口。其核心功能是将 pre-reset 的 `extras` 重建为 per-env `info` 字典，使训练层能获取"上一 episode 真实结束状态"而非已 reset 的新 episode 初始状态。
+
+### 5.6 批量环境中的 Reset 语义
+
+默认训练路径在场景创建时预生成所有资产（含左右杯体），运行时不反复创建或删除。Reset 语义为"固定拓扑下的状态重写"：
+
+- 不需要持杯的环境：杯体 teleport 至远处 $(100, 0, 0)$。
+- 需要持杯的环境：`_batch_cup_grasp_init()` 直接将关节写入预设抓取姿态，并将杯体 teleport 至夹爪对应位置。
+
+此纯状态写入方式避免在部分环境 reset 时调用 `sim.step()` 影响其他并行环境，是 GPU batched 设计中的关键工程约束。
+
+---
+
+## 6. 观测层：状态表示契约
+
+观测层定义了环境与策略之间的正式数据契约。虽然观测构建逻辑在当前实现中已直接并入 `DoorPushEnv._get_observations()`，但观测层的结构边界和语义规范仍然是系统设计的核心组成部分。
+
+### 6.1 Actor 观测
+
+当前 Actor 观测总维度为 $\dim(\mathbf{o}_t^{\text{actor}}) = 96$，由五个分支拼接而成：
+
+$$\mathbf{o}_t^{\text{actor}} = [\mathbf{o}_t^{\text{proprio}};\; \mathbf{o}_t^{\text{ee}};\; \mathbf{o}_t^{\text{ctx}};\; \mathbf{o}_t^{\text{stab}};\; \mathbf{o}_t^{\text{geom}}]$$
+
+| 分支 | 维度 | 组成 | 数学表示 |
+|------|------|------|---------|
+| `proprio` | 48 | 关节位置 $\mathbf{q} \in \mathbb{R}^{12}$、关节速度 $\dot{\mathbf{q}} \in \mathbb{R}^{12}$、关节力矩 $\boldsymbol{\tau} \in \mathbb{R}^{12}$、上一步动作 $\mathbf{a}_{t-1} \in \mathbb{R}^{12}$ | $[\mathbf{q};\; \dot{\mathbf{q}};\; \boldsymbol{\tau};\; \mathbf{a}_{t-1}]$ |
+| `ee` | 38 | 左右末端位置 $\mathbf{p} \in \mathbb{R}^3$、姿态 $\mathbf{q}_{\text{quat}} \in \mathbb{R}^4$（仅左臂）、线速度 $\mathbf{v} \in \mathbb{R}^3$、角速度 $\boldsymbol{\omega} \in \mathbb{R}^3$、线加速度 $\mathbf{a} \in \mathbb{R}^3$、角加速度 $\boldsymbol{\alpha} \in \mathbb{R}^3$ | $[\mathbf{p}_L;\; \mathbf{q}_L;\; \mathbf{v}_L;\; \boldsymbol{\omega}_L;\; \mathbf{a}_L;\; \boldsymbol{\alpha}_L;\; \mathbf{p}_R;\; \mathbf{v}_R;\; \boldsymbol{\omega}_R;\; \mathbf{a}_R;\; \boldsymbol{\alpha}_R]$ |
+| `context` | 2 | 左臂占用标志 $m_L$、右臂占用标志 $m_R$ | $[m_L;\; m_R] \in \{0,1\}^2$ |
+| `stability` | 2 | 左侧 tilt $\text{tilt}_L$、右侧 tilt $\text{tilt}_R$ | $[\text{tilt}_L;\; \text{tilt}_R]$ |
+| `door_geometry` | 6 | `base_link` 系下门叶中心 $\mathbf{c}^B \in \mathbb{R}^3$、门叶法向量 $\mathbf{n}^B \in \mathbb{R}^3$ | $[\mathbf{c}^B;\; \mathbf{n}^B]$ |
+
+**观测噪声**：仅注入至 `proprio` 分支中的关节位置和关节速度（共 24 维）：
+
+$$\hat{\mathbf{q}} = \mathbf{q} + \boldsymbol{\epsilon}_q, \quad \hat{\dot{\mathbf{q}}} = \dot{\mathbf{q}} + \boldsymbol{\epsilon}_{\dot{q}}, \quad \boldsymbol{\epsilon} \sim \mathcal{N}(\mathbf{0},\; \sigma_o^2 \mathbf{I})$$
+
+其中 $\sigma_o = 0.01$。Critic 观测使用无噪声的真实状态（非对称 Actor-Critic 设计）。
+
+**设计要点**：
+
+1. **Base-relative 表达**：所有几何量在 `base_link` 坐标系下表达，策略看到的是相对几何关系而非绝对世界坐标，提升对基座位姿扰动的鲁棒性。
+2. **Tilt 独立性**：`stability` 分支仅包含 tilt 标量，不与速度/加速度混杂；后者已在 `ee` 分支中完整表达。
+3. **门信号纯几何化**：`door_geometry` 来自仿真 ground truth 的几何计算，不经过视觉感知模型，不依赖相机更新频率。
+
+### 6.2 Critic 观测与 Privileged Information
+
+当前 Critic 观测总维度为 $\dim(\mathbf{o}_t^{\text{critic}}) = 109$，结构为：
+
+$$\mathbf{o}_t^{\text{critic}} = [\mathbf{o}_t^{\text{actor,\,clean}};\; \boldsymbol{\psi}_t]$$
+
+其中 $\mathbf{o}_t^{\text{actor,\,clean}}$ 为 Actor 观测的无噪声版本（$\sigma_o = 0$），$\boldsymbol{\psi}_t \in \mathbb{R}^{13}$ 为 privileged 信息：
+
+| Privileged 信号 | 维度 | 含义 |
+|----------------|------|------|
+| `door_pose` | 7 | 门叶在世界系下的位姿 $(\mathbf{p}, \mathbf{q}_{\text{quat}})$ |
+| `door_joint_pos` | 1 | 门铰链角度 $\theta_t$ |
+| `door_joint_vel` | 1 | 门铰链角速度 $\dot{\theta}_t$ |
+| `cup_mass` | 1 | 当前 episode 的杯体质量 $m_{\text{cup}}$ |
+| `door_mass` | 1 | 当前 episode 的门板质量 $m_{\text{door}}$ |
+| `door_damping` | 1 | 当前 episode 的门铰链阻尼 $d_{\text{hinge}}$ |
+| `cup_dropped` | 1 | 掉杯事件标志 $\mathbb{1}[\text{cup\_dropped}]$ |
+
+**信息边界的设计意义**：Actor 无法直接观测隐藏动力学参数 $(m_{\text{door}}, d_{\text{hinge}}, m_{\text{cup}})$ 和门的真实铰链状态 $(\theta_t, \dot{\theta}_t)$，必须通过交互历史间接推断。Critic 则利用这些额外信息降低价值估计的方差，加速训练收敛。此非对称设计确保部署时不依赖仿真 oracle。
+
+---
+
+## 7. 策略网络层
+
+### 7.1 Actor 架构
+
+Actor 采用多分支编码器 + 循环主干 + 高斯动作头的结构。形式化地，给定观测 $\mathbf{o}_t^{\text{actor}}$ 的五个分支，前向过程为：
+
+**Step 1：分支编码**
+
+$$\mathbf{f}_t^{\text{proprio}} = E_p(\mathbf{o}_t^{\text{proprio}}) \in \mathbb{R}^{d_p}, \quad \mathbf{f}_t^{\text{ee}} = E_e(\mathbf{o}_t^{\text{ee}}) \in \mathbb{R}^{d_e}$$
+
+$$\mathbf{f}_t^{\text{stab}} = E_s(\mathbf{o}_t^{\text{stab}}) \in \mathbb{R}^{d_s}, \quad \mathbf{f}_t^{\text{geom}} = E_g(\mathbf{o}_t^{\text{geom}}) \in \mathbb{R}^{d_g}$$
+
+其中各 $E_*$ 为轻量 MLP 编码器。`context` 分支因维度极低（2D）而直接拼接，不经过编码器。
+
+**Step 2：特征融合**
+
+$$\mathbf{f}_t = [\mathbf{f}_t^{\text{proprio}};\; \mathbf{f}_t^{\text{ee}};\; \mathbf{o}_t^{\text{ctx}};\; \mathbf{f}_t^{\text{stab}};\; \mathbf{f}_t^{\text{geom}}] \in \mathbb{R}^{d_f}$$
+
+**Step 3：循环时序建模**
+
+$$\mathbf{h}_t = \text{GRU}(\mathbf{f}_t,\; \mathbf{h}_{t-1})$$
+
+默认配置下，`rnn_hidden = 512`，`rnn_layers = 1`，`rnn_type = gru`（可切换为 LSTM）。RNN 在此系统中的角色不是性能装饰，而是应对部分可观测性的必要结构：由于 Actor 无法直接观测隐藏参数，必须通过 GRU 隐状态 $\mathbf{h}_t \in \mathbb{R}^{512}$ 积累交互历史以间接推断。
+
+**Step 4：动作采样**
+
+$$\boldsymbol{\mu}_t, \boldsymbol{\sigma}_t = \text{Head}(\mathbf{h}_t)$$
+
+$$\mathbf{a}_t \sim \boldsymbol{\pi}_\theta(\cdot | \mathbf{o}_t, \mathbf{h}_t) = \mathcal{N}(\boldsymbol{\mu}_t,\; \text{diag}(\boldsymbol{\sigma}_t^2))$$
+
+其中 $\boldsymbol{\mu}_t \in \mathbb{R}^{12}$ 为均值向量，$\boldsymbol{\sigma}_t = \exp(\boldsymbol{\ell}) \in \mathbb{R}^{12}$ 为逐维标准差（$\boldsymbol{\ell}$ 为可学习参数，初始化为 $\ell_0 = -0.5$），$\mathbf{a}_t \in \mathbb{R}^{12}$ 为双臂 12 维连续力矩。
+
+### 7.2 Critic 架构
+
+Critic 使用与 Actor 对应的独立分支结构（不共享参数），并额外增加一个 `privileged` 编码器：
+
+$$\mathbf{g}_t^{\text{actor}} = [E_p^c(\mathbf{o}_t^{\text{proprio}});\; E_e^c(\mathbf{o}_t^{\text{ee}});\; \mathbf{o}_t^{\text{ctx}};\; E_s^c(\mathbf{o}_t^{\text{stab}});\; E_g^c(\mathbf{o}_t^{\text{geom}})]$$
+
+$$\mathbf{g}_t^{\text{priv}} = E_{\psi}(\boldsymbol{\psi}_t)$$
+
+$$V_t = \text{MLP}([\mathbf{g}_t^{\text{actor}};\; \mathbf{g}_t^{\text{priv}}]) \in \mathbb{R}$$
+
+Critic 默认不使用循环结构（因其已拥有完整状态信息），MLP 层配置为 $\{512, 256, 128, 1\}$。
+
+### 7.3 动作语义与安全分工
+
+策略输出始终定义为 12 维 raw torque $\mathbf{a}_t \in \mathbb{R}^{12}$。环境在执行前做硬裁剪至 $[-\tau_{\max}, \tau_{\max}]$。安全惩罚中的"力矩超限"以 raw action 为依据。此分工意味着：
+
+- `policy/` 负责表达控制意图。
+- `envs/` 负责执行约束和物理安全边界。
+- 奖励函数负责将超限控制意图作为训练信号显式反馈给策略。
+
+当前设计明确不使用动作 mask：即使某一侧处于持杯状态，该侧仍允许输出动作。策略必须在统一动作空间中通过 reward 和上下文约束学会差异化的动作模式。
+
+### 7.4 时序语义
+
+每个并行环境维护独立的 Actor 隐状态 $\mathbf{h}_t^{(i)}$：
+
+- **Episode 内部**：隐状态连续传递 $\mathbf{h}_0 \to \mathbf{h}_1 \to \cdots \to \mathbf{h}_T$。
+- **Episode 结束**：对应环境的隐状态被清零 $\mathbf{h}_0^{(i)} = \mathbf{0}$。
+
+`RolloutCollector` 在采样阶段缓存每步的 hidden state；`RolloutBuffer` 在更新阶段将缓存切分为 TBPTT 所需的序列片段。
+
+---
+
+## 8. 奖励函数
+
+本节给出奖励函数的完整数学定义。总奖励为任务奖励、双侧稳定性奖励与安全惩罚的组合：
+
+$$r_t = r_t^{\text{task}} + m_L \cdot r_t^{\text{stab},L} + m_R \cdot r_t^{\text{stab},R} - r_t^{\text{safe}}$$
+
+其中 $m_L, m_R \in \{0, 1\}$ 为左右臂持杯占用标志（occupancy mask），仅对持杯侧计算稳定性奖励。
+
+### 8.1 任务奖励
+
+任务奖励由角度增量奖励与一次性成功 bonus 组成：
+
+$$r_t^{\text{task}} = w(\theta_t) \cdot \Delta\theta_t + w_{\text{open}} \cdot \mathbb{1}[\theta_t \geq \theta_{\text{bonus}} \;\wedge\; \neg\text{already\_succeeded}]$$
+
+其中 $\Delta\theta_t = \theta_t - \theta_{t-1}$ 为门角度增量，$w_{\text{open}} = 50.0$ 为成功 bonus 权重，$\theta_{\text{bonus}} = 1.2$ rad 为 bonus 触发阈值。
+
+权重函数 $w(\theta_t)$ 的设计目的是在门接近完全打开后逐步衰减增量奖励，避免策略过度优化已完成的子目标：
+
+$$w(\theta_t) = \begin{cases} w_\delta & \text{if } \theta_t \leq \theta_{\text{bonus}} \\ w_\delta \cdot \max\!\left(\alpha,\; 1 - k_{\text{decay}} \cdot (\theta_t - \theta_{\text{bonus}})\right) & \text{if } \theta_t > \theta_{\text{bonus}} \end{cases}$$
+
+默认参数：$w_\delta = 10.0$，$\alpha = 0.3$（衰减下限比例），$k_{\text{decay}} = 0.5$（衰减速率）。
+
+### 8.2 稳定性奖励（每侧 7 项）
+
+对每侧 $s \in \{L, R\}$，稳定性奖励由 7 个分量组成：
+
+$$r_t^{\text{stab},s} = r_{\text{zero-acc}} + r_{\text{zero-ang}} + r_{\text{acc}} + r_{\text{ang}} + r_{\text{tilt}} + r_{\text{smooth}} + r_{\text{reg}}$$
+
+**分量 1：零线性加速度奖励**（高斯核，鼓励加速度趋零）
+
+$$r_{\text{zero-acc}} = w_{\text{zero-acc}} \cdot \exp\!\left(-\lambda_{\text{acc}} \cdot \|\mathbf{a}_t\|^2\right)$$
+
+参数：$w_{\text{zero-acc}} = 1.0$，$\lambda_{\text{acc}} = 2.0$。
+
+**分量 2：零角加速度奖励**（高斯核，鼓励角加速度趋零）
+
+$$r_{\text{zero-ang}} = w_{\text{zero-ang}} \cdot \exp\!\left(-\lambda_{\text{ang}} \cdot \|\boldsymbol{\alpha}_t\|^2\right)$$
+
+参数：$w_{\text{zero-ang}} = 0.5$，$\lambda_{\text{ang}} = 1.0$。
+
+**分量 3：线性加速度惩罚**（二次型）
+
+$$r_{\text{acc}} = -w_{\text{acc}} \cdot \|\mathbf{a}_t\|^2$$
+
+参数：$w_{\text{acc}} = 0.5$。
+
+**分量 4：角加速度惩罚**（二次型）
+
+$$r_{\text{ang}} = -w_{\text{ang}} \cdot \|\boldsymbol{\alpha}_t\|^2$$
+
+参数：$w_{\text{ang}} = 0.3$。
+
+**分量 5：倾斜惩罚**（基于重力在末端局部系的水平投影）
+
+$$r_{\text{tilt}} = -w_{\text{tilt}} \cdot \left\|P_{xy}\!\left(\mathbf{R}_{\text{EE}}^\top \mathbf{g}\right)\right\|^2$$
+
+参数：$w_{\text{tilt}} = 0.3$。
+
+**分量 6：平滑度惩罚**（力矩变化率的二次惩罚）
+
+$$r_{\text{smooth}} = -w_{\text{smooth}} \cdot \|\boldsymbol{\tau}_t - \boldsymbol{\tau}_{t-1}\|^2$$
+
+参数：$w_{\text{smooth}} = 0.1$。
+
+**分量 7：力矩正则化**（鼓励小力矩输出）
+
+$$r_{\text{reg}} = -w_{\text{reg}} \cdot \|\boldsymbol{\tau}_t\|^2$$
+
+参数：$w_{\text{reg}} = 0.01$。
+
+**设计说明**：分量 1–2 采用高斯核 $\exp(-\lambda \|\cdot\|^2)$，在零附近提供稠密梯度信号；分量 3–4 采用二次惩罚，在整个值域提供一致梯度；分量 5 直接惩罚杯体倾斜；分量 6–7 鼓励平滑、小幅度的力矩输出。
+
+### 8.3 安全惩罚
+
+安全惩罚由四项组成：
+
+$$r_t^{\text{safe}} = r_{\text{joint\_limit}} + r_{\text{joint\_vel}} + r_{\text{torque\_limit}} + r_{\text{cup\_drop}}$$
+
+**关节限位惩罚**：
+
+$$r_{\text{joint\_limit}} = \beta_1 \sum_{i=1}^{12} \max\!\left(0,\; |q_i - q_i^c| - \mu \cdot \delta_i\right)^2$$
+
+其中 $q_i^c = \frac{q_i^{\min} + q_i^{\max}}{2}$ 为关节限位中心，$\delta_i = \frac{q_i^{\max} - q_i^{\min}}{2}$ 为半范围，$\mu = 0.9$ 为触发比例。参数：$\beta_1 = 1.0$。
+
+**关节速度惩罚**：
+
+$$r_{\text{joint\_vel}} = \beta_2 \sum_{i=1}^{12} \max\!\left(0,\; |\dot{q}_i| - \mu \cdot \dot{q}_i^{\max}\right)^2$$
+
+参数：$\beta_2 = 0.5$。
+
+**力矩超限惩罚**（以 raw action 为依据，per-joint limits）：
+
+$$r_{\text{torque\_limit}} = \beta_3 \sum_{i=1}^{12} \max\!\left(0,\; |a_i^{\text{raw}}| - \tau_{\max,i}\right)^2$$
+
+其中 $\tau_{\max,i}$ 为第 $i$ 个关节的力矩上限（来自 Z1 URDF：joint2 为 60 N·m，其余为 30 N·m）。参数：$\beta_3 = 0.01$。
+
+**掉杯惩罚**：
+
+$$r_{\text{cup\_drop}} = w_{\text{drop}} \cdot \mathbb{1}[\text{cup\_dropped}]$$
+
+参数：$w_{\text{drop}} = 100.0$。掉杯判定条件为杯体相对持杯末端偏移超过 `cup_drop_threshold = 0.15` m。
+
+### 8.4 奖励参数总表
+
+| 类别 | 参数 | 符号 | 默认值 |
+|------|------|------|--------|
+| 任务 | 角度增量权重 | $w_\delta$ | 10.0 |
+| 任务 | 衰减下限比例 | $\alpha$ | 0.3 |
+| 任务 | 衰减速率 | $k_{\text{decay}}$ | 0.5 |
+| 任务 | 成功 bonus 权重 | $w_{\text{open}}$ | 50.0 |
+| 任务 | bonus 触发角度 | $\theta_{\text{bonus}}$ | 1.2 rad |
+| 稳定性 | 零加速度权重 | $w_{\text{zero-acc}}$ | 1.0 |
+| 稳定性 | 加速度高斯衰减率 | $\lambda_{\text{acc}}$ | 2.0 |
+| 稳定性 | 零角加速度权重 | $w_{\text{zero-ang}}$ | 0.5 |
+| 稳定性 | 角加速度高斯衰减率 | $\lambda_{\text{ang}}$ | 1.0 |
+| 稳定性 | 加速度惩罚系数 | $w_{\text{acc}}$ | 0.5 |
+| 稳定性 | 角加速度惩罚系数 | $w_{\text{ang}}$ | 0.3 |
+| 稳定性 | 倾斜惩罚系数 | $w_{\text{tilt}}$ | 0.3 |
+| 稳定性 | 平滑度系数 | $w_{\text{smooth}}$ | 0.1 |
+| 稳定性 | 正则化系数 | $w_{\text{reg}}$ | 0.01 |
+| 安全 | 关节限位系数 | $\beta_1$ | 1.0 |
+| 安全 | 触发比例 | $\mu$ | 0.9 |
+| 安全 | 速度限位系数 | $\beta_2$ | 0.5 |
+| 安全 | 力矩限位系数 | $\beta_3$ | 0.01 |
+| 安全 | 掉杯惩罚 | $w_{\text{drop}}$ | 100.0 |
+
+---
+
+## 9. 训练优化与调度层
+
+### 9.1 RolloutCollector
+
+`RolloutCollector` 是训练循环与环境交互之间的主要驱动器。在每一轮 iteration 中，它在 $N$ 个并行环境中连续推进 $T$ 步（$T = \text{n\_steps\_per\_rollout}$），执行以下流程：
+
+```
+for t = 1, ..., T:
+    1. 将当前观测转换成策略前向所需的张量分支
+    2. Actor 前向：采样动作 a_t, 计算旧 log_prob π_old(a_t|o_t, h_t)
+    3. Critic 前向：估计价值 V(s_t)
+    4. 环境步进：将 a_t 送入环境，接收 o_{t+1}, r_t, d_t, info_t
+    5. 写入 Buffer：存储 (o_t, a_t, log_prob_t, V_t, r_t, d_t, h_t)
+    6. 对 done 环境清零 hidden state
+    7. 聚合统计量（mean_reward, 成功率, 上下文成功率, reward 分项）
+
+# Rollout 结束后
+last_values = Critic(o_{T+1})   # Bootstrap value
+```
+
+**统计聚合**：collector 在 rollout 内对以下指标求均值并生成 `collect_stats`：
+
+- `collect/mean_reward`：全部环境全部步的即时奖励均值。
+- `collect/completed_episodes`、`collect/successful_episodes`：完成和成功的 episode 计数。
+- `collect/episode_success_rate`：成功率 $\eta = \frac{N_{\text{success}}}{N_{\text{completed}}}$。
+- `collect/success_none`、`success_left_only`、`success_right_only`、`success_both`：按上下文拆分的成功率。
+- `reward/*`：一级奖励分量均值。
+
+### 9.2 RolloutBuffer
+
+`RolloutBuffer` 是固定容量的 on-policy 轨迹缓存。它预先分配形状为 $(T, N, \text{dim})$ 的张量，存储：
+
+- Actor 各分支观测、privileged 观测
+- 动作 $\mathbf{a}_t$、旧 log prob $\log \pi_{\theta_{\text{old}}}(\mathbf{a}_t)$、旧价值 $V_{\text{old}}(s_t)$
+- 奖励 $r_t$、终止标志 $d_t$
+- Hidden state $\mathbf{h}_t$（和 LSTM 的 cell state $\mathbf{c}_t$）
+
+两个核心职责：
+
+#### 9.2.1 GAE 优势估计
+
+Generalized Advantage Estimation (GAE) 的反向递推计算：
+
+$$\delta_t = r_t + \gamma V(s_{t+1})(1 - d_t) - V(s_t)$$
+
+$$\hat{A}_t = \delta_t + \gamma \lambda (1 - d_t) \hat{A}_{t+1}$$
+
+其中 $\gamma = 0.99$ 为折扣因子，$\lambda = 0.95$ 为 GAE 偏差-方差权衡参数。Returns 通过优势与价值估计之和计算：
+
+$$\hat{R}_t = \hat{A}_t + V(s_t)$$
+
+对于 rollout 最后一帧（$t = T$），$V(s_{T+1})$ 使用 collector 提供的 bootstrap value `last_values`，$d_T$ 使用 `last_dones`。
+
+#### 9.2.2 TBPTT 序列切分
+
+为支持截断反向传播（Truncated Backpropagation Through Time），buffer 将完整轨迹按固定序列长度 $L$ 切分：
+
+$$\text{num\_seqs\_per\_env} = \lfloor T / L \rfloor, \quad \text{total\_seqs} = \text{num\_seqs\_per\_env} \times N$$
+
+每个序列片段包含：
+- 起始步的 hidden state 作为 RNN 初始状态：$\mathbf{h}_0^{\text{seq}} \in \mathbb{R}^{1 \times B \times 512}$
+- 长度为 $L$ 的观测、动作、优势、returns 序列
+
+梯度仅在长度为 $L$ 的片段内传播，实现有界的内存消耗与稳定的长序列训练。
+
+### 9.3 PPOTrainer
+
+`PPOTrainer` 持有 Actor 和 Critic 各自独立的 Adam 优化器，在每一轮数据收集之后执行 $K$ epoch $\times$ $M$ mini-batch 的 PPO 更新。当前默认配置下 $K = 3$，$M = 16$。
+
+#### 9.3.1 PPO 总损失函数
+
+$$\mathcal{L}(\theta, \phi) = \mathcal{L}^{\text{clip}}(\theta) + c_v \cdot \mathcal{L}^{\text{value}}(\phi) - c_e \cdot \bar{\mathcal{H}}[\pi_\theta]$$
+
+其中 $c_v = 0.5$ 为 Critic 损失权重，$c_e = 0.01$ 为熵正则化系数。
+
+#### 9.3.2 Actor Loss（PPO-Clip）
+
+概率比：
+
+$$\rho_t(\theta) = \frac{\pi_\theta(\mathbf{a}_t | \mathbf{o}_t, \mathbf{h}_t)}{\pi_{\theta_{\text{old}}}(\mathbf{a}_t | \mathbf{o}_t, \mathbf{h}_t)} = \exp\!\left(\log \pi_\theta(\mathbf{a}_t) - \log \pi_{\theta_{\text{old}}}(\mathbf{a}_t)\right)$$
+
+实现中对 log ratio 做数值裁剪 $\text{clamp}(\cdot, -20, 20)$ 以防止溢出。
+
+Clipped surrogate 目标：
+
+$$\mathcal{L}^{\text{clip}}(\theta) = -\frac{1}{|\mathcal{B}|} \sum_{t \in \mathcal{B}} \min\!\left(\rho_t \hat{A}_t,\; \text{clip}(\rho_t,\; 1-\epsilon,\; 1+\epsilon) \hat{A}_t\right)$$
+
+其中 $\epsilon = 0.2$ 为裁剪参数。
+
+**优势归一化**：更新前对 mini-batch 内的优势做标准化：
+
+$$\hat{A}_t \leftarrow \frac{\hat{A}_t - \bar{A}}{\text{std}(A) + 10^{-8}}$$
+
+**诊断指标**：
+- Clip fraction：$\frac{1}{|\mathcal{B}|} \sum_t \mathbb{1}[|\rho_t - 1| > \epsilon]$，正常应 $< 0.1{\sim}0.2$。
+- Approximate KL：$\widehat{D}_{\text{KL}} = \mathbb{E}[(\rho_t - 1) - \log \rho_t]$，正常应 $< 0.02{\sim}0.05$。
+
+#### 9.3.3 Critic Loss
+
+标准形式为 MSE：
+
+$$\mathcal{L}^{\text{value}}(\phi) = \frac{1}{2|\mathcal{B}|} \sum_{t \in \mathcal{B}} \left(V_\phi(s_t) - \hat{R}_t\right)^2$$
+
+可选的 clipped value loss（默认启用）：
+
+$$\bar{V}_\phi(s_t) = V_{\phi_{\text{old}}}(s_t) + \text{clip}\!\left(V_\phi(s_t) - V_{\phi_{\text{old}}}(s_t),\; -\epsilon_v,\; \epsilon_v\right)$$
+
+$$\mathcal{L}^{\text{value, clip}}(\phi) = \frac{1}{2|\mathcal{B}|} \sum_{t \in \mathcal{B}} \max\!\left((V_\phi(s_t) - \hat{R}_t)^2,\; (\bar{V}_\phi(s_t) - \hat{R}_t)^2\right)$$
+
+其中 $\epsilon_v = 0.2$。
+
+#### 9.3.4 熵正则化
+
+对于 12 维对角高斯策略，每个维度的微分熵为 $\frac{1}{2}\ln(2\pi e \sigma_i^2)$，总熵为：
+
+$$\mathcal{H}[\pi_\theta] = \frac{1}{2} \sum_{i=1}^{12} \ln(2\pi e \sigma_i^2)$$
+
+熵正则化项 $-c_e \cdot \bar{\mathcal{H}}$ 鼓励策略保持探索，防止过早收敛。
+
+#### 9.3.5 梯度裁剪与学习率调度
+
+全局梯度裁剪（按范数）：
+
+$$\hat{\mathbf{g}} = \begin{cases} \mathbf{g} & \text{if } \|\mathbf{g}\| \leq g_{\max} \\ g_{\max} \cdot \frac{\mathbf{g}}{\|\mathbf{g}\|} & \text{if } \|\mathbf{g}\| > g_{\max} \end{cases}$$
+
+其中 $g_{\max} = 1.0$。Actor 和 Critic 各自独立执行梯度裁剪。
+
+可选线性学习率衰减（从初始 $\eta_0$ 到 $0$）：
+
+$$\eta_t = \eta_0 \cdot \left(1 - \frac{t}{T_{\text{total}}}\right)$$
+
+#### 9.3.6 解释方差
+
+Critic 质量的核心诊断指标：
+
+$$\text{EV} = 1 - \frac{\text{Var}(\hat{R} - V)}{\text{Var}(\hat{R})}$$
+
+值域为 $(-\infty, 1]$。接近 1 表示 Critic 预测准确；负值表示预测不如均值。
+
+### 9.4 CurriculumManager
+
+`CurriculumManager` 管理三阶段 push-only 课程，各阶段的上下文分布为：
+
+| 阶段 | 上下文分布 | 训练目标 |
+|------|-----------|---------|
+| Stage 1 | $P(c) = \{\text{none}: 1.0\}$ | 学习基础推门接触 |
+| Stage 2 | $P(c) = \{\text{left\_only}: 0.5,\; \text{right\_only}: 0.5\}$ | 单臂持杯约束下推门 |
+| Stage 3 | $P(c) = \{\text{none}: 0.25,\; \text{left\_only}: 0.25,\; \text{right\_only}: 0.25,\; \text{both}: 0.25\}$ | 最终混合分布 |
+
+**阶段跃迁判据**：维护长度为 $M = 50$ 的滑动窗口，记录近 $M$ 个 epoch 的成功率 $\eta_e$：
+
+$$\bar{\eta} = \frac{1}{M}\sum_{e=E-M+1}^{E} \eta_e \geq \eta_{\text{thresh}} = 0.8$$
+
+满足条件时推进至下一阶段。
+
+**跃迁的惰性生效**：`curriculum.report_epoch()` 只改变当前阶段状态，不立即重置所有环境。新阶段的上下文样本通过 `_episode_reset_fn` 在各环境下一次 auto-reset 时逐步注入，避免在同一 iteration 内硬重配所有并行环境。
+
+### 9.5 DomainRandomizer
+
+`DomainRandomizer` 负责采样（而非应用）episode 级物理参数和步级噪声。环境在 `_reset_idx()` 或 `_pre_physics_step()` 中将采样结果写入仿真状态。
+
+**Episode 级随机化**：
+
+| 参数 | 符号 | 分布 | 默认范围 |
+|------|------|------|---------|
+| 杯体质量 | $m_{\text{cup}}$ | $\mathcal{U}(0.1, 0.8)$ | 0.1 – 0.8 kg |
+| 门板质量 | $m_{\text{door}}$ | $\mathcal{U}(5.0, 20.0)$ | 5.0 – 20.0 kg |
+| 门铰链阻尼 | $d_{\text{hinge}}$ | $\mathcal{U}(0.5, 5.0)$ | 0.5 – 5.0 N·m·s/rad |
+| 基座径向距离 | $r$ | $\mathcal{U}(0.45, 0.60)$ | 0.45 – 0.60 m |
+| 基座扇形角度 | $\theta_{\text{sector}}$ | $\mathcal{U}(-20°, +20°)$ | $\pm 20°$ |
+| 基座 yaw 扰动 | $\delta_{\text{yaw}}$ | $\mathcal{U}(-10°, +10°)$ | $\pm 10°$ |
+
+**步级噪声**：
+
+| 参数 | 符号 | 分布 | 标准差 |
+|------|------|------|--------|
+| 动作噪声 | $\boldsymbol{\epsilon}_a$ | $\mathcal{N}(\mathbf{0}, \sigma_a^2 \mathbf{I}_{12})$ | $\sigma_a = 0.02$ |
+| 观测噪声 | $\boldsymbol{\epsilon}_o$ | $\mathcal{N}(\mathbf{0}, \sigma_o^2 \mathbf{I}_{24})$ | $\sigma_o = 0.01$ |
+
+观测噪声仅注入至 Actor 的 proprio 分支（关节位置 + 关节速度，共 24 维），Critic 观测使用无噪声的真实状态。
+
+### 9.6 训练层统计组件的职责分化
+
+| 组件 | 职责 | 默认路径中的角色 |
+|------|------|-----------------|
+| `RolloutCollector._accumulate_*()` | Rollout 内奖励/成功率均值 | `collect/*` 和 `reward/*` 的主来源 |
+| `episode_stats.py` | 从 info 提取成功率 | 课程学习的输入 |
+| `TrainingMetrics` | 长期均值聚合 | `metrics/ppo/*` 指标；`metrics/episode/*` 辅助 |
+
+---
+
+## 10. 入口脚本与运行方式
+
+### 10.1 `scripts/train.py`
+
+`train.py` 是默认训练入口，执行以下装配流程：
+
+```
+1. load_config()          → 合并 7 份 YAML 为 cfg 字典
+2. resolve_train_runtime_config() → 提取 TrainRuntimeConfig
+3. launch_simulation_app() → 启动 Isaac Sim 运行时
+4. build_env_cfg()        → 选择环境配置变体，注入参数
+5. 构建组件序列：
+   DoorPushEnv + DirectRLEnvAdapter
+   → Actor + Critic
+   → PPOTrainer
+   → RolloutCollector + RolloutBuffer
+   → CurriculumManager
+   → DomainRandomizer
+   → TrainingMetrics
+6. 注册 _episode_reset_fn
+7. 首次批量 reset（build_curriculum_reset_batch → reset_batch）
+8. collector.reset_hidden(n_envs)
+9. 进入主循环
+```
+
+### 10.2 其他脚本
+
+| 脚本 | 职责 |
 |------|------|
-| 关节/body 索引解析 | 一次性从 `Articulation` 中查找 12 个臂关节 (`ARM_JOINT_NAMES`)、2 个 gripper 关节、`base_link`/`left_gripper_link`/`right_gripper_link` body 索引、门铰链关节索引 |
-| Per-env 状态 tensor | 分配 `(N, ...)` 形状的零值 tensor：`_prev_action`、`_left_occupied`/`_right_occupied`、`_step_count`、`_prev_door_angle`、`_already_succeeded`、域随机化参数缓存、EE 速度缓存 |
+| `scripts/evaluate.py` | 评估训练策略的跨上下文表现 |
+| `scripts/export_policy.py` | 将 Actor 导出为 ONNX/TorchScript 用于部署 |
+| `scripts/load_scene.py` | Isaac Sim 中加载和调试场景资产 |
+| `scripts/rollout_demo.py` | 结合 visualization 模块生成 rollout artifact（视频、帧图） |
 
-环境不持有独立的子组件实例 — 所有逻辑（观测构建、奖励计算、终止判定、接触检测、杯体脱落判定）都作为 `DoorPushEnv` 的方法直接实现。
+---
 
-#### 2.1.2 声明式场景配置与 Cloner 自动复制
+## 11. 端到端训练闭环
 
-场景通过 `@configclass` 装饰的 `DoorPushSceneCfg`（`InteractiveSceneCfg` 子类）声明式定义。配置中每个资产的 `prim_path` 使用 `{ENV_REGEX_NS}` 占位符：
+### 11.1 单轮 Iteration 流程
+
+每轮 iteration 包括以下步骤：
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│ Step 1: Rollout 采集                                            │
+│   collector.collect() → 推进 N×T 步环境交互                     │
+│   输出: buffer 数据 + collect_stats + last_values              │
+├────────────────────────────────────────────────────────────────┤
+│ Step 2: GAE 计算                                                │
+│   buffer.compute_gae(last_values, last_dones)                  │
+│   反向递推: δ_t → Â_t → R̂_t                                   │
+├────────────────────────────────────────────────────────────────┤
+│ Step 3: PPO 参数更新                                            │
+│   ppo_trainer.update(buffer)                                   │
+│   K epochs × M mini-batches × TBPTT sequences                  │
+├────────────────────────────────────────────────────────────────┤
+│ Step 4: 调度更新                                                │
+│   global_steps += N × T                                        │
+│   学习率衰减（若启用）                                           │
+│   curriculum.report_epoch(success_rate) → 检查阶段跃迁           │
+├────────────────────────────────────────────────────────────────┤
+│ Step 5: 监控与持久化                                            │
+│   控制台日志（log_interval 控制频率）                             │
+│   TensorBoard 写入                                              │
+│   Checkpoint 保存（checkpoint_interval 控制频率）                │
+├────────────────────────────────────────────────────────────────┤
+│ Step 6: Buffer 清空                                             │
+│   buffer.clear() → 准备下一轮                                   │
+└────────────────────────────────────────────────────────────────┘
+```
+
+训练在 `global_steps >= total_steps` 时结束，或用户中断时保存最终 checkpoint 并释放资源。
+
+### 11.2 Episode 生命周期
+
+从单个并行环境实例的视角，执行循环为：
+
+**单步执行顺序**：
+
+1. `_pre_physics_step(actions)`：缓存 raw action（用于安全惩罚计算）；执行硬裁剪；注入动作噪声；二次裁剪；写入 arm effort target。
+2. 物理引擎推进 `decimation = 2` 个物理步（总时长 $\frac{2}{120} = \frac{1}{60}$ s）。
+3. `_get_observations()`：读取关节和刚体状态；执行世界系→base 系变换；数值微分计算加速度；计算 tilt proxy；构造 Actor/Critic 观测。**同步缓存**后续阶段需复用的中间量。
+4. `_get_rewards()`：基于门角度增量、缓存的加速度/tilt/上一步力矩/安全状态，计算任务奖励、稳定性奖励、安全惩罚；分项写入 `extras["reward_info"]`。
+5. `_get_dones()`：根据门角度达标、杯体脱落和步数超限生成 `terminated` 与 `truncated`；把 pre-reset 成功标志和 occupancy 写入 `extras`。
+
+**终止条件**：
+
+| 条件 | 判据 | 类型 |
+|------|------|------|
+| 成功终止 | $\theta_t \geq \theta^* = 1.57$ rad | `terminated = True` |
+| 失败终止 | $\|\mathbf{p}_{\text{cup}} - \mathbf{p}_{\text{ee}}\| > 0.15$ m | `terminated = True` |
+| 截断终止 | $\text{step\_count} \geq 900$（15 s × 60 Hz） | `truncated = True` |
+
+需区分两个角度阈值：
+- `success_angle_threshold = 1.2` rad：仅触发任务奖励中的一次性成功 bonus。
+- `door_angle_target = 1.57` rad：触发 episode 成功终止。
+
+### 11.3 选择性 Reset 流程
+
+当部分环境完成或失败后，Isaac Lab 自动调用 `_reset_idx(env_ids)`，仅重置 `env_ids` 指定的子集：
+
+```
+_reset_idx(env_ids):
+  1. 采样默认域随机化参数（cup_mass, door_mass, door_damping）
+  2. 应用 pending override（来自 set_domain_params_batch）
+  3. 对未显式覆写的环境，调用 _episode_reset_fn
+     → 按当前课程阶段注入 occupancy 和 domain params
+  4. 写入机器人 root state 与 joint state（含新 base pose）
+  5. 将门关节角度归零
+  6. 不需要持杯的环境: teleport 杯体至远处 (100, y, 0)
+  7. 需要持杯的环境: _batch_cup_grasp_init()
+     → 直接写关节至预设抓取姿态，teleport 杯体至夹爪位置
+  8. 写入新物理参数至仿真（门板质量、杯体质量、阻尼）
+  9. 清零 per-env 状态（step_count, prev_action, 速度缓存, _already_succeeded）
+```
+
+**关键约束**：此过程中无资产重建，无 `sim.step()` 调用，不影响未完成环境的物理状态。
+
+---
+
+## 12. 跨层数据流
+
+### 12.1 课程学习数据流
+
+```text
+环境层                              训练层
+_get_dones()                      RolloutCollector
+  │ 写 success + occupancy           │
+  │ 到 extras                        │ compute_episode_outcome_stats()
+  ▼                                  ▼
+DirectRLEnvAdapter                extract_curriculum_success_rate()
+  │ 重构 info dict                    │
+  ▼                                  ▼
+info["success"]               CurriculumManager.report_epoch(η)
+  │                                   │ 更新滑动窗口
+  │                                   │ 检查跃迁条件
+  │                                   ▼
+  │                              阶段变化? → 更新 current_stage
+  │                                   │
+  ▼                                   ▼
+_episode_reset_fn              下次 auto-reset 时
+  │ 按新阶段采样                   注入新上下文分布
+  ▼
+环境 reset
+```
+
+课程机制在训练层判定，在环境层惰性生效。
+
+### 12.2 奖励统计链路
+
+```text
+DoorPushEnv._get_rewards()
+  │ 构造 reward_info dict
+  │ 写入 extras["reward_info"]
+  ▼
+DirectRLEnvAdapter
+  │ 还原为 per-env 标量字典
+  ▼
+RolloutCollector._accumulate_reward_stats()
+  │ rollout 内求均值
+  ▼
+collect_stats["reward/*"]
+  │
+  ├─ reward/total, reward/task, reward/stab_left, reward/stab_right, reward/safe
+  └─ reward_terms/* (细分子项)
+  ▼
+TensorBoard
+```
+
+### 12.3 域随机化跨层流
+
+```text
+DomainRandomizer                  DoorPushEnv
+  │ 采样 episode 级参数               │
+  │ (m_cup, m_door, d_hinge,         │
+  │  base_pos, base_yaw)              │
+  │                                   │
+  │ 步级噪声:                         │
+  │ ε_a → _pre_physics_step()        │ → 注入到 action
+  │ ε_o → _get_observations()        │ → 注入到 proprio obs
+  │                                   │
+  ▼                                   ▼
+  Critic privileged vector         PhysX 仿真
+  [cup_mass, door_mass,            质量/阻尼写入
+   door_damping]                   仿真状态
+```
+
+---
+
+## 13. 监控、输出与训练工件
+
+### 13.1 控制台日志
+
+按 `log_interval`（默认 5 轮）输出 iteration 级概览：iteration 编号、累计 `global_steps`、FPS、actor_loss、critic_loss、entropy、clip_fraction、平均奖励 $\bar{r}$、当前 iteration 成功率、rollout_s/update_s 耗时、当前课程阶段、ETA。
+
+### 13.2 TensorBoard 指标体系
+
+| 命名空间 | 内容 | 详细参考 |
+|---------|------|---------|
+| `train/*` | actor_loss, critic_loss, entropy, clip_fraction, approx_kl, explained_variance, fps | §9.3 |
+| `timing/*` | rollout_s, update_s, env_steps_per_s | §11.1 |
+| `collect/*` | mean_reward, completed/successful_episodes, episode_success_rate, 上下文成功率 | §9.1 |
+| `reward/*` | total, task, stab_left, stab_right, safe | §8 |
+| `reward_terms/*` | delta, open_bonus, zero_acc, zero_ang, acc, ang, tilt, smooth, reg, joint_limit, joint_vel, torque_limit, cup_drop | §8 |
+| `curriculum/*` | stage, window_mean | §9.4 |
+| `metrics/ppo/*` | 聚合周期内的 PPO 指标均值 | §9.6 |
+
+### 13.3 Checkpoint 结构
+
+默认训练按 `checkpoint_interval` 保存中间 checkpoint，训练结束或用户中断时保存 `ckpt_final.pt`。每个 checkpoint 包含：
 
 ```python
-@configclass
-class DoorPushSceneCfg(InteractiveSceneCfg):
-    robot: ArticulationCfg = ArticulationCfg(
-        prim_path="{ENV_REGEX_NS}/Robot", ...
-    )
-    door: ArticulationCfg = ArticulationCfg(
-        prim_path="{ENV_REGEX_NS}/Door", ...
-    )
-    cup_left: RigidObjectCfg = RigidObjectCfg(
-        prim_path="{ENV_REGEX_NS}/CupLeft", ...
-    )
-    cup_right: RigidObjectCfg = RigidObjectCfg(
-        prim_path="{ENV_REGEX_NS}/CupRight", ...
-    )
+{
+    "iteration": int,
+    "global_steps": int,
+    "actor_state_dict": dict,
+    "critic_state_dict": dict,
+    "trainer_state_dict": dict,      # 含 optimizer state
+    "curriculum_state_dict": dict,   # 含阶段与滑动窗口
+    "best_success_rate": float,
+}
 ```
 
-`DoorPushEnv._setup_scene()` 将资产注册到 `InteractiveScene`，Isaac Lab 的 **Cloner** 随后自动将 `{ENV_REGEX_NS}` 替换为 `/World/envs/env_\d+`，为 $N$ 个并行环境各复制一棵完整的场景子树。
-
-与旧架构的 `SceneFactory.build()` 相比，新架构完全不需要手动 8 步装配：
-
-| 旧架构 (`SceneFactory.build()`) | 新架构 (`DoorPushSceneCfg` + Cloner) |
-|------|------|
-| 命令式 Python 脚本逐步加载资产 | 声明式 `@configclass` 配置 |
-| 每个子环境独立执行 USD 加载 | Cloner 自动批量复制 |
-| 手动创建 `SimulationContext` 视图 | `DirectRLEnv` 基类自动管理 |
-| `reset()` 时可能需要清理旧场景 | 资产预生成，reset 时仅 teleport |
-
-**杯体预生成策略**：左右杯体在场景创建时即被预生成（默认 `init_state.pos` 在远处 `(100, 0, 0)` / `(100, 1, 0)`），不会在 episode 边界反复创建/删除。reset 时根据 occupancy 将需要的杯体 teleport 到夹爪位置，不需要的保持在远处。
-
-#### 2.1.3 DirectRLEnvAdapter
-
-`DirectRLEnvAdapter` 将 `DoorPushEnv` 的 GPU tensor 接口包装为 `VecEnvProtocol`（`list[dict]` 格式），使现有训练管线（`RolloutCollector` + PPO）能直接消费 GPU 并行环境而无需大规模改写训练侧代码。
-
-适配器的核心职责：
-- `reset()` — 将 `occupancy` 和 `domain_params` 传递给底层 `DoorPushEnv`，调用 `env.reset()`，将返回的 `(N, obs_dim)` tensor 解包为 `list[dict]`
-- `step(np.ndarray)` — 将 numpy 动作转为 torch tensor，调用 `env.step()`，将结果转回 numpy 和 `list[dict]`
-- `set_curriculum()` — 更新 occupancy 和域随机化参数（兼容旧 `VecDoorEnv.set_curriculum()` 接口）
-
-### 2.2 Actor 与 Critic
-
-Actor 是一个带 GRU 隐状态的循环网络，接收五个观测分支（本体感觉、末端状态、上下文标记、稳定性代理、门几何）并输出关节力矩的高斯分布。Critic 是一个前馈网络，接收与 Actor 相同的观测分支，外加一个包含域随机化参数和门状态的 privileged 向量，输出标量状态价值。这种不对称设计使得 Actor 只能看到部署时可用的信息，而 Critic 可以利用仿真内部状态来降低价值估计的方差。
-
-### 2.3 PPO 训练器
-
-PPO 训练器持有 Actor 和 Critic 各自独立的 Adam 优化器，负责在每轮迭代中执行 PPO-Clip 参数更新。
-
-### 2.4 轨迹采集器与缓冲区
-
-轨迹采集器（`RolloutCollector`）负责驱动并行环境推进并记录 on-policy 数据。它内部维护 Actor 的 GRU 隐状态，在每步前向推理后将观测、动作、对数概率、价值估计、奖励和终止标志写入缓冲区。
-
-缓冲区（`RolloutBuffer`）是固定容量的张量存储，rollout 结束后负责计算 GAE 优势估计，并按序列长度切分出 TBPTT 所需的 mini-batch。
-
-### 2.5 ~~视觉感知运行时~~（已移除）
-
-> **注意**：`PerceptionRuntime` 已从默认训练路径中移除。当前训练使用仿真 ground truth 计算的 `door_geometry`（6 维：base 系下门叶 center + normal）作为唯一门相关输入。`PerceptionRuntime` 代码保留为历史实验参考，不再被默认入口引用。
-
-### 2.6 课程管理器
-
-课程管理器维护一个三阶段训练课程，通过滑动窗口平均成功率判定阶段跃迁。三个阶段分别是：
-
-- Stage 1 — 无持杯推门：双臂空闲，只需学会基本推门接触
-- Stage 2 — 单臂持杯推门：左臂或右臂持杯，学会在约束下稳定推门
-- Stage 3 — 混合分布推门：无杯、单臂持杯、双臂持杯四种上下文均匀采样
-
-当滑动窗口内的平均成功率达到阈值（默认 0.8）时，课程自动跃迁到下一阶段。
-
-### 2.7 域随机化器
-
-域随机化器在两个时间尺度上工作：
-
-**回合级**：每个新 episode 开始时（通过 `_reset_idx()` 内部采样）重新采样一组物理参数（杯体质量、门板质量、门铰链阻尼、基座位置 `base_pos`、基座朝向 `base_yaw`）。其中 base pose 的采样几何不是方形抖动，而是"以推板中心为圆心、门外侧小扇形环中的位置采样 + 朝向推板中心的小角度 yaw 扰动"（由 `sample_base_poses()` 实现）。这组参数在整个 episode 内保持不变。
-
-**步级**：动作噪声和观测噪声直接在 `DoorPushEnv` 内部以 tensor 操作实现。动作噪声在 `_pre_physics_step()` 中力矩截断之后注入，注入后重新截断以保证安全（由 `DoorPushEnvCfg.action_noise_std` 控制）；观测噪声仅注入 Actor 观测中的关节位置和关节速度（共 24 维），Critic 始终看到无噪声的真实状态（由 `DoorPushEnvCfg.obs_noise_std` 控制）。
-
-### 2.8 回调注入
-
-域随机化器和课程管理器通过两个兼容性接口与 `DirectRLEnvAdapter` 连接：
-
-- **episode 重采样回调**：通过 `envs.set_episode_reset_fn()` 注册。当某个子环境的 episode 结束并触发 auto-reset 时，回调会查询课程管理器的当前阶段，然后为该环境独立采样新的域参数、门类型和持杯上下文。
-- **步级噪声配置**：噪声标准差直接在 `DoorPushEnvCfg` 中声明，`DoorPushEnv` 内部自动注入。`envs.set_randomizer()` 保留为兼容接口，实际为空操作。
-
-### 2.9 初始环境重置
-
-进入主循环前，系统根据当前课程阶段（通常是 Stage 1）为所有并行环境批量采样一组初始参数，然后通过 `DirectRLEnvAdapter.reset()` 执行一次全量重置。这会触发 `DoorPushEnv.reset()` → `_reset_idx(all_env_ids)`，为每个环境采样域随机化参数、写入 base pose、重置门关节、处理杯体 teleport、应用物理参数、清零 per-env 状态 tensor。同时清空所有 Actor 的 GRU 隐状态。
+训练恢复包括模型权重、优化器状态和课程学习进度三部分。
 
 ---
 
-## 3. 训练主循环
+## 14. 关键接口与数据契约
 
-主循环以"迭代"为单位反复执行，每轮迭代依次完成：采集轨迹、计算优势、更新参数、推进课程、记录日志。训练在累计步数达到上限或用户手动中断时结束。
+### 14.1 核心张量形状
 
-### 3.1 轨迹采集
+| 对象 | 形状 | 含义 |
+|------|------|------|
+| Actor 观测 | $(N, 96)$ | 5 分支拼接 |
+| Critic 观测 | $(N, 109)$ | Actor 观测无噪声版 + 13D privileged |
+| Privileged | $(N, 13)$ | door_pose(7) + door_joint_pos(1) + door_joint_vel(1) + cup_mass(1) + door_mass(1) + door_damping(1) + cup_dropped(1) |
+| 动作 | $(N, 12)$ | 双臂 raw torque |
+| 奖励 | $(N,)$ | 标量即时奖励 |
+| `reward_info` | `dict[str, Tensor(N,)]` | 分项奖励字典 |
+| Hidden state | $(L, N, 512)$ | RNN 隐状态（$L$ = num_layers） |
+| 优势 | $(T, N)$ | GAE 优势估计 |
+| Returns | $(T, N)$ | 累计折扣回报 |
+| Mini-batch 序列 | $(B, L_{\text{seq}}, \text{dim})$ | TBPTT 片段 |
 
-采集器在 $N$ 个并行环境中推进 $T$ 步（$T$ 由 `n_steps_per_rollout` 决定），每轮共产出 $N \times T$ 条 transition。
-
-单步采集流程如下：
-
-1. 将各环境的原始观测展平为网络输入格式。Actor 输入包含本体感觉（关节角度、角速度、力矩、上一步动作）、末端执行器状态、上下文标记、稳定性代理和门几何五个分支。Critic 在此基础上额外接收 privileged 向量。
-
-2. 缓存当前 GRU 隐状态，供后续 TBPTT 恢复使用。
-
-3. Actor 前向推理：输入观测分支和当前隐状态，输出动作采样、对数概率、策略熵和更新后的隐状态。
-
-4. Critic 前向推理：输入观测分支和 privileged 向量，输出状态价值标量。
-
-5. 将动作发送给 `DirectRLEnvAdapter.step()`，适配器将 numpy 动作转为 torch tensor 后调用 `DoorPushEnv.step()`。环境内部的单步处理是：
-   - `_pre_physics_step()` — 力矩裁剪 → 注入动作噪声 → 重新裁剪 → 写入关节力矩目标
-   - 物理引擎执行 `decimation` 次步进
-   - `_get_observations()` — 批量读取物理状态、变换到 base_link 系、计算加速度和 tilt、构建 Actor/Critic 观测 tensor
-   - `_get_rewards()` — 计算 12 项奖励
-   - `_get_dones()` — 判定 terminated/truncated
-
-6. 将本步数据（观测、动作、对数概率、价值、奖励、终止标志、隐状态）写入缓冲区。
-
-7. 处理终止的环境：对 done 的子环境清零其 GRU 隐状态。`DirectRLEnv` 框架对 done 的子环境自动触发 `_reset_idx(env_ids)` 执行选择性重置，仅影响终止的环境而不干扰其他环境。重置后返回新 episode 的初始观测。轨迹因此自然接续到下一个 episode 的起点，不会出现观测中断。
-
-采集结束后，采集器会对当前时刻的观测额外做一次 Critic 前向，得到用于 bootstrap 的末端价值估计。
-
-### 3.2 GAE 优势估计
-
-缓冲区从 rollout 末端向前逐步计算广义优势估计（GAE）。在每个时间步上，先算出单步 TD 误差：
-
-$$\delta_t = r_t + \gamma \cdot V(s_{t+1}) \cdot (1 - \text{done}_t) - V(s_t)$$
-
-再按指数加权递推得到优势：
-
-$$\hat{A}_t = \delta_t + \gamma \lambda \cdot (1 - \text{done}_t) \cdot \hat{A}_{t+1}$$
-
-回报为优势加上基线：
-
-$$R_t = \hat{A}_t + V(s_t)$$
-
-末端 bootstrap 使用采集阶段缓存的 `last_values` 和 `last_dones`：如果 rollout 末尾某个环境未终止，则用 Critic 估计的价值进行 bootstrap；如果已终止，则屏蔽 bootstrap。
-
-### 3.3 PPO 参数更新
-
-PPO 训练器从缓冲区中按序列长度切分 mini-batch，每个 mini-batch 是一段连续时间片段，附带该片段起始时刻的 GRU 隐状态。
-
-**Actor 更新**：在每个 mini-batch 内，从缓存的隐状态出发逐时间步展开 Actor，得到新策略下的对数概率和熵。计算重要性比率 $r(\theta) = \exp(\log \pi_{\text{new}} - \log \pi_{\text{old}})$，然后按 PPO-Clip 目标裁剪。总 Actor 损失 = clipped surrogate loss $-$ 熵系数 $\times$ 熵。
-
-**Critic 更新**：Critic 不使用 RNN，直接将整个序列展平后批量前向，得到新的价值估计。计算 clipped value loss 或普通 MSE value loss。
-
-两个网络分别做梯度裁剪后由各自的 Adam 优化器更新参数。
-
-每次更新返回六项指标：Actor 损失、Critic 损失、策略熵、clip 比例、近似 KL 散度、explained variance。
-
-### 3.4 课程跃迁判定
-
-每轮迭代结束后，系统将本轮的 episode 成功率报告给课程管理器。课程管理器内部执行以下判定流程：
+### 14.2 `reward_info` 键体系
 
 ```
-CurriculumManager.report_epoch(success_rate)
-  │
-  ├── 1. 将 success_rate 追加到滑动窗口 deque(maxlen=M)
-  │
-  ├── 2. 若已在最终阶段 (stage_3) → 返回 False，不做跃迁
-  │
-  ├── 3. 若窗口未填满 (len < M) → 返回 False，等待更多数据
-  │
-  └── 4. 计算窗口均值并与阈值比较
-        若 (1/M) * Σ η_e ≥ η_thresh → 触发跃迁
+reward_info/
+├── task
+│   ├── task/delta
+│   └── task/open_bonus
+├── stab_left
+│   ├── stab_left/zero_acc
+│   ├── stab_left/zero_ang
+│   ├── stab_left/acc
+│   ├── stab_left/ang
+│   ├── stab_left/tilt
+│   ├── stab_left/smooth
+│   └── stab_left/reg
+├── stab_right
+│   └── (同 stab_left 结构)
+├── safe
+│   ├── safe/joint_limit
+│   ├── safe/joint_vel
+│   ├── safe/torque_limit
+│   └── safe/cup_drop
+└── total
 ```
 
-跃迁条件的数学判据为：
+### 14.3 `collect_stats` 核心字段
 
-$$\frac{1}{M} \sum_{e=E-M+1}^{E} \eta_e \geq \eta_{\text{thresh}}$$
+```
+collect/
+├── mean_reward
+├── completed_episodes
+├── successful_episodes
+├── episode_success_rate
+├── success_mixed (= episode_success_rate)
+├── success_none
+├── success_left_only
+├── success_right_only
+└── success_both
+reward/
+├── total
+├── task
+├── stab_left
+├── stab_right
+└── safe
+```
 
-其中 $M$ 为滑动窗口长度（默认 50），$\eta_e$ 为第 $e$ 轮的 episode 成功率，$\eta_{\text{thresh}}$ 为跃迁阈值（默认 0.8）。
+### 14.4 配置系统共享约束
 
-#### 跃迁执行
+以下约束在修改配置时必须保持一致：
 
-当条件满足时，`_advance()` 方法执行以下操作：
-
-1. **推进阶段索引**：`current_idx += 1`，指向下一个 `StageConfig`
-2. **清空滑动窗口**：`success_window.clear()`，避免旧阶段的成功率残留影响新阶段的跃迁判定
-3. **train.py 响应跃迁**：检测到 `report_epoch()` 返回 `True` 后，立即为所有 $N$ 个并行环境重新批量采样一组新课程阶段下的域参数和上下文分布，并通过 `envs.set_curriculum()` 推送给 `DirectRLEnvAdapter`，后者调用 `DoorPushEnv.set_occupancy()` 更新 occupancy tensor
-4. **后续 auto-reset 自动生效**：此后每个子环境触发 auto-reset 时，episode 重采样回调会自动使用新阶段的 `context_probabilities` 进行采样
-
-三个阶段的上下文概率分布如下：
-
-| 阶段 | `none` | `left_only` | `right_only` | `both` | 学习目标 |
-|------|--------|-------------|-------------|--------|----------|
-| Stage 1 | 1.0 | — | — | — | 基础推门接触 |
-| Stage 2 | — | 0.5 | 0.5 | — | 单臂持杯约束下推门 |
-| Stage 3 | 0.25 | 0.25 | 0.25 | 0.25 | 全覆盖混合分布 |
-
-#### Checkpoint 中的课程状态
-
-课程管理器的状态（当前阶段索引、滑动窗口内容、总 epoch 数）会被序列化到每个 checkpoint 中。从 checkpoint 恢复训练时，课程进度可以无缝接续。
-
-### 3.5 日志与 checkpoint
-
-**控制台日志**：按配置间隔打印当前迭代号、累计步数、FPS、Actor/Critic 损失、策略熵、clip 比例、平均奖励、成功率、当前课程阶段和预计剩余时间。
-
-**TensorBoard**：如果可用，每轮写入训练损失指标、PPO 优化指标、rollout 统计、各持杯上下文的分类成功率、课程阶段和滑动窗口均值。
-
-**Checkpoint**：按配置间隔保存中间 checkpoint，每个 checkpoint 包含当前迭代号、累计步数、Actor 和 Critic 的网络权重、PPO 优化器状态、课程管理器状态和历史最佳成功率。训练可从任意 checkpoint 恢复。
-
-### 3.6 清空缓冲区
-
-每轮迭代末尾清零缓冲区中的张量数据，但不销毁缓冲区对象本身，下一轮采集继续复用同一批预分配内存。
+1. `success_angle_threshold`（1.2 rad，奖励用途）与 `door_angle_target`（1.57 rad，终止用途）不可混用。
+2. `env_variant` 影响场景资产、碰撞设置和机器人配置，非仅切换 USD 路径。
+3. `reward/default.yaml` 通过注入进入环境配置，修改奖励权重需同时理解配置侧和环境侧。
+4. 课程阶段仅决定上下文分布与门类型集合，不直接改变策略输入结构。
 
 ---
 
-## 4. Episode 生命周期
+## 15. 默认路径与历史路径的边界
 
-本节详述单个 episode 从创建到终止的完整生命周期。在 GPU 批量架构下，所有操作都是对 `env_ids` 子集的 tensor 索引操作，而非独立的 Python 对象。
+### 15.1 默认训练主线特征
 
-### 4.1 Episode 创建（`_reset_idx`）
+- 门相关输入采用 6D `door_geometry`（仿真 ground truth），不经过视觉感知。
+- `DoorPushEnv` 是环境、观测、奖励和终止判定的统一实现位置。
+- 训练使用 PPO + asymmetric Actor-Critic + recurrent Actor（GRU）。
+- 课程学习采用三阶段 push-only 分布，滑动窗口成功率触发跃迁。
+- 域随机化覆盖 episode 级物理参数（3 项）+ 基座位姿（3 项）+ 步级噪声（2 项）。
+- TensorBoard、checkpoint 与导出工具形成完整训练输出链路。
 
-当 `DirectRLEnv` 框架检测到某些环境的 `done = True` 时，自动调用 `DoorPushEnv._reset_idx(env_ids)` 执行**选择性重置**，仅重置终止的环境而不干扰其余环境。重置按以下 7 步顺序执行：
+### 15.2 历史视觉感知路径
 
-```
-DoorPushEnv._reset_idx(env_ids)
-  │
-  ├── 1. 采样域随机化参数
-  │     对 env_ids 中的每个环境独立采样：
-  │       cup_mass   ∈ [0.1, 0.8] kg
-  │       door_mass  ∈ [5.0, 20.0] kg
-  │       door_damping ∈ [0.5, 5.0] Nm·s/rad
-  │       base_pos, base_yaw ← sample_base_poses()
-  │         （门外侧扇形环采样 + 朝向推板中心的 yaw 扰动）
-  │
-  ├── 2. 写入机器人 base pose
-  │     将 base_pos + env_origins[env_ids] 写入 root state
-  │     将 base_yaw 转换为 quaternion 写入 root orientation
-  │     重置关节到默认位置，速度清零
-  │
-  ├── 3. 重置门关节角度
-  │     将门铰链关节 pos / vel 全部清零
-  │
-  ├── 4. Occupancy 保持不变
-  │     不重置 _left_occupied / _right_occupied
-  │     保留外部课程管理器通过 set_occupancy() 注入的值
-  │
-  ├── 5. 杯体处理
-  │     将不需要持杯的环境的杯体 teleport 到远处 (x=100)
-  │     对需要持杯的环境执行 _batch_cup_grasp_init():
-  │       直接将臂关节写到预设抓取姿态（最终状态）
-  │       直接关闭 gripper 到 -34°
-  │       将杯体 teleport 到基座相对坐标的世界位置
-  │       （纯 teleport，无 sim.step()，不影响其他环境）
-  │
-  ├── 6. 应用域随机化物理参数
-  │     _apply_domain_params(env_ids):
-  │       写入门板 body 质量 → PhysX view set_masses()
-  │       写入门铰链阻尼 → write_joint_damping_to_sim()
-  │       写入左/右杯体质量 → PhysX view set_masses()
-  │
-  └── 7. 清零 per-env 状态 tensor
-        _step_count[env_ids] = 0
-        _prev_door_angle[env_ids] = 0
-        _prev_action[env_ids] = 0
-        _already_succeeded[env_ids] = False
-        _prev_{left,right}_ee_{lin,ang}_vel[env_ids] = 0
-        _door_embedding[env_ids] = 0  # [历史] 仅为兼容保留；默认训练不使用视觉 embedding
-```
+`src/affordance_guided_interaction/door_perception/` 是历史实验模块，描述从 RGB-D经开集分割、深度反投影和 Point-MAE 编码得到高维 `door_embedding` 的视觉路径。当前保留用于记录过去的感知研究方向与未来视觉实验参考。`training/perception_runtime.py` 同属兼容保留模块。
 
-> **与旧架构的关键差异**：旧架构中 `SceneFactory.build()` 每次 reset 都可能删除和重新加载 USD 资产。新架构中所有资产在场景创建时由 Cloner 一次性复制，reset 仅做状态写入和 teleport，性能显著更高。
+### 15.3 其他非默认模块
 
-### 4.2 Episode 推进
-
-每一步由 `DoorPushEnv` 的三个框架回调方法驱动：
-
-#### 4.2.1 `_pre_physics_step(actions)` — 动作执行
-
-```
-actions (N, 12) 策略输出的力矩
-  │
-  ├── 缓存原始动作（clip 前），用于力矩超限惩罚 §6.3
-  ├── 力矩裁剪到 [-effort_limit, +effort_limit]
-  ├── 注入步级动作噪声 ε_a (σ = action_noise_std)
-  ├── 重新裁剪以保证安全
-  ├── 构建全关节力矩向量（仅 12 个臂关节非零）
-  ├── robot.set_joint_effort_target(efforts)
-  └── 保存 clipped action 到 _prev_action
-```
-
-物理引擎随后执行 `decimation` 次步进（$D=2$，对应策略频率 60 Hz）。
-
-#### 4.2.2 `_get_observations()` — 观测构建
-
-观测构建为纯 tensor 操作，一次性为所有 $N$ 个环境批量计算：
-
-**Actor 观测** (96 维)：
-
-| 分支 | 维度 | 内容 |
+| 模块 | 状态 | 说明 |
 |------|------|------|
-| proprio | 48 | 关节角度(12) + 关节速度(12) + 力矩(12) + 上一步动作(12)，含观测噪声 |
-| left_ee | 19 | base 系下的 pos(3) + quat(4) + 线速度(3) + 角速度(3) + 线加速度(3) + 角加速度(3) |
-| right_ee | 19 | 同上 |
-| context | 2 | left_occupied(1) + right_occupied(1) |
-| stability | 2 | left_tilt(1) + right_tilt(1)，重力在 EE 局部系中的 xy 投影范数 |
-| door_geometry | 6 | door_center_in_base(3) + door_normal_in_base(3)，仿真 ground truth 计算 |
-
-**Critic 观测** (109 维)：
-
-| 分支 | 维度 | 内容 |
-|------|------|------|
-| actor_obs 同构部分 | 96 | 与 Actor 相同结构，但 **无观测噪声** |
-| privileged | 13 | door_pose(7) + door_joint_pos(1) + door_joint_vel(1) + cup_mass(1) + door_mass(1) + door_damping(1) + cup_dropped(1) |
-
-关键计算步骤：
-- **坐标变换**：所有 EE 状态和门状态都从世界系变换到 `base_link` 相对系（`_ee_world_to_base()`），使观测对机器人全局位置不敏感
-- **数值微分加速度**：线加速度 / 角加速度通过当前帧与上一帧的速度差除以 `control_dt` 计算
-- **Tilt proxy**：将重力向量旋转到 EE 局部系后取 xy 分量，作为杯体倾斜的代理信号
-
-#### 4.2.3 `_get_rewards()` — 奖励计算
-
-奖励由 11 个子项组成，按任务/稳定性/安全三类组织：
-
-$$r = r_\text{task} + r_\text{stab} - r_\text{safe}$$
-
-**§4 任务奖励** (2 子项)：
-
-| 子项 | 公式 |
-|------|------|
-| 角度增量 | $w(\theta) \cdot \Delta\theta$，其中 $w = w_\delta$ 当 $\theta \leq \theta_s$；$w = w_\delta \cdot \max(\alpha,\; 1 - k(\theta - \theta_s))$ 当 $\theta > \theta_s$ |
-| 成功 bonus | $\theta$ 首次达到 $\theta_s = 1.2\ \text{rad}$ 时一次性奖励 $w_\text{open} = 50$ |
-
-**§5 稳定性奖励** (7 子项，双臂分别计算并以 occupancy mask $m$ 加权)：
-
-| 编号 | 子项 | 公式 |
-|------|------|------|
-| 5.1 | 零线加速度 bonus | $w_\text{zacc} \cdot \exp(-\lambda_\text{acc} \cdot \|\mathbf{a}_\text{lin}\|^2)$ |
-| 5.2 | 零角加速度 bonus | $w_\text{zang} \cdot \exp(-\lambda_\text{ang} \cdot \|\mathbf{a}_\text{ang}\|^2)$ |
-| 5.3 | 线加速度惩罚 | $-w_\text{acc} \cdot \|\mathbf{a}_\text{lin}\|^2$ |
-| 5.4 | 角加速度惩罚 | $-w_\text{ang} \cdot \|\mathbf{a}_\text{ang}\|^2$ |
-| 5.5 | 杯体倾斜惩罚 | $-w_\text{tilt} \cdot \|\text{tilt}_{xy}\|^2$ |
-| 5.6 | 力矩平滑惩罚 | $-w_\text{smooth} \cdot \|\Delta\tau\|^2$ |
-| 5.7 | 力矩正则惩罚 | $-w_\text{reg} \cdot \|\tau\|^2$ |
-
-**§6 安全惩罚** (4 子项)：
-
-| 编号 | 子项 | 公式 |
-|------|------|------|
-| 6.1 | 关节限位 | $\beta_\text{limit} \cdot \sum_j [\max(0, |q_j - c_j| - \mu \cdot h_j)]^2$ |
-| 6.2 | 关节速度 | $\beta_\text{vel} \cdot \sum_j [\max(0, |\dot{q}_j| - \mu \cdot v_j^\text{lim})]^2$ |
-| 6.3 | 力矩超限 | $\beta_\text{torque} \cdot \sum_j [\max(0, |a_j^\text{raw}| - \tau^\text{lim})]^2$ |
-| 6.4 | 杯体掉落 | $w_\text{drop} \cdot \mathbb{1}[\text{cup\_dropped}]$ |
-
-#### 4.2.4 `_get_dones()` — 终止判定
-
-终止由两个独立来源共同决定：
-
-```python
-terminated = cup_dropped | angle_reached   # 杯掉落 or 门角度达标(≥1.57 rad)
-truncated  = step_count >= max_episode_length   # 超时(5400 步 = 90 秒)
-```
-
-> **重要区分：成功标记 ≠ 终止条件**
->
-> 奖励计算中维护两个不同的角度阈值：
-> - **成功阈值** `success_angle_threshold = 1.2 rad`（约 69°）：门角度首次达到此值时，触发一次性成功 bonus（$w_\text{open} = 50$），并设置 `_already_succeeded = True`，但 **不会终止** episode
-> - **终止阈值** `door_angle_target = 1.57 rad`（约 90°）：门角度达到此值时 **终止** episode（`terminated = True`）
->
-> 这意味着策略需要将门从 69° 继续推到 90° 才能正常结束 episode。如果策略在 69°~90° 之间失去控制（例如杯体掉落或超时），该 episode 仍然已经获得过成功 bonus，但 episode 以失败原因终止。
-
-### 4.3 终止后的处理
-
-在 `DirectRLEnv` 框架中，当某个环境的 `done = True` 时：
-
-1. 该环境的 episode 统计信息（通过 `_build_info_list()` 构建）被收集并上报
-2. 框架自动调用 `_reset_idx(env_ids)` 执行选择性重置（详见 §4.1），仅重置终止的环境
-3. 采集器清零该环境对应的 GRU 隐状态
-4. 下一步采集从新 episode 的初始观测无缝继续
+| `src/teleop_cup_grasp/` | 独立辅助 | 杯体抓取遥操作与实验工具 |
+| `visualization/` | 正式输出链路 | Rollout artifact 生成，非历史残留 |
 
 ---
 
-## 5. 场景装配的时机
+## 16. PPO 算法超参数总表
 
-训练过程中，场景的物理拓扑在 Cloner 复制后**永不改变**。与旧架构不同，新架构没有"装配"和"拆解"的概念，只有状态重写。
-
-**一次性场景创建**：`DoorPushEnv.__init__()` → `_setup_scene()` 将 robot/door/cup_left/cup_right 等场景实体注册到 `InteractiveScene`，Cloner 为 $N$ 个环境复制完整场景子树。此后场景拓扑固定。
-
-**episode 内**：只做物理步进。每步向关节施加力矩、推进仿真、读取新状态。
-
-**选择性 reset**：当某些环境 done 时，`_reset_idx(env_ids)` 仅对这些环境的状态 tensor 执行写入操作（root state、joint state、cup teleport、物理参数），其他环境不受影响。由于杯体是预生成的，不需要的杯体始终停留在远处 `(100, y, 0)`，不参与物理碰撞。
-
-因此，一个 episode 的初始状态由以下输入决定：域随机化参数（由 `_reset_idx` 内部采样）、occupancy 标记（由外部课程管理器通过 `set_occupancy()` 注入）。这些输入每个新 episode 都会独立重新设定。
+| 参数 | 符号 | 默认值（env_4096 profile） |
+|------|------|--------------------------|
+| 并行环境数 | $N$ | 4096 |
+| 每轮步数 | $T$ | 16 |
+| 总训练步数 | — | 300M |
+| Actor 学习率 | $\eta_{\text{actor}}$ | 2 × 10⁻⁴ |
+| Critic 学习率 | $\eta_{\text{critic}}$ | 2 × 10⁻⁴ |
+| PPO epoch 数 | $K$ | 3 |
+| Mini-batch 数 | $M$ | 16 |
+| TBPTT 序列长度 | $L$ | 16 |
+| 折扣因子 | $\gamma$ | 0.99 |
+| GAE 参数 | $\lambda$ | 0.95 |
+| PPO 裁剪参数 | $\epsilon$ | 0.2 |
+| Value 裁剪参数 | $\epsilon_v$ | 0.2 |
+| 熵正则化系数 | $c_e$ | 0.01 |
+| Critic 损失权重 | $c_v$ | 0.5 |
+| 梯度裁剪范数 | $g_{\max}$ | 1.0 |
+| 优势归一化 | — | 启用 |
+| Clipped value loss | — | 启用 |
+| Actor RNN 隐状态维度 | — | 512 |
+| Actor RNN 层数 | — | 1 |
+| Actor RNN 类型 | — | GRU |
+| Log std 初始值 | $\ell_0$ | −0.5 |
+| Critic MLP 层 | — | [512, 256, 128, 1] |
+| 物理步长 | $\Delta t_{\text{phys}}$ | 1/120 s |
+| Decimation | — | 2（控制频率 60 Hz） |
+| Episode 最大时长 | — | 15 s (900 步) |
+| 门角度终止目标 | $\theta^*$ | 1.57 rad (≈ 90°) |
+| 成功奖励触发角度 | $\theta_{\text{bonus}}$ | 1.2 rad |
+| 掉杯判定阈值 | — | 0.15 m |
+| 臂关节力矩上限 | $\boldsymbol{\tau}_{\max}$ | joint2: 60 N·m, 其余: 30 N·m (per-joint, 来自 Z1 URDF) |
+| 课程窗口长度 | $M_{\text{cur}}$ | 50 |
+| 课程跃迁阈值 | $\eta_{\text{thresh}}$ | 0.8 |
 
 ---
 
-## 6. 训练结束
+## 17. 推荐阅读顺序
 
-训练在以下两种情况下结束：
+1. **本文档**：建立全项目架构、训练闭环与模块边界的系统级认知。
+2. [README.md](../README.md)：快速开始方式与外部使用视角。
+3. [envs/Reward.md](../src/affordance_guided_interaction/envs/Reward.md)：奖励函数完整数学推导与设计动机。
+4. [training/README.md](../src/affordance_guided_interaction/training/README.md)：PPO 算法、TBPTT、课程学习与域随机化的形式化描述。
+5. [envs/README.md](../src/affordance_guided_interaction/envs/README.md)：环境层在 Isaac Lab 中的实现细节。
+6. [observations/README.md](../src/affordance_guided_interaction/observations/README.md)：观测层语义规范与工具类。
+7. [policy/README.md](../src/affordance_guided_interaction/policy/README.md)：策略网络架构、动作语义与时序设计。
+8. [configs/README.md](../configs/README.md)：7 份 YAML 的消费路径与参数含义。
+9. [docs/randomization.md](./randomization.md) 与 [docs/tensorboard_guide.md](./tensorboard_guide.md)：随机化参数详表与监控指标释义。
+10. 最后进入 `scripts/`、`envs/`、`policy/`、`training/` 的具体实现文件进行代码级阅读。
 
-- 累计步数达到配置的 `total_steps` 上限
-- 用户按 Ctrl+C 手动中断
+---
 
-无论哪种方式，系统都会在退出前执行以下收尾工作：
+## 18. 总结
 
-1. 保存最终 checkpoint（`ckpt_final.pt`）
-2. 打印训练总结：总耗时、总步数、平均 FPS、最终课程阶段、当前课程窗口成功率
-3. 释放所有环境资源（`envs.close()`）
-4. 关闭 TensorBoard 写入器
-5. 关闭仿真运行时（`simulation_app.close()`）
+本项目的训练系统由资源、环境、观测、策略、训练、监控与输出六层协同构成。环境层提供 GPU 批量并行的交互世界；观测层将仿真状态整理为结构化输入；策略层在部分可观测条件下输出连续控制信号；训练层通过 PPO + GAE + TBPTT 将交互数据转化为稳定的参数更新；监控与输出层保证整个过程可解释、可恢复、可分析。
+
+默认训练路径以 6D `door_geometry` 为门相关输入，以 asymmetric Actor-Critic + GRU 为策略架构，以三阶段课程和 8 维域随机化为泛化机制，以 17 项奖励分量为训练信号，构成当前项目的主干实现。理解这套系统的关键在于把握各层之间的职责划分与数据流向，从而准确判断改动的影响范围与正确的实现位置。

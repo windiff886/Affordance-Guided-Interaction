@@ -289,7 +289,7 @@ door_normal_in_base  # (N, 3)  门叶法向量在 base_link 系下的方向
 |---|---|---|
 | `physics_dt` | 物理仿真步长 | 1/120 s |
 | `decimation` | 策略控制间隔（物理步数） | 2（策略频率 60 Hz） |
-| `episode_length_s` | 单 episode 时长上限 | 90.0 s（5400 控制步） |
+| `episode_length_s` | 单 episode 时长上限 | 15.0 s（900 控制步） |
 | `num_envs` | 并行环境数 | 64（可调至数千） |
 | `env_spacing` | 环境间距 | 5.0 m |
 

@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import numpy as np
+
+_logger = logging.getLogger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -13,15 +16,7 @@ import numpy as np
 
 
 def should_capture_step(step: int, frame_stride: int) -> bool:
-    """判断当前步是否应捕获帧。
-
-    Parameters
-    ----------
-    step:
-        当前环境步索引（从 0 开始）。
-    frame_stride:
-        帧步幅，1 表示每步都捕获，2 表示隔一步捕获一次。
-    """
+    """判断当前步是否应捕获帧。"""
     return step % frame_stride == 0
 
 
@@ -36,19 +31,7 @@ def build_video_path(
     context: str,
     video_name_template: str,
 ) -> Path:
-    """构建视频文件的输出路径。
-
-    Parameters
-    ----------
-    output_root:
-        artifact 输出根目录（绝对路径）。
-    checkpoint_stem:
-        checkpoint 文件名去掉扩展名，如 ``"iter_010000"``；无 checkpoint 时为 ``"random_init"``。
-    context:
-        当前上下文名称，如 ``"none"``、``"both"``。
-    video_name_template:
-        视频路径模板，支持 ``{checkpoint_stem}`` 和 ``{context}`` 占位符。
-    """
+    """构建视频文件的输出路径。"""
     relative = video_name_template.format(
         checkpoint_stem=checkpoint_stem,
         context=context,
@@ -62,10 +45,7 @@ def build_frames_dir(
     context: str,
     frames_dir_template: str,
 ) -> Path:
-    """构建帧图片的输出目录路径。
-
-    参数同 :func:`build_video_path`，使用 ``frames_dir_template`` 模板。
-    """
+    """构建帧图片的输出目录路径。"""
     relative = frames_dir_template.format(
         checkpoint_stem=checkpoint_stem,
         context=context,
@@ -77,18 +57,66 @@ def build_frames_dir(
 # 帧捕获
 # ═══════════════════════════════════════════════════════════════════════
 
+_capture_warned_once = False
+
+
+def _normalize_rgb_frame(frame) -> np.ndarray | None:
+    """将 render/visual_observation 返回值标准化为 RGB uint8。"""
+    if frame is None:
+        return None
+    array = np.asarray(frame)
+    if array.size == 0:
+        return None
+    if array.ndim != 3:
+        return None
+    if array.shape[-1] >= 3:
+        array = array[:, :, :3]
+    if array.dtype != np.uint8:
+        array = array.astype(np.uint8)
+    return np.ascontiguousarray(array)
+
 
 def capture_frame(env) -> np.ndarray | None:
     """从环境获取当前帧的 RGB 数组。
 
-    安全方法：任何异常都会返回 ``None`` 而不传播。
+    优先使用 Isaac Lab 官方 `render()` 路径；若不可用，再回退到旧的
+    `get_visual_observation()` 接口。
     """
+    global _capture_warned_once
     try:
-        vis_obs = env.get_visual_observation()
-        if vis_obs is None or "rgb" not in vis_obs:
+        render_fn = getattr(env, "render", None)
+        if callable(render_fn):
+            frame = _normalize_rgb_frame(render_fn())
+            if frame is not None:
+                _capture_warned_once = False
+                return frame
+
+        if not hasattr(env, "get_visual_observation"):
+            if not _capture_warned_once:
+                _logger.warning(
+                    "capture_frame: 环境既没有 render() 也没有 get_visual_observation()，"
+                    "帧捕获不可用。请确认 rollout 环境以 rgb_array 模式创建。"
+                )
+                _capture_warned_once = True
             return None
-        return vis_obs["rgb"]  # (H, W, 3)
-    except Exception:
+
+        vis_obs = env.get_visual_observation()
+        frame = None if vis_obs is None else _normalize_rgb_frame(vis_obs.get("rgb"))
+        if frame is None:
+            if not _capture_warned_once:
+                _logger.warning(
+                    "capture_frame: render()/get_visual_observation() 都没有返回有效 RGB 帧，"
+                    "请检查 rollout 的离屏渲染配置。"
+                )
+                _capture_warned_once = True
+            return None
+
+        _capture_warned_once = False
+        return frame
+    except Exception as exc:
+        if not _capture_warned_once:
+            _logger.warning("capture_frame: 帧捕获异常: %s", exc)
+            _capture_warned_once = True
         return None
 
 
@@ -98,15 +126,7 @@ def capture_frame(env) -> np.ndarray | None:
 
 
 def save_frame_image(rgb: np.ndarray, path: Path) -> Path | None:
-    """将 RGB 帧保存为图片文件。
-
-    优先使用 imageio 保存 PNG；不可用时回退到 PPM 格式。
-
-    Returns
-    -------
-    Path | None
-        实际写入的文件路径，失败时返回 ``None``。
-    """
+    """将 RGB 帧保存为图片文件。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     rgb = np.asarray(rgb, dtype=np.uint8)
 
@@ -120,7 +140,6 @@ def save_frame_image(rgb: np.ndarray, path: Path) -> Path | None:
     except Exception:
         pass
 
-    # 回退到 PPM
     ppm_path = path.with_suffix(".ppm")
     try:
         _save_ppm(ppm_path, rgb)
@@ -147,22 +166,7 @@ def assemble_video(
     output_path: Path,
     fps: int = 30,
 ) -> bool:
-    """将帧列表组装为视频文件。
-
-    Parameters
-    ----------
-    frames:
-        RGB 帧列表，每个元素为 ``(H, W, 3)`` uint8 数组。
-    output_path:
-        输出视频文件路径。
-    fps:
-        输出帧率。
-
-    Returns
-    -------
-    bool
-        成功返回 ``True``；帧为空或 imageio[ffmpeg] 不可用时返回 ``False``。
-    """
+    """将帧列表组装为视频文件。"""
     if not frames:
         print("  无可用帧，跳过视频生成")
         return False

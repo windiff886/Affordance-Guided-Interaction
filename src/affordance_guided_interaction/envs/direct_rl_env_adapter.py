@@ -136,7 +136,7 @@ class DirectRLEnvAdapter:
         right_occupied_list: list[bool] | None = None,
     ) -> tuple[Tensor, Tensor]:
         """重置所有环境并保留 batched tensor 观测。"""
-        del door_types
+        # door_types 当前仅有一种（push），暂不传递；保留参数以便未来扩展。
         # 将 occupancy 传递给底层 env
         if left_occupied_list is not None and right_occupied_list is not None:
             self._env.set_occupancy(
@@ -330,6 +330,10 @@ class DirectRLEnvAdapter:
         ep_right_occ: Tensor | None = info_dict.get("episode_right_occupied")
         reward_info_dict: dict[str, Tensor] | None = info_dict.get("reward_info")
 
+        # 门角度和终止原因
+        door_angle_tensor: Tensor | None = info_dict.get("door_angle")
+        termination_reasons: list[str] | None = info_dict.get("termination_reason")
+
         for i in range(self.n_envs):
             done = bool(dones_np[i])
             # success 仅在 episode 结束时有意义；pre-reset 时由 env 计算正确值
@@ -363,6 +367,10 @@ class DirectRLEnvAdapter:
                 "success": success,
                 "episode_context": context,
             }
+            if door_angle_tensor is not None:
+                info["door_angle"] = float(door_angle_tensor[i])
+            if termination_reasons is not None and i < len(termination_reasons):
+                info["termination_reason"] = termination_reasons[i]
             if reward_info_dict is not None:
                 info["reward_info"] = {
                     key: float(val[i]) for key, val in reward_info_dict.items()
@@ -404,3 +412,23 @@ class DirectRLEnvAdapter:
     def close(self) -> None:
         """关闭环境。"""
         self._env.close()
+
+    def render(self):
+        """委托到底层环境的 render()，供 rollout 离屏抓帧使用。"""
+        if hasattr(self._env, "render"):
+            return self._env.render()
+        return None
+
+    # ── 帧捕获委托 ──────────────────────────────────────────────────
+
+    def get_visual_observation(self) -> dict | None:
+        """委托到底层环境的帧捕获方法。
+
+        Returns
+        -------
+        dict | None
+            ``{"rgb": ndarray(H, W, 3)}`` 或不可用时返回 ``None``。
+        """
+        if hasattr(self._env, "get_visual_observation"):
+            return self._env.get_visual_observation()
+        return None

@@ -103,7 +103,6 @@ def run_episode(
     left_occupied, right_occupied = VALID_CONTEXTS[context_name]
 
     actor_obs_list, critic_obs_list = envs.reset(
-        door_types=["push"],
         left_occupied_list=[left_occupied],
         right_occupied_list=[right_occupied],
     )
@@ -161,7 +160,18 @@ def run_episode(
             )
 
     success = bool(last_info.get("success", False))
-    reason = str(last_info.get("termination_reason", "UNKNOWN"))
+    # 优先从 info 读取终止原因（由 env → adapter 透传）；回退到字段推导
+    reason = last_info.get("termination_reason")
+    if not reason:
+        if success:
+            reason = "door_opened"
+        elif last_info.get("terminated", False):
+            reason = "cup_dropped"
+        elif last_info.get("truncated", False):
+            reason = "max_steps"
+        else:
+            reason = "UNKNOWN"
+    reason = str(reason)
 
     return {
         "success": success,
@@ -200,9 +210,10 @@ def main() -> int:
         assemble_video,
     )
     from affordance_guided_interaction.utils.runtime_env import resolve_headless_mode
-    from affordance_guided_interaction.utils.sim_runtime import launch_simulation_app
-    from affordance_guided_interaction.envs.door_push_env import DoorPushEnv
-    from affordance_guided_interaction.envs.direct_rl_env_adapter import DirectRLEnvAdapter
+    from affordance_guided_interaction.utils.sim_runtime import (
+        launch_simulation_app,
+        close_simulation_app,
+    )
 
     # ── 从 YAML 加载配置 ─────────────────────────────────────
     cfg = load_config(args.configs_dir)
@@ -215,13 +226,27 @@ def main() -> int:
     torch.manual_seed(vis_cfg.seed)
 
     device = torch.device(vis_cfg.device)
+
+    # 仅在需要帧捕获时启用渲染管线。
+    # 注意：enable_cameras=True 会启用 AppLauncher 完整渲染管线，
+    # 显著降低仿真速度（~5-10x）。仅当确实需要录制视频时才开启。
+    needs_rendering = vis_cfg.save_video or vis_cfg.save_frames
+    if needs_rendering:
+        print("提示: save_video/save_frames 已启用，将开启完整渲染管线，仿真速度会降低。")
+
+    # SimulationApp 必须在 import isaaclab 之前启动，
+    # 否则 omni 模块不可用 → ModuleNotFoundError
     simulation_app = launch_simulation_app(
         headless=resolve_headless_mode(vis_cfg.headless, os.environ),
-        enable_cameras=False,
+        enable_cameras=needs_rendering,
         import_error_message=(
             "未检测到 isaacsim 运行时，rollout_demo.py 需要在 Isaac Sim / Isaac Lab 运行时下执行。"
         ),
     )
+
+    # isaaclab 依赖 omni 运行时，必须在 SimulationApp 启动后导入
+    from affordance_guided_interaction.envs.door_push_env import DoorPushEnv
+    from affordance_guided_interaction.envs.direct_rl_env_adapter import DirectRLEnvAdapter
 
     actor, _critic, actor_cfg = build_models(cfg, device)
     actor.eval()
@@ -242,8 +267,11 @@ def main() -> int:
         print("未指定 checkpoint，使用随机初始化策略")
 
     # ── 创建环境 ────────────────────────────────────────────
-    env_cfg = build_env_cfg(cfg, n_envs=1, device=str(device), seed=vis_cfg.seed, enable_cameras=False)
-    _direct_env = DoorPushEnv(cfg=env_cfg)
+    env_cfg = build_env_cfg(cfg, n_envs=1, device=str(device), seed=vis_cfg.seed, enable_cameras=needs_rendering)
+    env_cfg.viewer.eye = vis_cfg.viewer_eye
+    env_cfg.viewer.lookat = vis_cfg.viewer_lookat
+    render_mode = "rgb_array" if needs_rendering else None
+    _direct_env = DoorPushEnv(cfg=env_cfg, render_mode=render_mode)
     envs = DirectRLEnvAdapter(_direct_env)
 
     verbose = True
@@ -259,6 +287,8 @@ def main() -> int:
     print(f"  保存帧: {vis_cfg.save_frames}")
     print(f"  帧步幅: {vis_cfg.frame_stride}")
     print(f"  输出目录: {vis_cfg.output_root}")
+    print(f"  Viewer eye: {vis_cfg.viewer_eye}")
+    print(f"  Viewer lookat: {vis_cfg.viewer_lookat}")
     print(f"{'═' * 60}\n")
 
     # ── 跨上下文 Rollout ────────────────────────────────────
@@ -339,8 +369,7 @@ def main() -> int:
 
     finally:
         envs.close()
-        if simulation_app is not None:
-            simulation_app.close()
+        close_simulation_app(simulation_app, wait_for_replicator=False)
 
     # ── 总结 ────────────────────────────────────────────────
     n_success = sum(1 for r in all_results if r["success"])

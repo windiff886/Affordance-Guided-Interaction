@@ -58,7 +58,7 @@ ssh -L 6006:localhost:6006 root@39.105.12.60 -p 6026
 #### **rollout_s** — 轨迹采集总耗时
 
 从 `collector.collect()` 开始到结束的完整耗时。包含：
-- `n_steps_per_rollout` 步环境交互（当前配置为 64）
+- `n_steps_per_rollout` 步环境交互（当前配置为 16）
 - Actor/Critic 前向推理
 - 观测数据准备（door geometry ground truth）
 - 数据写入 Buffer
@@ -71,7 +71,7 @@ ssh -L 6006:localhost:6006 root@39.105.12.60 -p 6026
 - 从 Buffer 中抽取 mini-batch
 - TBPTT（截断反向传播）序列处理
 - Actor/Critic 反向传播 + 梯度裁剪
-- 优化器更新参数（共 `num_mini_batches` × `num_epochs` 次更新，当前配置为 8 × 4 = 32 次）
+- 优化器更新参数（共 `num_mini_batches` × `num_epochs` 次更新，当前配置为 16 × 3 = 48 次）
 
 这部分通常在**秒级**，一般不是瓶颈。
 
