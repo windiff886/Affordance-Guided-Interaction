@@ -4,10 +4,12 @@
 由 Cloner 自动为每个并行环境复制完整场景子树，实现 GPU 批量并行仿真。
 
 场景包含：
-    - 双臂移动机器人 (UniDingo Dual-Arm Z1)
+    - 双臂固定底座机器人 (UniDingo Lite Z1)
     - 推门 (minimal_push_door)
     - 左/右杯体（预生成，按课程 occupancy 启停）
     - 地面平面 + 照明
+
+基座位姿在每次 episode reset 时通过扇形环采样随机化。
 """
 
 from __future__ import annotations
@@ -124,21 +126,21 @@ TRAY_SIZE_XYZ: tuple[float, float, float] = (0.12, 0.12, 0.008)
 
 @configclass
 class DoorPushSceneCfg(InteractiveSceneCfg):
-    """门推交互任务的完整场景配置。
+    """门推交互任务的场景配置（轻量化单配置）。
 
     Cloner 将 ``{ENV_REGEX_NS}`` 替换为 ``/World/envs/env_\\d+``，
     自动为每个并行环境复制整棵子树。
+
+    特征：
+        - 保留 ``room`` 字段但默认禁用（``room=None``）
+        - 使用精简版机器人 USD（无轮子/云台/支架），底座固定
+        - 仅保留双臂 + gripper actuator
+        - 机器人自碰撞保持启用
+        - 基座位姿在每次 episode reset 时随机化（扇形环采样）
     """
 
-    # ── 房间（墙壁 + 地板）────────────────────────────────────────────
-    room: AssetBaseCfg = AssetBaseCfg(
-        prim_path="{ENV_REGEX_NS}/Room",
-        spawn=sim_utils.UsdFileCfg(
-            usd_path=_ROOM_USD,
-            collision_props=sim_utils.CollisionPropertiesCfg(),
-        ),
-        init_state=AssetBaseCfg.InitialStateCfg(pos=(0.0, 0.0, 0.0)),
-    )
+    # ── 房间（保留配置字段，但默认不实例化）────────────────────────────
+    room: AssetBaseCfg | None = None
 
     # ── 地面 + 照明 ──────────────────────────────────────────────────
     ground: AssetBaseCfg = AssetBaseCfg(
@@ -166,17 +168,18 @@ class DoorPushSceneCfg(InteractiveSceneCfg):
         ),
     )
 
-    # ── 双臂移动机器人 ──────────────────────────────────────────────
+    # ── 双臂机器人（轻量化，固定底座）──────────────────────────────
     robot: ArticulationCfg = ArticulationCfg(
         prim_path="{ENV_REGEX_NS}/Robot",
         spawn=sim_utils.UsdFileCfg(
-            usd_path=_ROBOT_USD,
+            usd_path=_LITE_ROBOT_USD if Path(_LITE_ROBOT_USD).exists() else _ROBOT_USD,
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 disable_gravity=False,
                 retain_accelerations=True,
                 max_depenetration_velocity=1.0,
             ),
             articulation_props=sim_utils.ArticulationRootPropertiesCfg(
+                fix_root_link=True,
                 enabled_self_collisions=True,
                 solver_position_iteration_count=8,
                 solver_velocity_iteration_count=4,
@@ -189,8 +192,6 @@ class DoorPushSceneCfg(InteractiveSceneCfg):
             joint_pos={
                 "left_joint.*": 0.0,
                 "right_joint.*": 0.0,
-                "pan_tilt_.*": 0.0,
-                ".*wheel": 0.0,
             },
         ),
         actuators={
@@ -218,20 +219,6 @@ class DoorPushSceneCfg(InteractiveSceneCfg):
                 joint_names_expr=["left_jointGripper", "right_jointGripper"],
                 effort_limit=30.0,
                 velocity_limit=2.175,
-                stiffness=400.0,
-                damping=40.0,
-            ),
-            "wheels": ImplicitActuatorCfg(
-                joint_names_expr=[".*wheel"],
-                effort_limit=20.0,
-                velocity_limit=10.0,
-                stiffness=0.0,
-                damping=10.0,
-            ),
-            "pan_tilt": ImplicitActuatorCfg(
-                joint_names_expr=PAN_TILT_JOINT_NAMES,
-                effort_limit=5.0,
-                velocity_limit=2.0,
                 stiffness=400.0,
                 damping=40.0,
             ),
@@ -317,6 +304,9 @@ class DoorPushEnvCfg(DirectRLEnvCfg):
     """门推交互任务的 DirectRLEnv 配置。
 
     包含场景配置引用和所有任务级超参数。
+
+    使用轻量化场景（固定底座、无轮子/云台、`room=None`、自碰撞启用），
+    基座位姿在每次 episode reset 时通过扇形环采样随机化。
     """
 
     # ── 场景 ────────────────────────────────────────────────────────
@@ -328,7 +318,7 @@ class DoorPushEnvCfg(DirectRLEnvCfg):
 
     scene: DoorPushSceneCfg = DoorPushSceneCfg(
         num_envs=64,
-        env_spacing=10.0,
+        env_spacing=4.0,
         replicate_physics=True,
         clone_in_fabric=True,
     )
@@ -423,52 +413,3 @@ class DoorPushEnvCfg(DirectRLEnvCfg):
     # ── 门几何观测 ────────────────────────────────────────────────────
     door_geometry_dim: int = 6  # center(3) + normal(3)
     visual_refresh_interval: int = 4  # deprecated, kept for config compat
-
-
-@configclass
-class DoorPushLiteSceneCfg(DoorPushSceneCfg):
-    """门-杯-双臂训练轻量版场景。
-
-    Phase 2 轻量化：
-    - 使用精简版机器人 USD（uni_dingo_lite.usd，无轮子/云台/相机/支架）
-    - 删除 room
-    - 固定机器人 root
-    - 仅保留双臂 actuator
-    - 维持现有 DoorPushEnv 逻辑兼容
-
-    注意：uni_dingo_lite.usd 需要先通过
-    ``python assets/robot/scripts/convert_lite_urdf_to_usd_basic.py``
-    从 uni_dingo_lite.urdf 转换生成。
-    如果 lite USD 尚未生成，会回退到完整机器人 USD。
-    """
-
-    def __post_init__(self):
-        super().__post_init__()
-        self.room = None
-        # 切换到轻量版机器人 USD（如文件存在）
-        if Path(_LITE_ROBOT_USD).exists():
-            self.robot.spawn.usd_path = _LITE_ROBOT_USD
-        self.robot.spawn.articulation_props.fix_root_link = True
-        self.robot.actuators.pop("wheels", None)
-        self.robot.actuators.pop("pan_tilt", None)
-        self.robot.init_state.joint_pos.pop(".*wheel", None)
-        self.robot.init_state.joint_pos.pop("pan_tilt_.*", None)
-
-
-@configclass
-class DoorPushLiteEnvCfg(DoorPushEnvCfg):
-    """固定底座双臂持杯推门训练配置。"""
-
-    scene: DoorPushLiteSceneCfg = DoorPushLiteSceneCfg(
-        num_envs=64,
-        env_spacing=4.0,
-        replicate_physics=True,
-        clone_in_fabric=True,
-    )
-
-    def __post_init__(self):
-        super().__post_init__()
-        # 固定在当前标称门前位姿，避免把底盘采样当作训练内容。
-        self.base_radius_range = (0.74, 0.74)
-        self.base_sector_half_angle_deg = 0.0
-        self.base_yaw_delta_deg = 0.0

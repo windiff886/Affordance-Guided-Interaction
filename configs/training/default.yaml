@@ -33,7 +33,6 @@ runtime_defaults: &runtime_defaults
   resume: null              # 恢复训练的 checkpoint 路径；null 表示从头开始
   log_dir: runs             # TensorBoard 日志根目录
   ckpt_dir: checkpoints     # checkpoint 根目录；实际输出到 checkpoints/checkpoints_<timestamp>/
-  env_variant: lite       # full | lite，控制训练使用的环境变体
 
 ppo_common: &ppo_common
   gamma: 0.99               # 折扣因子 γ

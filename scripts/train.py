@@ -170,20 +170,13 @@ def build_env_cfg(
     device: str | None = None,
     seed: int | None = None,
     enable_cameras: bool = True,
-    variant: str = "full",
 ):
     """基于 YAML 配置构建 DoorPushEnvCfg。"""
     from affordance_guided_interaction.envs.door_push_env_cfg import (
         DoorPushEnvCfg,
-        DoorPushLiteEnvCfg,
     )
 
-    if variant == "lite":
-        env_cfg = DoorPushLiteEnvCfg()
-    elif variant == "full":
-        env_cfg = DoorPushEnvCfg()
-    else:
-        raise ValueError(f"Unsupported env variant: {variant}")
+    env_cfg = DoorPushEnvCfg()
     env_cfg.scene.num_envs = int(n_envs)
     env_cfg.sim.render_interval = int(env_cfg.decimation)
 
@@ -490,7 +483,6 @@ def main() -> int:
     print(f"   每轮采集步数: {n_steps_per_rollout}")
     print(f"   无头模式: {headless}")
     print(f"   随机种子: {runtime_cfg.seed}")
-    print(f"   环境变体: {runtime_cfg.env_variant}")
 
     simulation_app = launch_simulation_app(
         headless=headless,
@@ -514,7 +506,6 @@ def main() -> int:
         device=str(device),
         seed=runtime_cfg.seed,
         enable_cameras=enable_cameras,
-        variant=runtime_cfg.env_variant,
     )
     _direct_env = DoorPushEnv(cfg=env_cfg)
     envs = DirectRLEnvAdapter(_direct_env)

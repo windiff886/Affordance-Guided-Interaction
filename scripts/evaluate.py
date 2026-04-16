@@ -82,7 +82,6 @@ def main() -> int:
         device=str(device),
         seed=args.seed,
         enable_cameras=False,
-        variant=runtime_cfg.env_variant,
     )
     _direct_env = DoorPushEnv(cfg=env_cfg)
     envs = DirectRLEnvAdapter(_direct_env)

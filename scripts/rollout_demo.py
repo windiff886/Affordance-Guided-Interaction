@@ -277,7 +277,6 @@ def main() -> int:
         device=str(device),
         seed=vis_cfg.seed,
         enable_cameras=needs_rendering,
-        variant=runtime_cfg.env_variant,
     )
     env_cfg.viewer.eye = vis_cfg.viewer_eye
     env_cfg.viewer.lookat = vis_cfg.viewer_lookat
@@ -294,7 +293,6 @@ def main() -> int:
     print(f"  每上下文 episode: {vis_cfg.episodes_per_context}")
     print(f"  动作模式: {'确定性' if vis_cfg.deterministic else '随机采样'}")
     print(f"  设备: {device}")
-    print(f"  环境变体: {runtime_cfg.env_variant}")
     print(f"  保存视频: {vis_cfg.save_video}")
     print(f"  保存帧: {vis_cfg.save_frames}")
     print(f"  帧步幅: {vis_cfg.frame_stride}")

@@ -159,18 +159,12 @@ DirectRLEnvAdapter ──► RolloutCollector
 | 资产 | USD 路径 | 关键属性 |
 |------|---------|---------|
 | 双臂机器人 | `assets/robot/usd/uni_dingo_dual_arm.usd` | 12 个臂关节 + 4 个轮关节 + 2 个云台关节；臂关节力矩上限 joint2=60 N·m，其余=30 N·m |
-| 轻量机器人 | `assets/robot/usd/uni_dingo_lite.usd` | 移除轮子、云台、支架；固定底座；关闭自碰撞 |
+| 轻量机器人 | `assets/robot/usd/uni_dingo_lite.usd` | 移除轮子、云台、支架；固定底座；保留自碰撞 |
 | 推门 | `assets/minimal_push_door/solid_push_door.usda` | 单铰链关节；默认阻尼 2.0 N·m·s/rad |
 | 杯体 | `assets/grasp_objects/cup/carry_cup.usda` | 默认质量 0.3 kg（域随机化覆盖范围 0.1–0.8 kg） |
-| 房间 | `assets/minimal_push_door/room_shell.usda` | 碰撞几何边界 |
+| 房间 | `assets/minimal_push_door/room_shell.usda` | 碰撞几何边界（当前统一配置保留字段 `room=None`，默认不实例化） |
 
-环境配置类支持以下变体，各变体代表不同的场景规模与训练速度权衡：
-
-| 配置类 | 特征 |
-|--------|------|
-| `DoorPushEnvCfg` | 完整场景、完整机器人、自碰撞启用 |
-| `DoorPushLiteEnvCfg` | 移除 room、固定底座、裁减 wheels/pan-tilt |
-| `DoorPushLiteTrainEnvCfg` | 轻量版 + 训练门资产 + visual-free 机器人 + 关闭自碰撞 |
+环境配置类为 `DoorPushEnvCfg`，作为唯一的场景配置入口。当前统一配置采用轻量机器人场景：移除 wheels / pan-tilt、固定 root、保留自碰撞，并保留 `room` 配置字段但默认设为 `None`；基座位姿在 reset 时按扇形环随机采样。
 
 ### 4.2 配置文件体系
 
@@ -200,7 +194,7 @@ DirectRLEnvAdapter ──► RolloutCollector
 
 `training/default.yaml` 中的字段分为两类：
 
-1. **运行时设置**：由 `resolve_train_runtime_config()` 提取为 `TrainRuntimeConfig` 数据类，包含 `headless`、`device`、`seed`、`resume`、`log_dir`、`ckpt_dir`、`num_envs`、`env_variant`。
+1. **运行时设置**：由 `resolve_train_runtime_config()` 提取为 `TrainRuntimeConfig` 数据类，包含 `headless`、`device`、`seed`、`resume`、`log_dir`、`ckpt_dir`、`num_envs`。
 
 2. **训练过程参数**：保留在合并后的 `cfg` 字典中，由 `train.py` 直接读取，包含 `total_steps`、`n_steps_per_rollout`、`ppo.*`、`log_interval`、`checkpoint_interval` 等。
 
@@ -1042,9 +1036,8 @@ reward/
 以下约束在修改配置时必须保持一致：
 
 1. `success_angle_threshold`（1.2 rad，奖励用途）与 `door_angle_target`（1.57 rad，终止用途）不可混用。
-2. `env_variant` 影响场景资产、碰撞设置和机器人配置，非仅切换 USD 路径。
-3. `reward/default.yaml` 通过注入进入环境配置，修改奖励权重需同时理解配置侧和环境侧。
-4. 课程阶段仅决定上下文分布与门类型集合，不直接改变策略输入结构。
+2. `reward/default.yaml` 通过注入进入环境配置，修改奖励权重需同时理解配置侧和环境侧。
+3. 课程阶段仅决定上下文分布与门类型集合，不直接改变策略输入结构。
 
 ---
 

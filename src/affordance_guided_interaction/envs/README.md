@@ -62,13 +62,15 @@ envs 层是整个系统中**唯一直接与 Isaac Lab 物理引擎交互的层**
 
 | 资产 | 类型 | prim_path | 说明 |
 |---|---|---|---|
-| 双臂移动机器人 | `ArticulationCfg` | `{ENV_REGEX_NS}/Robot` | Unitree Z1 双臂 + Dingo 底座，力矩直驱 |
+| 双臂固定底座机器人 | `ArticulationCfg` | `{ENV_REGEX_NS}/Robot` | Unitree Z1 双臂（轻量化，固定底座，无轮子/云台，自碰撞启用），力矩直驱 |
 | 推门 | `ArticulationCfg` | `{ENV_REGEX_NS}/Door` | 单铰链门，无主动力矩，阻尼可随机化 |
 | 左杯体 | `RigidObjectCfg` | `{ENV_REGEX_NS}/CupLeft` | 预生成在远处，reset 时按 occupancy teleport |
 | 右杯体 | `RigidObjectCfg` | `{ENV_REGEX_NS}/CupRight` | 同上 |
 | 地面 + 照明 | `AssetBaseCfg` | 全局 | `GroundPlaneCfg` + `DomeLightCfg` |
 
 `{ENV_REGEX_NS}` 是 Isaac Lab Cloner 的占位符，Cloner 会将整棵场景子树自动复制到 `/World/envs/env_0`、`env_1`、……，实现 GPU 批量并行。
+
+> **场景说明：** 当前场景使用轻量化机器人（固定 root，无轮式底盘或云台关节），机器人自碰撞保持启用；`room` 配置字段仍保留，但默认值为 `None`，因此场景默认不实例化房间。机器人 base pose 在每个 episode 重置时通过扇形环采样（sector sampling）随机化。
 
 ### 3.2 环境主体：DoorPushEnv
 
@@ -160,7 +162,7 @@ Critic 观测 = Actor 观测（无噪声版） + privileged 信息：
 1. 缓存 raw action（用于 §6.3 力矩超限惩罚）
 2. 硬裁剪至 $[-\tau_{\text{limit}}, \tau_{\text{limit}}]$（默认 33.5 N·m，来自 URDF effort_limit）
 3. 注入步级高斯噪声 $\sigma_a$（训练时）
-4. 写入 arm 关节 effort target（gripper 和 wheel 关节不受策略控制）
+4. 写入 arm 关节 effort target（gripper 不受策略控制）
 
 系统不做重力补偿——抵抗刚体重力和摩擦扰动的工作完全由策略网络隐式学习。
 
@@ -292,7 +294,7 @@ door_normal_in_base  # (N, 3)  门叶法向量在 base_link 系下的方向
 | `decimation` | 策略控制间隔（物理步数） | 2（策略频率 60 Hz） |
 | `episode_length_s` | 单 episode 时长上限 | 15.0 s（900 控制步） |
 | `num_envs` | 并行环境数 | 64（可调至数千） |
-| `env_spacing` | 环境间距 | 5.0 m |
+| `env_spacing` | 环境间距 | 4.0 m |
 
 ### 12.2 任务判定参数
 
