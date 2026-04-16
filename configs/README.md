@@ -14,14 +14,14 @@
 | 文件 | 参数数 | 消费率 |
 |------|--------|-------|
 | `training/default.yaml` | 28 | 100% |
-| `env/default.yaml` | 2 | 100% |
+| `env/default.yaml` | 6 | 100% |
 | `policy/default.yaml` | 8 | 100% |
 | `curriculum/default.yaml` | 3 | 100% |
 | `task/default.yaml` | 2 | 100% |
 | `reward/default.yaml` | 25 | 100% |
 | `visualization/default.yaml` | 14 | 100% |
 
-**整体**：82 个参数，全部被代码消费。
+**整体**：86 个参数，全部被代码消费。
 
 > **已恢复**: `reward/default.yaml`（25 参数）— 奖励超参数从 `DoorPushEnvCfg` 迁移到独立 YAML 配置文件，由 `train.py` 的 `_inject_reward_params()` 注入。
 > 数学公式参考见 `envs/Reward.md`。
@@ -112,15 +112,19 @@ cfg = {
 
 ---
 
-### 3.2 `env/default.yaml` — 环境配置（2 参数）
+### 3.2 `env/default.yaml` — 环境配置（6 参数）
 
 旧路径的环境参数（`joints_per_arm`、`total_joints`、`contact_force_threshold` 等）已删除。
 其他环境参数现在定义在 `DoorPushEnvCfg`（`door_push_env_cfg.py`）中。
 
 | YAML 键 | 默认值 | 消费位置 | 含义 |
 |---------|--------|---------|------|
-| `physics_dt` | `0.008333` | `train.py` → `create_simulation_context()` | 物理引擎步长，$\Delta t = 1/120$ 秒 |
-| `decimation` | `2` | `train.py` → `create_simulation_context()` | 每个策略步执行多少次物理步进。控制频率 = $1 / (\Delta t \times \text{decimation}) = 60\text{Hz}$ |
+| `physics_dt` | `0.008333` | `train.py` → `DoorPushEnvCfg.sim.dt` | 物理引擎步长，$\Delta t = 1/120$ 秒 |
+| `decimation` | `2` | `train.py` → `DoorPushEnvCfg.decimation` | 每个策略步执行多少次物理步进。控制频率 = $1 / (\Delta t \times \text{decimation}) = 60\text{Hz}$ |
+| `control.action_type` | `joint_position` | `train.py` → `env_cfg.control_action_type` | 默认动作语义：双臂 12 维关节位置目标（rad） |
+| `control.arm_pd_stiffness` | `1000.0` | `train.py` → `scene.robot.actuators[*].stiffness` | arm actuator 的 PD 刚度 |
+| `control.arm_pd_damping` | `100.0` | `train.py` → `scene.robot.actuators[*].damping` | arm actuator 的 PD 阻尼 |
+| `control.position_target_noise_std` | `0.0` | `train.py` → `env_cfg.position_target_noise_std` | 位置目标噪声标准差 |
 
 ---
 
@@ -135,9 +139,8 @@ cfg = {
 | `actor.rnn_hidden` | `512` | `train.py:115` → `ActorConfig` → `RecurrentBackbone` | GRU 隐状态维度 |
 | `actor.rnn_layers` | `1` | `train.py:116` → `ActorConfig` → `RecurrentBackbone` | GRU 层数 |
 | `actor.rnn_type` | `gru` | `train.py:117` → `ActorConfig` → `RecurrentBackbone` | 循环单元类型（`gru` 或 `lstm`） |
-| `actor.action_dim` | `12` | `train.py:118` → `ActorConfig` → `ActionHead` | 输出动作维度（双臂 12 个关节力矩） |
+| `actor.action_dim` | `12` | `train.py:118` → `ActorConfig` → `ActionHead` | 输出动作维度（双臂 12 个关节位置目标 rad） |
 | `actor.log_std_init` | `-0.5` | `train.py:119` → `ActorConfig` → `ActionHead` | 高斯策略初始 $\log\sigma$（对应 $\sigma \approx 0.61$） |
-| `actor.include_torques` | `true` | `train.py:120` → `ActorConfig` → `Actor`、`Critic` | 是否在本体感觉输入中包含关节力矩。为 `true` 时 proprio 维度为 48，为 `false` 时为 36 |
 
 #### Critic 网络
 
@@ -178,21 +181,21 @@ cfg = {
 
 ## 4. 域随机化参数
 
-域随机化参数当前硬编码在 `training/domain_randomizer.py` 的 `RandomizationConfig` dataclass 中，未外置到 YAML。
+默认路径的 episode 级随机化范围保留在 `DoorPushEnvCfg` 中；步级位置目标噪声由 `configs/env/default.yaml` 暴露；Actor 观测噪声由 `DoorPushEnvCfg.obs_noise_std` 控制。
 
-| 参数 | 符号 | 默认值 | 时间尺度 | 含义 |
+| 参数 | 位置 | 默认值 | 时间尺度 | 含义 |
 |------|------|--------|---------|------|
-| `cup_mass_range` | $m_{\text{cup}}$ | `(0.1, 0.8)` kg | 回合级 | 杯体质量均匀分布范围 |
-| `door_mass_range` | $m_{\text{door}}$ | `(5.0, 20.0)` kg | 回合级 | 门板质量均匀分布范围 |
-| `door_damping_range` | $d_{\text{hinge}}$ | `(0.5, 5.0)` N·m·s/rad | 回合级 | 门铰链阻尼均匀分布范围 |
-| `push_plate_center_xy` | $c_{\text{push}}$ | `(2.98, 0.27)` m | 回合级 | 推板中心的世界坐标投影，作为基座采样圆心 |
-| `base_reference_xy` | $p_{\text{ref}}$ | `(3.72, 0.27)` m | 回合级 | 门外侧参考基座点，用于确定采样扇区中心方向 |
-| `base_height` | $z_{\text{base}}$ | `0.12` m | 回合级 | 机器人 root 的固定高度 |
-| `base_radius_range` | $[r_{\min}, r_{\max}]$ | `(0.45, 0.60)` m | 回合级 | 基座到推板中心的允许半径范围 |
-| `base_sector_half_angle_deg` | $\Delta \theta$ | `20.0°` | 回合级 | 门外侧扇形环的半角 |
-| `base_yaw_delta_deg` | $\Delta \psi$ | `10.0°` | 回合级 | 名义朝向推板中心后的 yaw 扰动范围 |
-| `action_noise_std` | $\sigma_a$ | `0.02` | 步级 | 动作噪声标准差 |
-| `observation_noise_std` | $\sigma_o$ | `0.01` | 步级 | 观测噪声标准差（仅注入 Actor 的 proprio 分支） |
+| `cup_mass_range` | `DoorPushEnvCfg` | `(0.1, 0.8)` kg | 回合级 | 杯体质量均匀分布范围 |
+| `door_mass_range` | `DoorPushEnvCfg` | `(5.0, 20.0)` kg | 回合级 | 门板质量均匀分布范围 |
+| `door_damping_range` | `DoorPushEnvCfg` | `(0.5, 5.0)` N·m·s/rad | 回合级 | 门铰链阻尼均匀分布范围 |
+| `push_plate_center_xy` | `DoorPushEnvCfg` | `(2.98, 0.27)` m | 回合级 | 推板中心的世界坐标投影，作为基座采样圆心 |
+| `base_reference_xy` | `DoorPushEnvCfg` | `(3.72, 0.27)` m | 回合级 | 门外侧参考基座点，用于确定采样扇区中心方向 |
+| `base_height` | `DoorPushEnvCfg` | `0.12` m | 回合级 | 机器人 root 的固定高度 |
+| `base_radius_range` | `DoorPushEnvCfg` | `(0.45, 0.60)` m | 回合级 | 基座到推板中心的允许半径范围 |
+| `base_sector_half_angle_deg` | `DoorPushEnvCfg` | `20.0°` | 回合级 | 门外侧扇形环的半角 |
+| `base_yaw_delta_deg` | `DoorPushEnvCfg` | `10.0°` | 回合级 | 名义朝向推板中心后的 yaw 扰动范围 |
+| `control.position_target_noise_std` | `env/default.yaml` | `0.0` | 步级 | 位置目标噪声标准差 |
+| `obs_noise_std` | `DoorPushEnvCfg` | `0.01` | 步级 | Actor 观测噪声标准差（仅注入 q/dq） |
 
 ---
 

@@ -1,439 +1,212 @@
-# 奖励函数设计 — 数学参考文档
+# DoorPushEnv Reward 说明
 
-> **注意**: 本文档是奖励函数的数学参考。实际的奖励计算代码位于
-> `DoorPushEnv._get_rewards()`（`door_push_env.py`）中，以 PyTorch tensor 操作实现。
-> 训练入口默认从 `configs/reward/default.yaml` 读取奖励超参数，并由 `train.py` 注入到 `DoorPushEnvCfg`。
-> `DoorPushEnvCfg` 中仍保留同名字段作为回退默认值；本文档不包含具体参数数值，仅描述数学公式与物理含义。
+本文档描述当前默认实现的 reward。旧版 torque 直驱相关项已经移除，以下公式以当前位置控制版本为准。
 
-## 1. 本层在系统中的位置
+## 1. 总式
 
-奖励计算在每个仿真步结束后、PPO 更新之前执行，从环境状态中计算标量奖励信号。所有奖励逻辑集中在 `DoorPushEnv._get_rewards()` 方法（`door_push_env.py`）中，以纯 PyTorch tensor 操作实现，无独立模块文件。训练脚本运行时会把 `configs/reward/default.yaml` 中的值覆盖写入 `DoorPushEnvCfg`；若未经过这条配置注入路径，则环境回退到 `DoorPushEnvCfg` 内的默认值。
+总奖励为：
 
-```
-envs/ ──→ next_state, contact_events
-  │
-  ├── 任务进展（门角度、回合结果事件 ...）
-  ├── 接触相关事件（如杯体脱落）
-  └── 精确物理状态（杯体位姿、双臂关节状态 ...）
-          │
-          ▼
-    ┌──────────────────────────────────┐
-    │  DoorPushEnv._get_rewards()     │  ◄── 奖励计算入口
-    │    ├─ §4  任务奖励 r_task       │
-    │    ├─ §5  稳定性奖励 r_stab     │
-    │    └─ §6  安全惩罚   r_safe     │
-    └──────────────────────────────────┘
-             │  r_total = r_task + r_stab - r_safe
-             ▼
-       training/ (PPO update)
-```
-
-**设计核心原则**：
-
-- 奖励"在约束下正确交互"，而不是"用某个特定身体部位"
-- 所有稳定性约束通过持杯 mask 条件化激活，不持杯时不施加末端约束
-- 训练时直接使用仿真地面真值计算奖励，不依赖 actor 观测
-- 稳定性分支内部同时包含高斯正项和二次负项，但在文档与日志中统一视为单侧稳定性奖励 `r_stab^L / r_stab^R` 的子项
-- 安全惩罚统一作为正惩罚量汇总进 `r_safe`，再由总式统一扣除
-
----
-
-## 2. 总体奖励函数
-
-每步奖励由主任务项、左右臂稳定性项和安全惩罚构成。当前课程设计中，Stage 1 完全不激活稳定性项；进入持杯阶段后，仅持杯侧的稳定性项生效：
-
-$$
-r_t = r_{\text{task}} + m_L \cdot r_{\text{stab}}^L + m_R \cdot r_{\text{stab}}^R - r_{\text{safe}}
-$$
-
-其中单臂稳定性奖励定义为：
-
-$$
-r_{\text{stab}}^{(\cdot)} = r_{\text{zero-acc}} + r_{\text{zero-ang}} + r_{\text{acc}} + r_{\text{ang}} + r_{\text{tilt}} + r_{\text{smooth}} + r_{\text{reg}}
-$$
-
-关键要点：
-
-- $m_L, m_R \in \{0, 1\}$ 为左右臂持杯 mask，由 `left_occupied` / `right_occupied` 决定
-- 单臂稳定性奖励内部同时包含高斯正项与二次负项，但统一作为单一 `r_stab^L / r_stab^R` 记录与分析
-- Stage 1 中 $m_L = m_R = 0$，稳定性分支整体关闭；因此 `r_stab^L`、`r_stab^R` 及其全部子项在 TensorBoard 中都应为 0
-- 安全惩罚 $r_{\text{safe}}$ 始终按原值从总奖励中扣除
-- `r_safe` 内部的各个子项统一按“正惩罚量”定义，避免符号歧义
-
----
-
-## 3. 持杯 mask 与稳定性调制
-
-### 3.1 双臂 occupancy mask
-
-持杯是随机事件，有四种情况：
-
-| $m_L$ | $m_R$ | 含义 |
-|-------|-------|------|
-| 0 | 0 | 双臂空闲，无稳定性约束 |
-| 1 | 0 | 左臂持杯，约束左臂末端 |
-| 0 | 1 | 右臂持杯，约束右臂末端 |
-| 1 | 1 | 双臂持杯，同时约束两侧 |
-
-
-
----
-
-## 4. 主任务奖励 $r_{\text{task}}$
-
-### 4.1 设计思路
-
-现阶段主任务为**推门**。奖励函数奖励门角度的进展本身而不是特定的接触方式，确保策略自行发现有效的推门策略。
-
-奖励由**基于进展增量的稠密奖励**、**一次性成功 bonus** 和 **接近门板大表面的 shaping 项**构成，既保留推门进展信号，也在早期探索阶段鼓励机械臂先靠近正确的交互区域。
-
-### 4.2 推门奖励
-
-进展度量为门铰链角度增量，权重 $w(\theta_t)$ 是关于当前角度的**分段递减函数**。按当前目标定义，reward 层单独维护 success bonus 阈值 $\theta_{\text{reward\_success}} = 1.2\ \text{rad}$；它**不等同于** env / TaskManager 使用的 episode 结束阈值 `1.57 rad`。同时新增一个仅在推门前期激活的接近门奖励：
-
-$$
-r_{\text{task}} = w(\theta_t) \cdot (\theta_t - \theta_{t-1}) + w_{\text{open}} \cdot \mathbf{1}[\theta_t \geq \theta_{\text{reward\_success}}] + \mathbf{1}[\theta_t < \theta_{\text{stop}}] \cdot w_{\text{approach}} \cdot r_{\text{approach}, t}
-$$
+`r_total = r_task + r_stab_left + r_stab_right - r_safe`
 
 其中：
 
-$$
-w(\theta_t) = \begin{cases}
- w_{\delta} & \text{if } \theta_t \leq \theta_{\text{reward\_success}} \\
- w_{\delta} \cdot \max\!\left(\alpha,\; 1 - k_{\text{decay}}(\theta_t - \theta_{\text{reward\_success}})\right) & \text{if } \theta_t > \theta_{\text{reward\_success}}
-\end{cases}
-$$
+- `r_task`：推门主任务奖励
+- `r_stab_left / r_stab_right`：左右持杯稳定性奖励
+- `r_safe`：正惩罚量，进入总奖励时统一相减
 
-$$
-r_{\text{approach}, t} = \max\!\left(1 - \frac{a_t^2}{b^2 + \varepsilon},\; 0\right)
-$$
+## 2. 任务奖励
 
-$$
-a_t = \min_{\mathbf{x} \in \mathcal{A}_t,\; \mathbf{y} \in \mathcal{D}_t} \|\mathbf{x} - \mathbf{y}\|_2,
-\qquad
-b = \min_{\mathbf{x} \in \mathcal{A}_0,\; \mathbf{y} \in \mathcal{D}_0} \|\mathbf{x} - \mathbf{y}\|_2
-$$
+### 2.1 角度增量项
 
-当前最小实现中，$\mathcal{A}_t = \{\mathbf{p}_{\mathrm{ee}}^L(t), \mathbf{p}_{\mathrm{ee}}^R(t)\}$，即左右末端执行器控制点；$\mathcal{D}_t$ 为门板 `Panel` 推门侧的大矩形表面，而不是 `PushPlate` 的单点近似。
+设当前门角度为 `theta_t`，上一控制步门角度为 `theta_{t-1}`：
 
-- $\theta_t \leq \theta_{\text{reward\_success}}$ 时：$w = w_\delta$（满额激励，不衰减）
-- $\theta_t > \theta_{\text{reward\_success}}$ 时：权重由于超出奖励目标角度而线性衰减，直到降至下限 $\alpha \cdot w_\delta$
-- $\theta_t \geq \theta_{\text{stop}}$ 时：关闭接近奖励，避免学成“贴着门站着不推”
+`delta_t = theta_t - theta_{t-1}`
 
-参数说明：
+增量项采用分段权重：
 
-- $w_\delta$：基准角度增量奖励
-- $\alpha \in (0, 1)$：衰减下限比例，控制到达目标后的权重保留比例
-- $k_{\text{decay}}$：超出目标角度后的衰减速率系数
-- $\theta_{\text{reward\_success}}$：reward 层 success bonus 触发角度，目标值为 `1.2 rad`
-- $w_{\text{open}}$：完成 bonus（一次性）
-- $w_{\text{approach}}$：接近门板大表面的奖励权重
-- $\varepsilon$：归一化平方距离公式的稳定项
-- $\theta_{\text{stop}}$：关闭接近奖励的门角度阈值
+- 当 `theta_t <= success_angle_threshold` 时，权重为 `w_delta`
+- 当 `theta_t > success_angle_threshold` 时，权重按 `1 - k_decay * (theta_t - success_angle_threshold)` 线性衰减，并以 `alpha` 为下限
 
-env / TaskManager 的 episode 结束角度由环境层单独维护，目标值为 `1.57 rad`。reward 文档中的成功阈值不再与 episode 结束阈值共用同一名字，以避免再次混淆。
+即：
 
+`r_task_delta = weight(theta_t) * delta_t`
 
----
+### 2.2 一次性成功 bonus
 
-## 5. 持杯稳定性奖励 $r_{\text{stab}}$
+当门角度首次跨过 `success_angle_threshold` 时触发：
 
-### 5.1 设计思路
+`r_task_open_bonus = w_open * 1[newly_succeeded]`
 
-参考 SoFTA 框架上半身智能体的末端稳定性奖励设计。核心思想是：杯体的稳定性由末端执行器（EE）的运动状态决定，通过**高斯核正奖励**鼓励趋近零状态，**二次惩罚**抑制过大运动量。正奖励与惩罚构成互补的双向梯度场。
+该 bonus 每个 episode 只给一次。
 
-所有指标基于 **gripper frame**（末端执行器坐标系）定义。`lin_acc` / `ang_acc` 通过连续两步 EE 速度的数值微分计算，`tilt` 由末端姿态与重力方向几何推理得到。
+### 2.3 接近门板奖励
 
-对左右臂的计算方式完全对称，以下以单臂为例写出公式，左臂取 $(\cdot)^L$，右臂取 $(\cdot)^R$。
+接近奖励在门刚开始推动时激活，用于帮助策略建立接触：
 
-### 5.2 稳定性 proxy 中的关键量
+`r_task_approach = 1[theta_t < approach_stop_angle] * w_approach * approach_raw`
 
-| 量 | 定义 |
-|----|------|
-| $\mathbf{a}_t$ | EE 线加速度，通过连续两步 EE 线速度的数值微分 $\mathbf{a}_t = (\mathbf{v}_t - \mathbf{v}_{t-1}) / \Delta t$ 计算 |
-| $\boldsymbol{\alpha}_t$ | EE 角加速度，通过连续两步 EE 角速度的数值微分 $\boldsymbol{\alpha}_t = (\boldsymbol{\omega}_t - \boldsymbol{\omega}_{t-1}) / \Delta t$ 计算 |
-| $\text{tilt}$ | 杯体倾斜度，见 §5.3 |
+其中：
 
-### 5.3 杯体倾斜度的几何推理
+`approach_raw = max(1 - current_dist^2 / (initial_dist^2 + eps), 0)`
 
-杯体是否倾倒取决于杯口法线相对重力方向的偏转角。设重力方向为 $\mathbf{g} = [0, 0, -9.81]^\top$，gripper 旋转矩阵为 $R_{EE}$，则重力在 EE 局部坐标系中的表达为：
+`current_dist` 由左右 EE 到门板推门侧大表面的最近距离计算而来，`initial_dist` 是 episode 开始时的对应距离。
 
-$$
-\mathbf{g}_{\text{local}} = R_{EE}^\top \mathbf{g}
-$$
+### 2.4 任务奖励汇总
 
-取其 $xy$ 分量的模长即为倾斜度：
+`r_task = r_task_delta + r_task_open_bonus + r_task_approach`
 
-$$
-\text{tilt} = \| P_{xy}(\mathbf{g}_{\text{local}}) \| = \sqrt{g_x^2 + g_y^2}
-$$
+## 3. 稳定性奖励
 
-直觉：若 gripper 保持竖直（杯口朝上），重力在 EE 坐标系中完全沿 $-z$ 轴，$xy$ 分量为零，tilt = 0；gripper 越倾斜，tilt 越大。
+稳定性项仅对持杯侧生效。若某一侧当前未持杯，则该侧稳定性奖励为零。
 
-### 5.4 稳定性奖励子项
+对每一侧 `s ∈ {left, right}`：
 
-参考 SoFTA 上半身智能体的奖励设计。
+`r_stab_s = zero_acc + zero_ang + acc + ang + tilt`
 
-#### (1) 零线加速度奖励
+### 3.1 零线加速度奖励
 
-鼓励末端三维线加速度趋近于 0：
+`r_zero_acc = w_zero_acc * exp(-lambda_acc * ||a||^2)`
 
-$$
-r_{\text{zero-acc}} = w_{\text{zero-acc}} \cdot \exp\!\left( -\lambda_{acc} \cdot \|\mathbf{a}_t\|^2 \right)
-$$
+### 3.2 零角加速度奖励
 
-#### (2) 零角加速度奖励
+`r_zero_ang = w_zero_ang * exp(-lambda_ang * ||alpha||^2)`
 
-鼓励末端三维角加速度趋近于 0：
+### 3.3 线加速度惩罚
 
-$$
-r_{\text{zero-ang}} = w_{\text{zero-ang}} \cdot \exp\!\left( -\lambda_{ang} \cdot \|\boldsymbol{\alpha}_t\|^2 \right)
-$$
+`r_acc = -w_acc * ||a||^2`
 
-#### (3) 线加速度惩罚
+### 3.4 角加速度惩罚
 
-二次惩罚抑制末端高加速度冲击：
+`r_ang = -w_ang * ||alpha||^2`
 
-$$
-r_{\text{acc}} = -w_{\text{acc}} \cdot \|\mathbf{a}_t\|^2
-$$
+### 3.5 倾斜惩罚
 
-#### (4) 角加速度惩罚
+`r_tilt = -w_tilt * ||tilt_perp||^2`
 
-$$
-r_{\text{ang}} = -w_{\text{ang}} \cdot \|\boldsymbol{\alpha}_t\|^2
-$$
+其中 `tilt_perp` 是重力方向在末端局部坐标系中偏离局部 `Y` 轴的 `xz` 分量。
 
-#### (5) 重力倾斜惩罚
+### 3.6 已删除的旧项
 
-**极度惩罚 EE 倾斜**，确保液体不洒：
+以下 torque 语义下的旧稳定性项已经删除，不再进入当前 reward：
 
-$$
-r_{\text{tilt}} = -w_{\text{tilt}} \cdot \|P_{xy}(R_{EE}^\top \mathbf{g})\|^2
-$$
+- `smooth`
+- `reg`
 
-#### (6) 力矩变化平滑项
+原因是当前 policy 输出的是关节位置目标，不再直接输出 joint torque。
 
-相邻两步力矩的变化量反映控制信号的平滑程度，抑制抖动和高频振荡：
+## 4. 安全惩罚
 
-$$
-r_{\text{smooth}} = -w_{\text{smooth}} \cdot \|\boldsymbol{\tau}_t - \boldsymbol{\tau}_{t-1}\|^2
-$$
+安全惩罚始终激活，当前只保留 3 项：
 
-其中 $\boldsymbol{\tau}_t \in \mathbb{R}^6$ 为该侧臂经 clip + action noise 后的控制力矩。力矩来源为 `_prev_action`（当前步）和 `_prev_prev_action`（上一步），均为经过力矩裁剪和动作噪声注入后的值。
+`r_safe = r_safe_joint_vel + r_safe_target_limit + r_safe_cup_drop`
 
-#### (7) 力矩幅值正则项
+### 4.1 关节速度超限惩罚
 
-防止策略输出过大的力矩，起隐式能量约束的作用：
+设每个关节速度上限为 `dq_max`，触发比例为 `mu`：
 
-$$
-r_{\text{reg}} = -w_{\text{reg}} \cdot \|\boldsymbol{\tau}_t\|^2
-$$
+`vel_threshold = mu * dq_max`
 
-其中 $\boldsymbol{\tau}_t \in \mathbb{R}^6$ 为该侧臂经 clip + action noise 后的控制力矩，与平滑项使用相同的力矩来源。
+`vel_excess = max(|dq| - vel_threshold, 0)`
 
-### 5.5 单臂稳定性奖励汇总（对应第 2 章）
+`r_safe_joint_vel = beta_vel * sum(vel_excess^2)`
 
-在第 2 章的总奖励公式中，单臂稳定性项不再拆分为 bonus 和 penalty 两组，而是统一写作单一奖励：
+### 4.2 目标角越界惩罚
 
-$$
-r_{\text{stab}}^{(\cdot)} = r_{\text{zero-acc}} + r_{\text{zero-ang}} + r_{\text{acc}} + r_{\text{ang}} + r_{\text{tilt}} + r_{\text{smooth}} + r_{\text{reg}}
-$$
+这是当前版本最关键的安全项。
 
-这个写法与代码实现保持一致：高斯正项和二次负项都作为 `r_stab^(·)` 的子项参与求和，然后在左右臂层面分别应用 occupancy mask。
+设 policy 原始输出为 `q_target_raw`，关节上下限为 `q_min, q_max`。环境执行前会先做仿真层 clip：
 
-> **说明**：子项 $r_{\text{zero-acc}}$ / $r_{\text{acc}}$ 与 $r_{\text{zero-ang}}$ / $r_{\text{ang}}$ 仍然构成典型的“稳态吸引”组合，但在日志和分析层面统一归入单侧稳定性奖励，不再单独维护 `stab_bonus` / `stab_penalty` 概念。
+`q_target_cmd = clip(q_target_raw, q_min, q_max)`
 
-### 5.6 双臂稳定性奖励与 occupancy mask
+但 reward 惩罚的不是 `q_target_cmd`，而是 raw policy 输出的越界部分：
 
-最终的双臂稳定性奖励写作：
+`target_excess_high = max(q_target_raw - q_max, 0)`
 
-$$
-r_{\text{stab}} = m_L \cdot r_{\text{stab}}^L + m_R \cdot r_{\text{stab}}^R
-$$
+`target_excess_low = max(q_min - q_target_raw, 0)`
 
-这带来的直接效果是：
-- **双臂持杯时**：左右两侧的 7 个稳定性子项都满额激活，策略必须同时维持两只杯子的平稳。
-- **单臂持杯时**：仅持杯侧的相关稳定性子项生效，空闲臂不受末端稳定性约束。
-- **完全空手时**：$m_L = m_R = 0$，$r_{\text{stab}}^L$ 与 $r_{\text{stab}}^R$ 在两侧全局关闭。策略不会受到任何关于末端加速度和倾角限制的持杯稳定性约束（但安全底线惩罚 $r_{\text{safe}}$ 仍在）。
+`target_excess = target_excess_high + target_excess_low`
 
-当前 TensorBoard 中按“生效后的实际贡献”记录 `r_stab^L`、`r_stab^R` 及各自子项，因此在 Stage 1 下这些曲线应保持在 0 附近。
+`r_safe_target_limit = beta_target * sum(target_excess^2)`
 
----
+这保证了两件事：
 
-## 6. 安全惩罚 $r_{\text{safe}}$
+- 执行层永远安全，仿真只接收 clip 后的位置目标
+- 策略若持续输出越界目标角，仍会在 reward 上收到清晰惩罚
 
-安全惩罚项**始终激活**，不受持杯状态影响。奖励函数不鼓励危险行为，无论手中是否持杯。
+### 4.3 杯体脱落惩罚
 
-本节统一采用以下约定：
+若持杯侧 cup 与对应 EE 的距离超过 `cup_drop_threshold`：
 
-- `r_safe` 是正惩罚量的总和
-- 各个安全子项都按正数幅值定义
-- 最终总奖励通过 `- r_safe` 统一扣除
+`r_safe_cup_drop = w_drop`
 
-当前任务是显式接触任务，末端与门板/把手发生接触属于完成任务的必要条件。因此安全项不再直接惩罚接触力，而只保留与设备保护和持杯安全直接相关的约束。需要特别区分：仿真执行前的力矩 clip 由 env / 仿真层负责，而“力矩超限惩罚”基于 policy 原始输出的控制力矩计算，用于惩罚超限控制意图。
+并且 episode 会终止。
 
-### 6.1 关节限位逼近惩罚
+### 4.4 已删除的旧项
 
-当关节角度逼近物理限位时施加递增惩罚，防止机构损伤。
+以下旧安全项已经删除：
 
-**限位信息来源**：
-每个关节的物理极限区间 $[q_i^{\min}, q_i^{\max}]$ 并非硬编码在奖励函数中，而是直接从机器人的底层资产文件中解析获得：
-* URDF 源码定义：[`assets/robot/urdf/uni_dingo_dual_arm.urdf`](../../../assets/robot/urdf/uni_dingo_dual_arm.urdf) 中的 `<limit lower="..." upper="..."/>`
-* USD 仿真模型：[`assets/robot/uni_dingo_dual_arm.usd`](../../../assets/robot/uni_dingo_dual_arm.usd)
+- `safe/joint_limit`
+- `safe/torque_limit`
 
-在 Isaac Sim 仿真运行时，奖励模块会通过只读的物理抽象层（如 `ArticulationView.get_dof_limits()`）一次性获取这些真值。
+另外，PD 控制器输出力矩的饱和裁剪仍然存在，但只属于执行层安全约束，不进入 reward。
 
-设第 $i$ 关节的角度范围为 $[q_i^{\min}, q_i^{\max}]$，中心为 $q_i^c$，半范围为 $\delta_i = (q_i^{\max} - q_i^{\min}) / 2$，惩罚项的计算公式为：
+## 5. TensorBoard 标签
 
-$$
-r_{\text{limit}} = \beta_1 \cdot \sum_{i=1}^{12} \max\!\left(0,\ \left| q_i - q_i^c \right| - \mu \cdot \delta_i \right)^2
-$$
+当前 `reward_info` 中的主要 key 为：
 
-其中 $\mu \in (0, 1)$ 为触发比例（如 0.9，即偏移量超过允许半范围的 90% 时，才开始产生向上生长的二次幂惩罚）。
+- `task`
+- `task/delta`
+- `task/open_bonus`
+- `task/approach`
+- `task/approach_raw`
+- `stab_left`
+- `stab_left/zero_acc`
+- `stab_left/zero_ang`
+- `stab_left/acc`
+- `stab_left/ang`
+- `stab_left/tilt`
+- `stab_right`
+- `stab_right/zero_acc`
+- `stab_right/zero_ang`
+- `stab_right/acc`
+- `stab_right/ang`
+- `stab_right/tilt`
+- `safe`
+- `safe/joint_vel`
+- `safe/target_limit`
+- `safe/cup_drop`
+- `total`
 
-### 6.2 关节速度过大惩罚
+## 6. 默认参数来源
 
-与角度极限类似，防止过快运动超出关节减速器与电机的额定承载能力。
+当前默认训练路径的有效 reward 权重来自 [configs/reward/default.yaml](../../../configs/reward/default.yaml)，不是 `DoorPushEnvCfg` 中保留的回退默认值。
 
-**限速信息来源**：
-每个关节的物理最大转速 $\dot{q}_i^{\max}$ 同样并非随意选取，而是提取自底层的机器人资产：
-* URDF 源码定义：[`assets/robot/urdf/uni_dingo_dual_arm.urdf`](../../../assets/robot/urdf/uni_dingo_dual_arm.urdf) 中的 `<limit ... velocity="..."/>` 所填写的最大速率。
-* USD 仿真模型：[`assets/robot/uni_dingo_dual_arm.usd`](../../../assets/robot/uni_dingo_dual_arm.usd) 中绑定的 `maxJointVelocity` 属性。
+当前 YAML 默认值为：
 
-在运行时，系统通过物理引擎接口（如 `ArticulationView.get_dof_max_velocities()`）直接获取这组速度上限，并以此设置速度阈值 $v_{\text{thresh}}^{(i)}$ （通常取物理极限的一个安全系数比如 0.9）。
+### 6.1 Task
 
-$$
-r_{\text{vel}} = \beta_2 \cdot \sum_{i=1}^{12} \max\!\left(0,\ |\dot{q}_i| - \mu \cdot \dot{q}_i^{\max} \right)^2
-$$
+- `w_delta = 5000.0`
+- `alpha = 0.3`
+- `k_decay = 0.5`
+- `w_open = 25000.0`
+- `success_angle_threshold = 1.2`
+- `w_approach = 200.0`
+- `approach_eps = 1.0e-6`
+- `approach_stop_angle = 0.10`
 
-超过该动态截断阈值的部分以平方惩罚，阈值内不惩罚。这样当更换其他具有不同传动比的机械臂配置时，无需修改训练超参。
+### 6.2 Stability
 
-### 6.3 原始控制力矩超限惩罚
+- `w_zero_acc = 0.0`
+- `lambda_acc = 2.0`
+- `w_zero_ang = 0.0`
+- `lambda_ang = 1.0`
+- `w_acc = 0.05`
+- `w_ang = 0.001`
+- `w_tilt = 0.03`
 
-设 policy 在当前步输出的原始控制力矩为 $\boldsymbol{\tau}^{\text{raw}}_t$，每个关节的力矩上限为 $\boldsymbol{\tau}^{\max}$。env 会在送入物理引擎前执行：
+### 6.3 Safety
 
-$$
-\boldsymbol{\tau}^{\text{applied}}_t = \text{clip}\!\left(\boldsymbol{\tau}^{\text{raw}}_t,\; -\boldsymbol{\tau}^{\max},\; \boldsymbol{\tau}^{\max}\right)
-$$
-
-但安全检测不会使用 $\boldsymbol{\tau}^{\text{applied}}_t$ 掩盖超限行为，而是直接对原始输出中的超限部分施加惩罚：
-
-$$
-r_{\text{torque}} = \beta_3 \cdot \sum_{i=1}^{12} \max\!\left(0,\ |\tau^{\text{raw}}_i| - \tau^{\max}_i \right)^2
-$$
-
-这样可以同时满足两点：
-
-- 物理仿真始终安全，只执行 clip 后的力矩；
-- 策略如果持续输出越界力矩，仍会在奖励层受到明确惩罚。
-
-### 6.4 杯体脱落惩罚
-
-如果机械臂或环境的交互动作导致杯子不可逆地脱离了末端原有的持握状态（例如掉落、被外力撞飞），系统会给出极其严厉的单次截断性惩罚，以保证模型学会安全稳定的接触操作：
-
-$$
-r_{\text{drop}} = w_{\text{drop}} \cdot \mathbf{1}[\text{cup\_dropped}]
-$$
-
-脱落触发后当前 episode 直接终止。
-
----
-
-## 7. 课程与稳定性项的关系
-
-当前奖励设计不再使用时间退火。原因是课程本身已经把“先学会推门，再学会持杯稳定推门”拆成了两个阶段：
-
-1. **Stage 1（无持杯）**：`m_L = m_R = 0`，稳定性分支整体关闭。策略只学习推门和基本安全约束，不会因为稳定性惩罚而学成“不动”。
-2. **Stage 2/3（进入持杯）**：对持杯侧立即启用完整稳定性项。此时策略已经具备基础推门能力，奖励不再需要用时间轴逐步放大稳定性惩罚。
-
----
-
-## 8. 奖励数据来源
-
-`_get_rewards()` 从以下来源获取输入：
-
-| 数据 | 来源 | 用途 |
-|------|------|------|
-| $\theta_t, \theta_{t-1}$ | `door.data.joint_pos` + `_prev_door_angle` 缓存 | 任务奖励 |
-| $a_t, b$ | `_cached_approach_dist` + `_initial_approach_dist` + 门板大表面几何缓存 | approach reward |
-| $\mathbf{a}_t, \boldsymbol{\alpha}_t$ | 连续两步 EE 速度的数值微分（`_get_observations` 中缓存） | 稳定性奖励 |
-| $\text{tilt}$ | EE 姿态四元数 + 重力方向几何推理（`_compute_tilt`） | 稳定性奖励 |
-| $m_L, m_R$ | `_left_occupied` / `_right_occupied` 持杯状态标记 | 稳定性 mask |
-| $\boldsymbol{\tau}^{\text{raw}}_t$ | `_cached_raw_action`（clip 前原始输出） | 力矩超限惩罚 |
-| $\boldsymbol{\tau}^{\text{applied}}_t, \boldsymbol{\tau}^{\text{applied}}_{t-1}$ | `_prev_action` / `_prev_prev_action`（clip + noise 后的力矩） | 力矩平滑/正则 |
-| $\boldsymbol{\tau}^{\max}$ | `cfg.effort_limit` | 力矩超限阈值 |
-| $\mathbf{q}, \dot{\mathbf{q}}$ | `robot.data.joint_pos` / `joint_vel` | 关节限位/速度惩罚 |
-| 关节限位 $[q_i^{\min}, q_i^{\max}]$ | `robot.data.soft_joint_pos_limits`（物理引擎提供） | 关节限位惩罚 |
-| 关节速度上限 $\dot{q}_i^{\max}$ | `robot.data.soft_joint_vel_limits`（物理引擎提供） | 速度惩罚 |
-| 杯体脱落标志 | `_check_cup_dropped()`（EE-杯体距离阈值检测） | 杯体脱落惩罚 |
-
-注意：奖励计算使用仿真地面真值（不依赖 critic 的 privileged 信息）。
-
----
-
-## 9. 权重参数一览
-
-训练脚本默认从 `configs/reward/default.yaml` 读取奖励超参数，并通过 `_inject_reward_params()` 覆盖写入 `DoorPushEnvCfg`；`DoorPushEnvCfg` 自身仍保留同名默认值作为未注入场景下的回退。以下仅列出参数的数学符号与物理含义，具体数值参见该 YAML 文件。
-
-### 9.1 主任务权重
-
-| 参数 | YAML 键 | 含义 |
-|------|---------|------|
-| $\theta_{\text{reward\_success}}$ | `task.success_angle_threshold` | success bonus 触发角度 |
-| $w_\delta$ | `task.w_delta` | 角度增量基准奖励 |
-| $\alpha$ | `task.alpha` | 权重衰减下限比例 |
-| $k_{\text{decay}}$ | `task.k_decay` | 超出目标角度后的衰减速率 |
-| $w_{\text{open}}$ | `task.w_open` | 任务成功 bonus |
-| $w_{\text{approach}}$ | `task.w_approach` | 接近门板大表面奖励权重 |
-| $\varepsilon$ | `task.approach_eps` | 归一化距离公式稳定项 |
-| $\theta_{\text{stop}}$ | `task.approach_stop_angle` | 关闭接近奖励的门角度阈值 |
-
-### 9.2 稳定性权重
-
-| 参数 | YAML 键 | 含义 |
-|------|---------|------|
-| $w_{\text{zero-acc}}$ | `stability.w_zero_acc` | 零线加速度奖励权重 |
-| $\lambda_{acc}$ | `stability.lambda_acc` | 零线加速度高斯核衰减率 |
-| $w_{\text{zero-ang}}$ | `stability.w_zero_ang` | 零角加速度奖励权重 |
-| $\lambda_{ang}$ | `stability.lambda_ang` | 零角加速度高斯核衰减率 |
-| $w_{\text{acc}}$ | `stability.w_acc` | 线加速度惩罚系数 |
-| $w_{\text{ang}}$ | `stability.w_ang` | 角加速度惩罚系数 |
-| $w_{\text{tilt}}$ | `stability.w_tilt` | 重力倾斜惩罚系数 |
-| $w_{\text{smooth}}$ | `stability.w_smooth` | 力矩平滑惩罚系数 |
-| $w_{\text{reg}}$ | `stability.w_reg` | 力矩正则惩罚系数 |
-
-### 9.3 安全惩罚权重
-
-| 参数 | YAML 键 | 含义 |
-|------|---------|------|
-| $\beta_1$ | `safety.beta_limit` | 关节限位系数 |
-| $\mu$ | `safety.mu` | 关节限位/速度触发比例 |
-| $\beta_2$ | `safety.beta_vel` | 关节速度系数 |
-| $\beta_3$ | `safety.beta_torque` | 原始控制力矩超限系数 |
-| $w_{\text{drop}}$ | `safety.w_drop` | 杯体脱落惩罚 |
-
-### 9.4 课程阶段下的稳定性项开关
-
-| 阶段 | 持杯 mask | 稳定性项 |
-|------|-----------|----------|
-| Stage 1 | `m_L = m_R = 0` | 全部关闭 |
-| Stage 2 | 单臂持杯 | 持杯侧 7 个稳定性子项全量生效 |
-| Stage 3 | 混合分布 | 按具体上下文对持杯侧 7 个稳定性子项全量生效 |
-
----
-
-## 10. 分项监控
-
-当前实现会在 `_get_rewards()` 中同步构建 `reward_info`，并通过 `DirectRLEnvAdapter`、`RolloutCollector`、`train.py` 写入 TensorBoard。记录口径为“本轮 rollout 内所有环境、所有步的平均子项贡献”。
-
-当前可观测的主标签包括：
-
-- `reward/total`、`reward/task`、`reward/stab_left`、`reward/stab_right`、`reward/safe`
-- `reward_terms/task/delta`、`reward_terms/task/open_bonus`、`reward_terms/task/approach`、`reward_terms/task/approach_raw`
-- `reward_terms/stab_left/*`、`reward_terms/stab_right/*`
-- `reward_terms/safe/joint_limit`、`reward_terms/safe/joint_vel`、`reward_terms/safe/torque_limit`、`reward_terms/safe/cup_drop`
-
-其中 `task`、`stab_left`、`stab_right` 采用进入总奖励时的有符号贡献；`safe` 与 `safe/*` 采用正惩罚量记录，在总奖励中统一以减号扣除。
-
-这一组分项日志使得训练过程中每个奖励来源都可直接观测，便于定位“任务进展不足”还是“安全/稳定性惩罚过强”。更详细的标签说明见 `docs/tensorboard_guide.md`。
+- `mu = 0.9`
+- `beta_vel = 0.5`
+- `beta_target = 1.0`
+- `w_drop = 100.0`

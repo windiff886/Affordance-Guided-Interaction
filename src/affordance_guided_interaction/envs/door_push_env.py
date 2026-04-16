@@ -87,10 +87,10 @@ _DOOR_PANEL_HALF_EXTENT_Y = 0.45
 _DOOR_PANEL_HALF_EXTENT_Z = 1.0
 
 # 观测维度
-# actor: proprio(48) + ee(38) + context(2) + stability(2) + door_geometry(6) = 96
-# critic: actor_obs(96) + privileged(13) = 109
-_ACTOR_OBS_DIM = 96
-_CRITIC_OBS_DIM = 109
+# actor: proprio(36) + ee(38) + context(2) + stability(2) + door_geometry(6) = 84
+# critic: actor_obs(84) + privileged(13) = 97
+_ACTOR_OBS_DIM = 84
+_CRITIC_OBS_DIM = 97
 _DOOR_GEOMETRY_DIM = 6
 _PRIVILEGED_DIM = 13
 
@@ -137,8 +137,7 @@ class DoorPushEnv(DirectRLEnv):
         N = self.num_envs
         dev = self.device
 
-        self._prev_action = torch.zeros(N, 12, device=dev)
-        self._prev_prev_action = torch.zeros(N, 12, device=dev)
+        self._prev_joint_target = torch.zeros(N, 12, device=dev)
         self._left_occupied = torch.zeros(N, dtype=torch.bool, device=dev)
         self._right_occupied = torch.zeros(N, dtype=torch.bool, device=dev)
         self._step_count = torch.zeros(N, dtype=torch.long, device=dev)
@@ -170,11 +169,6 @@ class DoorPushEnv(DirectRLEnv):
         # 预计算控制 dt
         self._control_dt = self.physics_dt * self.cfg.decimation
 
-        # Per-joint effort limits tensor (1, 12)，来自 Z1 URDF
-        self._effort_limits = torch.tensor(
-            cfg.effort_limits, device=self.device
-        ).unsqueeze(0)  # (1, 12) for broadcasting with (N, 12)
-
         # ── 奖励计算用缓存（由 _get_observations 填充）───────────
         self._cached_left_ee_la = torch.zeros(N, 3, device=dev)
         self._cached_left_ee_aa = torch.zeros(N, 3, device=dev)
@@ -182,7 +176,7 @@ class DoorPushEnv(DirectRLEnv):
         self._cached_right_ee_aa = torch.zeros(N, 3, device=dev)
         self._cached_left_tilt_perp = torch.zeros(N, 2, device=dev)
         self._cached_right_tilt_perp = torch.zeros(N, 2, device=dev)
-        self._cached_raw_action = torch.zeros(N, 12, device=dev)
+        self._cached_raw_joint_target = torch.zeros(N, 12, device=dev)
         # L12: 每步在 _get_observations() 中缓存，供 _get_rewards/_get_dones 共用
         self._cached_cup_dropped = torch.zeros(N, dtype=torch.bool, device=dev)
         self._cached_left_ee_pos_base = torch.zeros(N, 3, device=dev)
@@ -267,34 +261,45 @@ class DoorPushEnv(DirectRLEnv):
     # ═══════════════════════════════════════════════════════════════════
 
     def _pre_physics_step(self, actions: Tensor) -> None:
-        """将策略输出的力矩写入关节 — 批量操作所有 env。"""
-        # 缓存原始动作（clip 前），用于力矩超限惩罚 §6.3
-        self._cached_raw_action = actions.clone()
+        """将策略输出的关节位置目标写入仿真 — 批量操作所有 env。
 
-        # 力矩裁剪（per-joint limits，来自 Z1 URDF）
-        clipped = torch.clamp(actions, -self._effort_limits, self._effort_limits)
+        控制链路：
+            q_target_raw → joint limit clip → (optional) position noise → re-clip
+            → set_joint_position_target() → PD 生成 torque → effort limit 截断
+        """
+        robot: Articulation = self.scene["robot"]
 
-        # 注入步级动作噪声 (training only)
-        if self.cfg.action_noise_std > 0:
-            noise = torch.randn_like(clipped) * self.cfg.action_noise_std
-            clipped = torch.clamp(
-                clipped + noise,
-                -self._effort_limits,
-                self._effort_limits,
+        # 1. 缓存 policy 原始输出（clip 前），用于目标角越界惩罚
+        self._cached_raw_joint_target = actions.clone()
+
+        # 2. 按 joint limits 做位置限位
+        joint_limits = robot.data.soft_joint_pos_limits[0, self._arm_joint_ids]  # (12, 2)
+        q_min = joint_limits[:, 0]  # (12,)
+        q_max = joint_limits[:, 1]  # (12,)
+        q_target_cmd = torch.clamp(actions, q_min.unsqueeze(0), q_max.unsqueeze(0))
+
+        # 3. 可选：注入位置目标噪声
+        noise_std = self.cfg.position_target_noise_std
+        if noise_std > 0:
+            noise = torch.randn_like(q_target_cmd) * noise_std
+            q_target_cmd = torch.clamp(
+                q_target_cmd + noise,
+                q_min.unsqueeze(0),
+                q_max.unsqueeze(0),
             )
 
-        # 构建全关节力矩向量（策略只控制 12 个臂关节）
-        robot: Articulation = self.scene["robot"]
-        efforts = torch.zeros(
+        # 4. 构造全关节位置目标向量（策略只控制 12 个臂关节）
+        targets = torch.zeros(
             self.num_envs, robot.num_joints, device=self.device
         )
-        efforts[:, self._arm_joint_ids] = clipped
-        robot.set_joint_effort_target(efforts)
+        targets[:, self._arm_joint_ids] = q_target_cmd
+        robot.set_joint_position_target(targets)
+
+        # 5. 保持 gripper hold targets
         self._set_gripper_hold_targets()
 
-        # 保存动作供下一步 obs 使用
-        self._prev_prev_action = self._prev_action.clone()
-        self._prev_action = clipped.clone()
+        # 6. 缓存 clip 后的目标，供下一步 obs 使用
+        self._prev_joint_target = q_target_cmd.clone()
 
     def _apply_action(self) -> None:
         """动作已在 `_pre_physics_step()` 中写入 articulation 缓冲，这里无需重复处理。"""
@@ -319,9 +324,6 @@ class DoorPushEnv(DirectRLEnv):
         # ── 读取关节状态 ──────────────────────────────────────────
         all_q = robot.data.joint_pos[:, self._arm_joint_ids]    # (N, 12)
         all_dq = robot.data.joint_vel[:, self._arm_joint_ids]   # (N, 12)
-        all_tau = robot.data.applied_torque[:, self._arm_joint_ids] \
-            if hasattr(robot.data, "applied_torque") \
-            else torch.zeros_like(all_q)
 
         # ── 读取 body 状态（世界系）─────────────────────────────
         body_pos_w = robot.data.body_pos_w     # (N, B, 3)
@@ -465,10 +467,10 @@ class DoorPushEnv(DirectRLEnv):
             noisy_q = all_q + torch.randn_like(all_q) * self.cfg.obs_noise_std
             noisy_dq = all_dq + torch.randn_like(all_dq) * self.cfg.obs_noise_std
 
-        # actor: proprio(48) + ee(38) + context(2) + stability(2) + door_geometry(6) = 96
+        # actor: proprio(36) + ee(38) + context(2) + stability(2) + door_geometry(6) = 84
         actor_obs = torch.cat([
-            # proprio: q(12) + dq(12) + tau(12) + prev_action(12) = 48
-            noisy_q, noisy_dq, all_tau, self._prev_action,
+            # proprio: q(12) + dq(12) + prev_joint_target(12) = 36
+            noisy_q, noisy_dq, self._prev_joint_target,
             # left_ee: pos(3) + quat(4) + lv(3) + av(3) + la(3) + aa(3) = 19
             left_ee_pos_base, left_ee_quat_base,
             left_ee_lv_base, left_ee_av_base,
@@ -483,7 +485,7 @@ class DoorPushEnv(DirectRLEnv):
             left_tilt, right_tilt,
             # door_geometry: center(3) + normal(3) = 6
             door_geometry,
-        ], dim=-1)  # (N, 96)
+        ], dim=-1)  # (N, 84)
 
         # ── Critic obs (无噪声 + privileged) ───────────────────
         # 门状态 (base_link 系)
@@ -501,7 +503,7 @@ class DoorPushEnv(DirectRLEnv):
 
         critic_obs = torch.cat([
             # 无噪声 proprio
-            all_q, all_dq, all_tau, self._prev_action,
+            all_q, all_dq, self._prev_joint_target,
             # EE（与 actor 相同，但无噪声 q/dq）
             left_ee_pos_base, left_ee_quat_base,
             left_ee_lv_base, left_ee_av_base,
@@ -520,7 +522,7 @@ class DoorPushEnv(DirectRLEnv):
             self._door_mass.unsqueeze(-1),
             self._door_damping.unsqueeze(-1),
             cup_dropped.float().unsqueeze(-1),
-        ], dim=-1)  # (N, 109)
+        ], dim=-1)  # (N, 97)
 
         return {"policy": actor_obs, "critic": critic_obs}
 
@@ -574,31 +576,23 @@ class DoorPushEnv(DirectRLEnv):
         reward_info["task/approach_raw"] = r_task_approach_raw
 
         # ══════════════════════════════════════════════════════════════
-        # §5 稳定性奖励：7 子项 × 双臂（使用缓存的加速度 + tilt_perp）
+        # §5 稳定性奖励：5 子项 × 双臂（使用缓存的加速度 + tilt_perp）
         # ══════════════════════════════════════════════════════════════
         m_l = self._left_occupied.float()  # (N,)
         m_r = self._right_occupied.float()
 
-        all_tau = self._prev_action  # (N, 12) — 已 clip 后的力矩
         r_stab_left = torch.zeros(self.num_envs, device=self.device)
         r_stab_right = torch.zeros(self.num_envs, device=self.device)
 
-        for side_idx, (side_name, m, la, aa, tilt_perp, tau_slice) in enumerate([
+        for side_name, m, la, aa, tilt_perp in [
             ("left", m_l, self._cached_left_ee_la, self._cached_left_ee_aa,
-             self._cached_left_tilt_perp, all_tau[:, :6]),
+             self._cached_left_tilt_perp),
             ("right", m_r, self._cached_right_ee_la, self._cached_right_ee_aa,
-             self._cached_right_tilt_perp, all_tau[:, 6:]),
-        ]):
-            prev_tau_slice = (
-                self._prev_prev_action[:, :6] if side_idx == 0
-                else self._prev_prev_action[:, 6:]
-            )
-
+             self._cached_right_tilt_perp),
+        ]:
             la_sq = (la * la).sum(-1)
             aa_sq = (aa * aa).sum(-1)
             tilt_sq = (tilt_perp * tilt_perp).sum(-1)
-            tau_diff_sq = ((tau_slice - prev_tau_slice) ** 2).sum(-1)
-            tau_sq = (tau_slice * tau_slice).sum(-1)
 
             side_terms = {
                 "zero_acc": m * (
@@ -610,8 +604,6 @@ class DoorPushEnv(DirectRLEnv):
                 "acc": m * (-self.cfg.rew_w_acc * la_sq),
                 "ang": m * (-self.cfg.rew_w_ang * aa_sq),
                 "tilt": m * (-self.cfg.rew_w_tilt * tilt_sq),
-                "smooth": m * (-self.cfg.rew_w_smooth * tau_diff_sq),
-                "reg": m * (-self.cfg.rew_w_reg * tau_sq),
             }
             r_stab_side = sum(side_terms.values())
             reward_info[f"stab_{side_name}"] = r_stab_side
@@ -624,22 +616,9 @@ class DoorPushEnv(DirectRLEnv):
                 r_stab_right = r_stab_side
 
         # ══════════════════════════════════════════════════════════════
-        # §6 安全惩罚：4 子项（正惩罚量）
+        # §6 安全惩罚：3 子项（正惩罚量）
         # ══════════════════════════════════════════════════════════════
-        joint_pos = robot.data.joint_pos[:, self._arm_joint_ids]  # (N, 12)
-        if hasattr(robot.data, "soft_joint_pos_limits"):
-            joint_limits = robot.data.soft_joint_pos_limits[0, self._arm_joint_ids]  # (12, 2)
-        else:
-            raise RuntimeError(
-                "robot.data.soft_joint_pos_limits 不可用，"
-                "无法获取关节物理限位。请检查 Isaac Lab 版本或 Articulation 配置。"
-            )
-        center = (joint_limits[:, 0] + joint_limits[:, 1]) / 2.0
-        half_range = (joint_limits[:, 1] - joint_limits[:, 0]) / 2.0
-        threshold = self.cfg.rew_mu * half_range
-        excess = torch.clamp(torch.abs(joint_pos - center) - threshold, min=0)
-        r_safe_joint_limit = self.cfg.rew_beta_limit * (excess ** 2).sum(-1)
-
+        # 关节速度超限惩罚
         joint_vel = robot.data.joint_vel[:, self._arm_joint_ids]  # (N, 12)
         if hasattr(robot.data, "soft_joint_vel_limits"):
             vel_limit = robot.data.soft_joint_vel_limits[0, self._arm_joint_ids]  # (12,)
@@ -652,25 +631,31 @@ class DoorPushEnv(DirectRLEnv):
         vel_excess = torch.clamp(torch.abs(joint_vel) - vel_threshold, min=0)
         r_safe_joint_vel = self.cfg.rew_beta_vel * (vel_excess ** 2).sum(-1)
 
-        torque_excess = torch.clamp(
-            torch.abs(self._cached_raw_action) - self._effort_limits, min=0
+        # 目标角越界惩罚（基于 raw target，而非 clip 后的 target）
+        joint_limits = robot.data.soft_joint_pos_limits[0, self._arm_joint_ids]  # (12, 2)
+        q_min = joint_limits[:, 0]  # (12,)
+        q_max = joint_limits[:, 1]  # (12,)
+        target_excess_high = torch.clamp(
+            self._cached_raw_joint_target - q_max.unsqueeze(0), min=0
         )
-        r_safe_torque_limit = self.cfg.rew_beta_torque * (torque_excess ** 2).sum(-1)
+        target_excess_low = torch.clamp(
+            q_min.unsqueeze(0) - self._cached_raw_joint_target, min=0
+        )
+        target_excess = target_excess_high + target_excess_low
+        r_safe_target_limit = self.cfg.rew_beta_target * (target_excess ** 2).sum(-1)
 
         cup_dropped = self._cached_cup_dropped
         r_safe_cup_drop = cup_dropped.float() * self.cfg.rew_w_drop
 
         r_safe = (
-            r_safe_joint_limit
-            + r_safe_joint_vel
-            + r_safe_torque_limit
+            r_safe_joint_vel
+            + r_safe_target_limit
             + r_safe_cup_drop
         )
 
         reward_info["safe"] = r_safe
-        reward_info["safe/joint_limit"] = r_safe_joint_limit
         reward_info["safe/joint_vel"] = r_safe_joint_vel
-        reward_info["safe/torque_limit"] = r_safe_torque_limit
+        reward_info["safe/target_limit"] = r_safe_target_limit
         reward_info["safe/cup_drop"] = r_safe_cup_drop
 
         r_total = r_task + r_stab_left + r_stab_right - r_safe
@@ -810,8 +795,7 @@ class DoorPushEnv(DirectRLEnv):
         # ── 7. 重置 per-env 状态 ────────────────────────────────
         self._step_count[env_ids] = 0
         self._prev_door_angle[env_ids] = 0.0
-        self._prev_action[env_ids] = 0.0
-        self._prev_prev_action[env_ids] = 0.0
+        self._prev_joint_target[env_ids] = 0.0
         self._already_succeeded[env_ids] = False
         self._prev_left_ee_lin_vel[env_ids] = 0.0
         self._prev_left_ee_ang_vel[env_ids] = 0.0

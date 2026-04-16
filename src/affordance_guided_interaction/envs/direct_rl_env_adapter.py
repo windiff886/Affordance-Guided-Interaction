@@ -40,26 +40,25 @@ _PRIV_LAYOUT: list[tuple[str, int, int]] = [
 # 对齐 DoorPushEnv._get_observations() 的拼接顺序
 _S_JP   = slice(0,   12)   # joint_positions
 _S_JV   = slice(12,  24)   # joint_velocities
-_S_JT   = slice(24,  36)   # joint_torques
-_S_PA   = slice(36,  48)   # prev_action
-_S_LEP  = slice(48,  51)   # left ee position
-_S_LEQ  = slice(51,  55)   # left ee orientation (quat)
-_S_LLV  = slice(55,  58)   # left ee linear_velocity
-_S_LAV  = slice(58,  61)   # left ee angular_velocity
-_S_LLA  = slice(61,  64)   # left ee linear_acceleration
-_S_LAA  = slice(64,  67)   # left ee angular_acceleration
-_S_REP  = slice(67,  70)   # right ee position
-_S_REQ  = slice(70,  74)   # right ee orientation (quat)
-_S_RLV  = slice(74,  77)   # right ee linear_velocity
-_S_RAV  = slice(77,  80)   # right ee angular_velocity
-_S_RLA  = slice(80,  83)   # right ee linear_acceleration
-_S_RAA  = slice(83,  86)   # right ee angular_acceleration
-_S_LO   = slice(86,  87)   # left_occupied
-_S_RO   = slice(87,  88)   # right_occupied
-_S_LT   = slice(88,  89)   # left_tilt
-_S_RT   = slice(89,  90)   # right_tilt
-_S_DCG  = slice(90,  93)   # door_center_in_base
-_S_DNM  = slice(93,  96)   # door_normal_in_base
+_S_PJT  = slice(24,  36)   # prev_joint_target
+_S_LEP  = slice(36,  39)   # left ee position
+_S_LEQ  = slice(39,  43)   # left ee orientation (quat)
+_S_LLV  = slice(43,  46)   # left ee linear_velocity
+_S_LAV  = slice(46,  49)   # left ee angular_velocity
+_S_LLA  = slice(49,  52)   # left ee linear_acceleration
+_S_LAA  = slice(52,  55)   # left ee angular_acceleration
+_S_REP  = slice(55,  58)   # right ee position
+_S_REQ  = slice(58,  62)   # right ee orientation (quat)
+_S_RLV  = slice(62,  65)   # right ee linear_velocity
+_S_RAV  = slice(65,  68)   # right ee angular_velocity
+_S_RLA  = slice(68,  71)   # right ee linear_acceleration
+_S_RAA  = slice(71,  74)   # right ee angular_acceleration
+_S_LO   = slice(74,  75)   # left_occupied
+_S_RO   = slice(75,  76)   # right_occupied
+_S_LT   = slice(76,  77)   # left_tilt
+_S_RT   = slice(77,  78)   # right_tilt
+_S_DCG  = slice(78,  81)   # door_center_in_base
+_S_DNM  = slice(81,  84)   # door_normal_in_base
 
 
 class DirectRLEnvAdapter:
@@ -211,24 +210,23 @@ class DirectRLEnvAdapter:
     ) -> tuple[list[dict], list[dict]]:
         """将 batch tensor obs 转为 per-env dict list。
 
-        将 DoorPushEnv 产出的 96D flat actor tensor 解构为
+        将 DoorPushEnv 产出的 84D flat actor tensor 解构为
         ``flatten_actor_obs()`` 期望的嵌套字典结构。
 
-        Actor obs 96D tensor 布局（对齐 DoorPushEnv._get_observations）：
+        Actor obs 84D tensor 布局（对齐 DoorPushEnv._get_observations）：
             [0:12)   joint_positions
             [12:24)  joint_velocities
-            [24:36)  joint_torques
-            [36:48)  prev_action
-            [48:51)  left_ee_pos      [51:55)  left_ee_quat
-            [55:58)  left_ee_lv       [58:61)  left_ee_av
-            [61:64)  left_ee_la       [64:67)  left_ee_aa
-            [67:70)  right_ee_pos     [70:74)  right_ee_quat
-            [74:77)  right_ee_lv      [77:80)  right_ee_av
-            [80:83)  right_ee_la      [83:86)  right_ee_aa
-            [86:87)  left_occupied    [87:88)  right_occupied
-            [88:89)  left_tilt        [89:90)  right_tilt
-            [90:93)  door_center_in_base
-            [93:96)  door_normal_in_base
+            [24:36)  prev_joint_target
+            [36:39)  left_ee_pos      [39:43)  left_ee_quat
+            [43:46)  left_ee_lv       [46:49)  left_ee_av
+            [49:52)  left_ee_la       [52:55)  left_ee_aa
+            [55:58)  right_ee_pos     [58:62)  right_ee_quat
+            [62:65)  right_ee_lv      [65:68)  right_ee_av
+            [68:71)  right_ee_la      [71:74)  right_ee_aa
+            [74:75)  left_occupied    [75:76)  right_occupied
+            [76:77)  left_tilt        [77:78)  right_tilt
+            [78:81)  door_center_in_base
+            [81:84)  door_normal_in_base
 
         critic_obs dict 结构:
             {
@@ -240,8 +238,8 @@ class DirectRLEnvAdapter:
                 },
             }
         """
-        actor_t = obs_dict["policy"]   # (N, 96)
-        critic_t = obs_dict["critic"]  # (N, 109)
+        actor_t = obs_dict["policy"]   # (N, 84)
+        critic_t = obs_dict["critic"]  # (N, 97)
 
         actor_list: list[dict] = []
         critic_list: list[dict] = []
@@ -254,8 +252,7 @@ class DirectRLEnvAdapter:
                 "proprio": {
                     "joint_positions": a[_S_JP],
                     "joint_velocities": a[_S_JV],
-                    "joint_torques":    a[_S_JT],
-                    "prev_action":      a[_S_PA],
+                    "prev_joint_target": a[_S_PJT],
                 },
                 "ee": {
                     "left": {

@@ -43,13 +43,11 @@ _STAB_DIM = 2
 _DOOR_GEOMETRY_DIM = 6
 
 
-def _compute_proprio_dim(include_torques: bool) -> int:
+def _compute_proprio_dim() -> int:
     """计算 proprio 分支的输入维度。"""
     total_joints = 12
     dim = total_joints * 2  # q + dq
-    if include_torques:
-        dim += total_joints  # tau
-    dim += total_joints  # prev_action
+    dim += total_joints  # prev_joint_target
     return dim
 
 
@@ -68,16 +66,13 @@ class ActorExportWrapper(nn.Module):
     ----------
     actor : Actor
         训练好的 Actor 网络实例。
-    include_torques : bool
-        是否包含力矩输入（影响 proprio 维度）。
     """
 
-    def __init__(self, actor: "Actor", include_torques: bool = True) -> None:
+    def __init__(self, actor: "Actor") -> None:
         super().__init__()
         self.actor = actor
-        self.include_torques = include_torques
 
-        self.proprio_dim = _compute_proprio_dim(include_torques)
+        self.proprio_dim = _compute_proprio_dim()
         self.ee_dim = _EE_DIM
         self.context_dim = _CONTEXT_DIM
         self.stab_dim = _STAB_DIM
@@ -280,7 +275,7 @@ def main() -> int:
     print(f"  训练轮次: {iteration}, 全局步数: {global_steps}")
 
     # ── 创建导出包装器 ──────────────────────────────────────
-    wrapper = ActorExportWrapper(actor, include_torques=actor_cfg.include_torques)
+    wrapper = ActorExportWrapper(actor)
     wrapper.eval()
     print(f"  扁平输入维度: {wrapper.flat_dim}")
     print(f"  RNN 类型: {actor_cfg.rnn_type}, 隐层: {actor_cfg.rnn_hidden}, 层数: {actor_cfg.rnn_layers}")

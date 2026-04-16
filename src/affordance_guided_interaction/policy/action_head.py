@@ -1,8 +1,8 @@
 """高斯动作头：将 backbone 隐状态解码为连续动作分布。
 
-输出双臂 12 维关节力矩的对角高斯分布参数 (μ, σ)，
+输出双臂 12 维关节位置目标 (rad) 的对角高斯分布参数 (μ, σ)，
 提供 sample / evaluate / deterministic 三种调用模式供 PPO 使用。
-不进行力矩 clip——力矩限制由仿真环境层负责。
+不进行关节限位 clip——位置限位由仿真环境层负责。
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ class ActionHead(nn.Module):
     input_dim : int
         来自 RecurrentBackbone 的隐状态维度。
     action_dim : int
-        输出动作维度，默认 12（双臂各 6 关节力矩）。
+        输出动作维度，默认 12（双臂各 6 关节位置目标，单位 rad）。
     log_std_init : float
         可学习 log_std 的初始值，默认 -0.5。
     """

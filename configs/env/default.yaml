@@ -7,3 +7,10 @@
 # ── 物理仿真参数 ─────────────────────────────────────────────────────
 physics_dt: 0.008333       # 物理步长 1/120 秒
 decimation: 2              # 控制频率 = physics_dt × decimation = 60Hz
+
+# ── 控制器参数 ─────────────────────────────────────────────────────
+control:
+  action_type: joint_position       # 动作语义: joint_position (rad)
+  arm_pd_stiffness: 1000.0          # PD 位置控制刚度 Kp
+  arm_pd_damping: 100.0             # PD 位置控制阻尼 Kd
+  position_target_noise_std: 0.0    # 位置目标噪声标准差 (训练时)

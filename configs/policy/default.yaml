@@ -11,11 +11,8 @@ actor:
   rnn_type: gru            # 循环类型: gru / lstm
 
   # ActionHead (Gaussian)
-  action_dim: 12           # 双臂关节力矩维度
+  action_dim: 12           # 双臂关节位置目标维度 (rad)
   log_std_init: -0.5       # 动作标准差的初始 log 值
-
-  # 观测相关
-  include_torques: true     # 是否在 proprio 分支中包含关节力矩
 
 # ── Critic 网络 ──────────────────────────────────────────────────────
 critic:

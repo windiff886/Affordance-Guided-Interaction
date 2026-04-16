@@ -111,7 +111,7 @@ $$
 \mathcal{H}[\pi_\theta] = \frac{1}{2} \sum_{i=1}^{12} \left( \ln(2\pi e\, \sigma_i^2) \right)
 $$
 
-其中 $\sigma_i$ 为动作空间第 $i$ 维的标准差。12 维对应双臂各 6 个关节的力矩输出。
+其中 $\sigma_i$ 为动作空间第 $i$ 维的标准差。12 维对应双臂各 6 个关节的关节位置目标输出。
 
 ---
 
@@ -227,25 +227,31 @@ $$
 
 ### 5.2 随机化参数与噪声注入
 
-系统将随机化分为**回合级（Episode-level）静态参数**与**步级（Step-level）动态噪声**两类：
+当前默认训练路径将随机化分为**回合级（Episode-level）静态参数**与**步级（Step-level）噪声**两类，但需要区分“默认主线实际生效的噪声入口”和“为兼容保留的历史 API”。
 
 **(1) 回合级静态参数**（每次 episode reset 时从均匀分布 $\mathcal{U}$ 中采样，局内保持这套常数不变）：
 
 | 参数 | 符号 | 分布 | 说明 |
 |------|------|------|------|
 | 杯体质量 | $m_{\text{cup}}$ | $\mathcal{U}[m_{\min}, m_{\max}]$ | 模拟不同液体装载量对惯性的影响 |
-| 门板质量 | $m_{\text{door}}$ | $\mathcal{U}[m_{\min}^d, m_{\max}^d]$ | 影响推门所需力矩 |
+| 门板质量 | $m_{\text{door}}$ | $\mathcal{U}[m_{\min}^d, m_{\max}^d]$ | 影响推门所需控制强度与门体响应 |
 | 门铰链阻尼 | $d_{\text{hinge}}$ | $\mathcal{U}[d_{\min}, d_{\max}]$ | 控制门的运动阻力 |
 | 基座初始位置 | $p_{\text{base}}$ | $\mathcal{U}[p_0 - \Delta p, p_0 + \Delta p]$ | 机器人基座的平面偏移（局限在机械臂运动学可达的工作空间裕度内，防止过拟合绝对坐标） |
 
-**(2) 步级动态噪声**（每执行一次 `step()` 时从高斯分布 $\mathcal{N}$ 中独立采样，持续不断地模拟传感器与执行器的高频抖动）：
+**(2) 步级噪声**（每执行一次 `step()` 时生效，用于模拟传感器与执行层的高频抖动）：
 
 | 噪声 | 符号 | 分布 | 说明 |
 |------|------|------|------|
-| 动作噪声 | $\epsilon_a$ | $\mathcal{N}(0, \sigma_a^2 I)$ | 实时叠加在策略发出的关节控制指令上 |
-| 观测噪声 | $\epsilon_o$ | $\mathcal{N}(0, \sigma_o^2 I)$ | 实时叠加在物理环境算出的关节编码器真值上 |
+| 位置目标噪声 | $\epsilon_q$ | $\mathcal{N}(0, \sigma_q^2 I)$ | 默认路径中注入到 joint-limit clip 之后的位置目标，再次 clip 后送入 `set_joint_position_target()` |
+| 观测噪声 | $\epsilon_o$ | $\mathcal{N}(0, \sigma_o^2 I)$ | 实时叠加在 Actor 观测中的关节编码器真值上 |
 
 其中 $\mathcal{U}[a, b]$ 为均匀分布，$\mathcal{N}(\mu, \Sigma)$ 为高斯分布。
+
+默认路径下：
+
+- 位置目标噪声由 `configs/env/default.yaml -> control.position_target_noise_std` 控制
+- 观测噪声由 `DoorPushEnvCfg.obs_noise_std` 控制
+- `training/domain_randomizer.py` 中保留的 `action_noise_std` / `sample_action_noise*()` 只是历史兼容 API，不驱动当前默认训练主线
 
 ### 5.3 随机化与 privileged information 的关系
 
@@ -255,7 +261,7 @@ $$
 o_t^{\text{critic}} = o_t^{\text{actor}} \cup \{m_{\text{cup}},\, m_{\text{door}},\, d_{\text{hinge}}\}
 $$
 
-Actor 必须通过交互反馈（力矩响应、速度变化等）和 RNN 隐状态来隐式推断这些参数。
+Actor 必须通过交互反馈（位置闭环后的运动响应、速度变化、门体推进效果等）和 RNN 隐状态来隐式推断这些参数。
 
 ---
 

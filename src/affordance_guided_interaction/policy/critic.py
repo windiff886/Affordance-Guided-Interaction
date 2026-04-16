@@ -79,9 +79,11 @@ def flatten_privileged(privileged: dict) -> torch.Tensor:
 
 def flatten_privileged_tensor(
     critic_obs: torch.Tensor,
-    actor_obs_dim: int = 96,
+    actor_obs_dim: int | None = None,
 ) -> torch.Tensor:
     """从 flat critic obs tensor 直接切出 privileged 分支。"""
+    if actor_obs_dim is None:
+        return critic_obs[:, -_PRIVILEGED_DIM:]
     return critic_obs[:, actor_obs_dim:]
 
 
@@ -144,8 +146,7 @@ class Critic(nn.Module):
         # L10: 与 Actor 保持相同公式，使用 TOTAL_ARM_JOINTS 避免隐式关系
         proprio_in = (
             TOTAL_ARM_JOINTS * 2                                     # q + dq
-            + (TOTAL_ARM_JOINTS if ac.include_torques else 0)        # tau
-            + TOTAL_ARM_JOINTS                                       # prev_action
+            + TOTAL_ARM_JOINTS                                       # prev_joint_target
         )
         stab_in = _DUAL_STAB_DIM  # L11: 使用常量而非硬编码 2
 

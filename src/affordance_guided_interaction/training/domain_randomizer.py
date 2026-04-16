@@ -1,12 +1,25 @@
-"""域随机化器 — 回合级物理参数采样与步级动态噪声注入。
+"""域随机化器 — 回合级物理参数采样与历史噪声采样工具。
 
-实现 training/README.md §5.2 中定义的两类随机化机制：
+当前默认训练路径中，本模块**实际承担的主职责**是：
+
+1. 为 episode reset 采样 `cup_mass / door_mass / door_damping / base pose`
+2. 为课程初始化与 auto-reset 提供同一套 episode 级采样工具
+
+本模块仍保留 step-level `action_noise` / `observation_noise` 的采样 API，
+但这些接口现在主要是历史兼容面：
+
+- 默认训练主线的动作侧噪声入口已经改为
+  `DoorPushEnvCfg.position_target_noise_std`
+- `DirectRLEnvAdapter.set_randomizer()` 是 no-op
+- 因此这里的 `sample_action_noise*()` 不再驱动默认 joint-position 控制链路
+
+实现上仍保留两类随机化描述：
 
 1. **回合级静态参数**（Episode-level）：
    每次 episode reset 时从均匀分布 U[a, b] 中采样，局内保持不变。
    包含 cup_mass, door_mass, door_damping, base_pos。
 
-2. **步级动态噪声**（Step-level）：
+2. **步级噪声采样 API**（Step-level, legacy compatibility）：
    每执行一次 step() 时从高斯分布 N(0, σ²I) 中独立采样。
    包含 action_noise (ε_a) 和 observation_noise (ε_o)。
 
@@ -42,8 +55,10 @@ class RandomizationConfig:
     base_sector_half_angle_deg: float = 20.0
     base_yaw_delta_deg: float = 10.0
 
-    # ── 步级动态噪声标准差 ────────────────────────────────────────
-    action_noise_std: float = 0.02    # σ_a
+    # ── 历史兼容的步级噪声标准差 ──────────────────────────────────
+    # 注：默认 joint-position 训练主线不使用 action_noise_std；
+    # 动作侧噪声入口已迁移到 DoorPushEnvCfg.position_target_noise_std。
+    action_noise_std: float = 0.02    # legacy σ_a
     observation_noise_std: float = 0.01  # σ_o
 
 
@@ -141,11 +156,15 @@ class DomainRandomizer:
         ))
 
     # ═══════════════════════════════════════════════════════════════════
-    # 步级噪声注入（Step-level）
+    # 步级噪声采样工具（Step-level, legacy compatibility）
     # ═══════════════════════════════════════════════════════════════════
 
     def sample_action_noise(self, action_dim: int = 12) -> np.ndarray:
-        """每步 step() 时调用，生成动作噪声 ε_a ~ N(0, σ_a² I)。
+        """生成历史兼容的动作噪声 ε_a ~ N(0, σ_a² I)。
+
+        默认训练主线不再消费该噪声；当前位置控制链路使用
+        `DoorPushEnvCfg.position_target_noise_std` 在环境内部直接对 joint
+        position target 注入噪声。
 
         Parameters
         ----------
@@ -159,7 +178,10 @@ class DomainRandomizer:
         return self._rng.normal(0.0, self.cfg.action_noise_std, size=action_dim)
 
     def sample_observation_noise(self, obs_dim: int) -> np.ndarray:
-        """每步 step() 时调用，生成观测噪声 ε_o ~ N(0, σ_o² I)。
+        """生成观测噪声 ε_o ~ N(0, σ_o² I)。
+
+        该接口目前仍可用于历史路径或独立工具；默认训练主线中的 actor
+        proprio 噪声由环境内部 `obs_noise_std` 直接采样。
 
         Parameters
         ----------

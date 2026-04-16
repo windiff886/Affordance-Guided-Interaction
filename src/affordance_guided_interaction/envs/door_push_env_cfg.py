@@ -196,12 +196,13 @@ class DoorPushSceneCfg(InteractiveSceneCfg):
         ),
         actuators={
             # 肩关节 (joint2) 力矩上限 60 N·m，其余臂关节 30 N·m（来自 Z1 URDF）
+            # PD 位置控制：stiffness/damping 由 env cfg 的 arm_pd_stiffness/arm_pd_damping 注入
             "shoulder_joints": ImplicitActuatorCfg(
                 joint_names_expr=["left_joint2", "right_joint2"],
                 effort_limit=60.0,
                 velocity_limit=2.175,
-                stiffness=0.0,
-                damping=0.0,
+                stiffness=1000.0,
+                damping=100.0,
             ),
             "arm_joints": ImplicitActuatorCfg(
                 joint_names_expr=[
@@ -212,8 +213,8 @@ class DoorPushSceneCfg(InteractiveSceneCfg):
                 ],
                 effort_limit=30.0,
                 velocity_limit=2.175,
-                stiffness=0.0,
-                damping=0.0,
+                stiffness=1000.0,
+                damping=100.0,
             ),
             "gripper": ImplicitActuatorCfg(
                 joint_names_expr=["left_jointGripper", "right_jointGripper"],
@@ -328,21 +329,21 @@ class DoorPushEnvCfg(DirectRLEnvCfg):
     episode_length_s: float = 15.0  # 900 steps × (1/60 s)
     num_rerenders_on_reset: int = 3
 
-    # ── 动作空间：双臂 6+6 = 12 关节力矩 ──────────────────────────
+    # ── 动作空间：双臂 6+6 = 12 关节位置目标 (rad) ──────────────
     num_actions: int = 12
     action_space: int = 12
 
     # ── 观测空间 ────────────────────────────────────────────────────
-    # Actor obs: proprio(48) + ee(38) + context(2) + stability(2) +
-    #            door_geometry(6) = 96
-    num_observations: int = 96
-    observation_space: int = 96
+    # Actor obs: proprio(36) + ee(38) + context(2) + stability(2) +
+    #            door_geometry(6) = 84
+    num_observations: int = 84
+    observation_space: int = 84
 
-    # Critic obs (privileged): actor_obs(96) + door_pose(7) +
+    # Critic obs (privileged): actor_obs(84) + door_pose(7) +
     #     door_joint_pos(1) + door_joint_vel(1) + cup_mass(1) +
-    #     door_mass(1) + door_damping(1) + cup_dropped(1) = 109
-    num_states: int = 109
-    state_space: int = 109
+    #     door_mass(1) + door_damping(1) + cup_dropped(1) = 97
+    num_states: int = 97
+    state_space: int = 97
 
     # ── 任务判定阈值 ────────────────────────────────────────────────
     # 门角度到达 target → terminated(success)
@@ -355,10 +356,17 @@ class DoorPushEnvCfg(DirectRLEnvCfg):
     # ── 力矩限幅（来自 Z1 URDF，per-joint）───────────────────────
     # 顺序与 ARM_JOINT_NAMES 一致：left_joint1..6, right_joint1..6
     # joint2（肩关节）为 60 N·m，其余为 30 N·m
+    # 注：位置控制模式下，effort_limits 限制 PD 控制器输出的力矩上限
     effort_limits: tuple[float, ...] = (
         30.0, 60.0, 30.0, 30.0, 30.0, 30.0,   # left arm
         30.0, 60.0, 30.0, 30.0, 30.0, 30.0,   # right arm
     )
+
+    # ── 控制器参数 ────────────────────────────────────────────────
+    control_action_type: str = "joint_position"
+    arm_pd_stiffness: float = 1000.0
+    arm_pd_damping: float = 100.0
+    position_target_noise_std: float = 0.0
 
     # ── 域随机化范围（回合级静态参数）──────────────────────────────
     cup_mass_range: tuple[float, float] = (0.1, 0.8)
@@ -400,14 +408,11 @@ class DoorPushEnvCfg(DirectRLEnvCfg):
     rew_w_acc: float = 0.5
     rew_w_ang: float = 0.3
     rew_w_tilt: float = 0.3
-    rew_w_smooth: float = 0.1
-    rew_w_reg: float = 0.01
 
     # 安全惩罚 (§6)
-    rew_beta_limit: float = 1.0
     rew_mu: float = 0.9
     rew_beta_vel: float = 0.5
-    rew_beta_torque: float = 0.01
+    rew_beta_target: float = 1.0
     rew_w_drop: float = 100.0
 
     # ── 门几何观测 ────────────────────────────────────────────────────

@@ -133,14 +133,15 @@ env_steps_per_s = steps_this_iter / rollout_s
 
 `reward_terms/` 页面只放细分子项，用来排查到底是哪一项在主导 reward 变化。
 
-- `reward_terms/task/*`：`delta`、`open_bonus`
-- `reward_terms/stab_left/*` 与 `reward_terms/stab_right/*`：`zero_acc`、`zero_ang`、`acc`、`ang`、`tilt`、`smooth`、`reg`
-- `reward_terms/safe/*`：`joint_limit`、`joint_vel`、`torque_limit`、`cup_drop`
+- `reward_terms/task/*`：`delta`、`open_bonus`、`approach`、`approach_raw`
+- `reward_terms/stab_left/*` 与 `reward_terms/stab_right/*`：`zero_acc`、`zero_ang`、`acc`、`ang`、`tilt`
+- `reward_terms/safe/*`：`joint_vel`、`target_limit`、`cup_drop`
 
 **解释时要注意符号：**
 - `reward/task`、`reward/stab_left`、`reward/stab_right` 和对应的 `reward_terms/stab_*/*` / `reward_terms/task/*` 都按进入总奖励的有符号贡献记录。
 - `reward/safe` 与 `reward_terms/safe/*` 都按正惩罚量记录，最终总奖励通过减去它们得到。
 - 在 `stage_1`（无杯）中，`reward/stab_left`、`reward/stab_right` 以及 `reward_terms/stab_left/*`、`reward_terms/stab_right/*` 理论上都应接近 0；如果不为 0，优先检查 occupancy mask 或日志链路。
+- 当前默认路径已经删除 `smooth`、`reg`、`joint_limit`、`torque_limit` 这些旧标签；如果日志里仍出现它们，通常说明代码与文档版本不一致。
 
 ### `curriculum/` — 课程学习
 

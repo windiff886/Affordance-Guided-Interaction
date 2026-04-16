@@ -2,7 +2,7 @@
 
 负责将 ``DirectRLEnvAdapter`` 输出的嵌套字典观测拆解为分支张量，
 分别编码后拼接、经循环主干网络产生隐状态特征，最终交由动作头
-输出双臂 12 维关节力矩。
+输出双臂 12 维关节位置目标 (rad)。
 
 数据流概览::
 
@@ -17,7 +17,7 @@
               ↓
         ActionHead (Gaussian)
               ↓
-        τ ∈ R^12
+        q_target ∈ R^12 (rad)
 """
 
 from __future__ import annotations
@@ -82,9 +82,6 @@ class ActorConfig:
     action_dim: int = TOTAL_ARM_JOINTS
     log_std_init: float = -0.5
 
-    # 是否包含关节力矩输入
-    include_torques: bool = True
-
 
 # ======================================================================
 # 分支 MLP 工厂
@@ -119,7 +116,7 @@ def flatten_actor_obs(obs: dict, cfg: ActorConfig) -> dict[str, torch.Tensor]:
 
     返回的字典包含以下 key，各值均为 ``(feature_dim,)`` 的 1-D 张量：
 
-    - ``"proprio"`` — 双臂关节位姿 + 速度 + [力矩] + 上一步动作
+    - ``"proprio"`` — 双臂关节位姿 + 速度 + 上一步位置目标
     - ``"ee"``      — 左右臂末端状态拼接
     - ``"context"`` — left_occ + right_occ
     - ``"stability"`` — 左右臂 tilt 拼接
@@ -130,18 +127,16 @@ def flatten_actor_obs(obs: dict, cfg: ActorConfig) -> dict[str, torch.Tensor]:
     obs : dict
         ``DirectRLEnvAdapter`` 返回的 actor_obs 字典。
     cfg : ActorConfig
-        配置（决定是否包含 torque 等）。
+        配置。
     """
     proprio = obs["proprio"]
 
-    # -- proprio --
+    # -- proprio: q(12) + dq(12) + prev_joint_target(12) = 36 --
     parts = [
         _t(proprio["joint_positions"]),
         _t(proprio["joint_velocities"]),
+        _t(proprio["prev_joint_target"]),
     ]
-    if cfg.include_torques:
-        parts.append(_t(proprio.get("joint_torques", torch.zeros(TOTAL_ARM_JOINTS))))
-    parts.append(_t(proprio["prev_action"]))
     proprio_vec = torch.cat(parts)
 
     # -- ee --
@@ -209,11 +204,11 @@ def batch_flatten_actor_obs(
 def build_actor_branches_from_tensor(obs: torch.Tensor) -> dict[str, torch.Tensor]:
     """从 flat actor obs tensor 直接切出 batch 分支。"""
     return {
-        "proprio": obs[:, 0:48],
-        "ee": obs[:, 48:86],
-        "context": obs[:, 86:88],
-        "stability": obs[:, 88:90],
-        "door_geometry": obs[:, 90:96],
+        "proprio": obs[:, 0:36],
+        "ee": obs[:, 36:74],
+        "context": obs[:, 74:76],
+        "stability": obs[:, 76:78],
+        "door_geometry": obs[:, 78:84],
     }
 
 
@@ -238,8 +233,7 @@ class Actor(nn.Module):
         # -- 计算各分支输入维度 --
         proprio_in = (
             TOTAL_ARM_JOINTS * 2  # q + dq
-            + (TOTAL_ARM_JOINTS if c.include_torques else 0)  # tau
-            + TOTAL_ARM_JOINTS  # prev_action
+            + TOTAL_ARM_JOINTS  # prev_joint_target
         )
         stab_in = _DUAL_STAB_DIM
 

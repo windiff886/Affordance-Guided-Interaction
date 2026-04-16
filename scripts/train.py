@@ -119,7 +119,6 @@ def build_models(cfg: dict, device: torch.device):
         rnn_type=actor_section.get("rnn_type", "gru"),
         action_dim=actor_section.get("action_dim", 12),
         log_std_init=actor_section.get("log_std_init", -0.5),
-        include_torques=actor_section.get("include_torques", True),
     )
 
     critic_cfg = CriticConfig(
@@ -192,6 +191,18 @@ def build_env_cfg(
         env_cfg.decimation = int(env_cfg_yaml["decimation"])
         env_cfg.sim.render_interval = env_cfg.decimation
 
+    # 注入控制器参数
+    control_cfg = env_cfg_yaml.get("control", {})
+    if "action_type" in control_cfg:
+        env_cfg.control_action_type = str(control_cfg["action_type"])
+    if "arm_pd_stiffness" in control_cfg:
+        env_cfg.arm_pd_stiffness = float(control_cfg["arm_pd_stiffness"])
+    if "arm_pd_damping" in control_cfg:
+        env_cfg.arm_pd_damping = float(control_cfg["arm_pd_damping"])
+    if "position_target_noise_std" in control_cfg:
+        env_cfg.position_target_noise_std = float(control_cfg["position_target_noise_std"])
+    _apply_arm_control_to_actuators(env_cfg)
+
     # NOTE: tiled_camera 已从 DoorPushSceneCfg 默认配置中移除，
     # 不再需要 env_cfg.scene.tiled_camera = None 的守卫逻辑。
 
@@ -206,6 +217,41 @@ def build_env_cfg(
     _inject_reward_params(env_cfg, reward_cfg)
 
     return env_cfg
+
+
+def _apply_arm_control_to_actuators(env_cfg: Any) -> None:
+    """将环境级 arm 控制参数回写到 scene actuator 配置。
+
+    这样 `configs/env/default.yaml` 中的 PD 参数不是只停留在 DoorPushEnvCfg
+    字段上，而会真实驱动 shoulder / arm actuator 的 stiffness / damping /
+    effort_limit。
+    """
+    if getattr(env_cfg, "control_action_type", "joint_position") != "joint_position":
+        raise ValueError(
+            f"Unsupported control action type: {env_cfg.control_action_type}"
+        )
+
+    robot_actuators = env_cfg.scene.robot.actuators
+    shoulder = robot_actuators["shoulder_joints"]
+    arm = robot_actuators["arm_joints"]
+
+    shoulder.stiffness = float(env_cfg.arm_pd_stiffness)
+    shoulder.damping = float(env_cfg.arm_pd_damping)
+    arm.stiffness = float(env_cfg.arm_pd_stiffness)
+    arm.damping = float(env_cfg.arm_pd_damping)
+
+    effort_limits = tuple(getattr(env_cfg, "effort_limits", ()))
+    if len(effort_limits) >= 8:
+        shoulder_indices = (1, 7)
+        shoulder_limits = [effort_limits[i] for i in shoulder_indices]
+        arm_limits = [
+            limit for idx, limit in enumerate(effort_limits)
+            if idx not in shoulder_indices
+        ]
+        if shoulder_limits:
+            shoulder.effort_limit = float(max(shoulder_limits))
+        if arm_limits:
+            arm.effort_limit = float(max(arm_limits))
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -232,14 +278,11 @@ _REWARD_PARAM_MAP: dict[str, dict[str, str]] = {
         "w_acc": "rew_w_acc",
         "w_ang": "rew_w_ang",
         "w_tilt": "rew_w_tilt",
-        "w_smooth": "rew_w_smooth",
-        "w_reg": "rew_w_reg",
     },
     "safety": {
-        "beta_limit": "rew_beta_limit",
         "mu": "rew_mu",
         "beta_vel": "rew_beta_vel",
-        "beta_torque": "rew_beta_torque",
+        "beta_target": "rew_beta_target",
         "w_drop": "rew_w_drop",
     },
 }
@@ -303,8 +346,7 @@ def build_collector(
     proprio_dim = (
         12                                               # q (TOTAL_ARM_JOINTS)
         + 12                                             # dq
-        + (12 if actor_cfg.include_torques else 0)       # tau
-        + 12                                             # prev_action
+        + 12                                             # prev_joint_target
     )
 
     actor_branch_dims = {
@@ -556,8 +598,11 @@ def main() -> int:
     envs.set_episode_reset_fn(_episode_reset_fn)
 
     # ── 兼容旧接口（no-op）─────────────────────────────────────
-    # DoorPushEnv 内部已内置 action_noise_std 和 obs_noise_std，
-    # 不依赖外部 randomizer 注入步级噪声。保留调用以兼容接口。
+    # 当前默认路径下，step-level 噪声由 DoorPushEnv cfg 直接控制：
+    #   - 动作侧：position_target_noise_std
+    #   - 观测侧：obs_noise_std
+    # 外部 randomizer 只实际用于 episode 级 domain params 采样；
+    # set_randomizer() 仍保留为兼容接口，但在 DirectRLEnvAdapter 中是 no-op。
     envs.set_randomizer(randomizer)
 
     # ── 指标聚合器 ────────────────────────────────────────────

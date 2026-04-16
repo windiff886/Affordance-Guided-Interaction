@@ -1,371 +1,192 @@
 # envs — GPU 批量并行仿真环境
 
-## 1. 本层做什么
+本文档只描述当前默认实现，不再保留旧的 torque 直驱语义。
 
-envs 层是整个系统中**唯一直接与 Isaac Lab 物理引擎交互的层**。它以 Isaac Lab `DirectRLEnv` 为基类，在单个 GPU 上并行运行数千个环境实例，完成场景装配、动作执行、观测构建、奖励计算和终止判定的完整闭环。
+默认环境由 [door_push_env.py](./door_push_env.py) 和 [door_push_env_cfg.py](./door_push_env_cfg.py) 组成，训练侧通过 [direct_rl_env_adapter.py](./direct_rl_env_adapter.py) 读取它输出的 batched tensor。
 
-```
-              training/ (PPO 训练循环)
-                   │
-                   │  RolloutCollector
-                   │  消费 VecEnvProtocol 接口
-                   │
-                   ▼
-         ┌─────────────────────────────────────────────────┐
-         │  DirectRLEnvAdapter                              │
-         │  tensor → list[dict] 格式适配                    │
-         └─────────────────────┬───────────────────────────┘
-                               │
-                               ▼
-         ┌─────────────────────────────────────────────────┐
-         │  DoorPushEnv  (DirectRLEnv)          ◄── 核心   │
-         │                                                  │
-         │  _setup_scene()         场景资产注册              │
-         │  _reset_idx()           选择性重置 + 持杯初始化   │
-         │  _pre_physics_step()    力矩注入                  │
-         │  _get_observations()    Actor(96D)/Critic(109D)  │
-         │  _get_rewards()         含 approach shaping 的奖励 │
-         │  _get_dones()           终止判定                  │
-         └─────────────────────────────────────────────────┘
-         │                                                  │
-         │  DoorPushEnvCfg + DoorPushSceneCfg               │
-         │  @configclass 声明式配置                          │
-         │                                                  │
-         │  batch_math.py                                   │
-         │  GPU tensor 四元数 / 坐标变换工具                 │
-         │                                                  │
-         │  Reward.md                                       │
-         │  含 approach shaping 的奖励数学参考文档            │
-         └──────────────────────────────────────────────────┘
-```
+## 1. 层职责
 
----
+`envs/` 是项目中唯一直接与 Isaac Lab 物理引擎交互的层，负责：
 
-## 2. 文件清单
+- 场景装配与 reset
+- joint-position 动作执行
+- actor / critic 观测构建
+- reward 计算
+- episode 终止判定
 
-| 文件 | 职责 |
-|---|---|
-| `door_push_env.py` | **DoorPushEnv** — `DirectRLEnv` 子类，自包含全部环境逻辑 |
-| `door_push_env_cfg.py` | **DoorPushEnvCfg** + **DoorPushSceneCfg** — 声明式 `@configclass` 配置 |
-| `direct_rl_env_adapter.py` | **DirectRLEnvAdapter** — 将 tensor 接口包装为 `VecEnvProtocol`，桥接 RolloutCollector |
-| `batch_math.py` | GPU 批量四元数运算、坐标系变换、基座位姿采样 |
-| `Reward.md` | 含 approach shaping 的奖励数学定义与超参参考 |
-| `__init__.py` | 对外导出 `DoorPushEnv`、`DoorPushEnvCfg`、`DoorPushSceneCfg`、`DirectRLEnvAdapter` |
+默认路径中，观测与奖励都直接在 `DoorPushEnv` 内部完成，不再存在旧版“环境层输出原始状态，再由独立 observations/rewards 模块二次加工”的执行链。
 
----
+## 2. 当前动作语义
 
-## 3. 架构总览
+策略输出为 12 维双臂关节位置目标：
 
-### 3.1 场景声明：DoorPushSceneCfg
+`a_t = q_target_raw ∈ R^12`
 
-使用 Isaac Lab 的 `@configclass` + `InteractiveSceneCfg` 以声明式方式定义完整场景：
+- 单位：`rad`
+- 语义：双臂 12 个臂关节的绝对目标角
+- gripper 不由策略控制，gripper 保持目标由环境内部持续刷新
 
-| 资产 | 类型 | prim_path | 说明 |
-|---|---|---|---|
-| 双臂固定底座机器人 | `ArticulationCfg` | `{ENV_REGEX_NS}/Robot` | Unitree Z1 双臂（轻量化，固定底座，无轮子/云台，自碰撞启用），力矩直驱 |
-| 推门 | `ArticulationCfg` | `{ENV_REGEX_NS}/Door` | 单铰链门，无主动力矩，阻尼可随机化 |
-| 左杯体 | `RigidObjectCfg` | `{ENV_REGEX_NS}/CupLeft` | 预生成在远处，reset 时按 occupancy teleport |
-| 右杯体 | `RigidObjectCfg` | `{ENV_REGEX_NS}/CupRight` | 同上 |
-| 地面 + 照明 | `AssetBaseCfg` | 全局 | `GroundPlaneCfg` + `DomeLightCfg` |
+`_pre_physics_step()` 的执行链路是：
 
-`{ENV_REGEX_NS}` 是 Isaac Lab Cloner 的占位符，Cloner 会将整棵场景子树自动复制到 `/World/envs/env_0`、`env_1`、……，实现 GPU 批量并行。
+`raw joint target -> joint-limit clip -> optional position-target noise -> re-clip -> set_joint_position_target() -> actuator PD -> effort_limit clip`
 
-> **场景说明：** 当前场景使用轻量化机器人（固定 root，无轮式底盘或云台关节），机器人自碰撞保持启用；`room` 配置字段仍保留，但默认值为 `None`，因此场景默认不实例化房间。机器人 base pose 在每个 episode 重置时通过扇形环采样（sector sampling）随机化。
+具体语义：
 
-### 3.2 环境主体：DoorPushEnv
+1. `DoorPushEnv` 先缓存 policy 的原始输出 `self._cached_raw_joint_target`
+2. 按 `robot.data.soft_joint_pos_limits` 对目标角做仿真层限位
+3. 若 `position_target_noise_std > 0`，对裁剪后的目标角注入噪声，并再次限位
+4. 将结果写入 `robot.set_joint_position_target()`
+5. 机器人 actuator 的隐式 PD 控制器生成实际执行力矩
+6. PD 输出力矩再受 actuator `effort_limit` 硬截断
 
-`DoorPushEnv` 继承 `DirectRLEnv`，是**完全自包含**的环境实现——观测构建、奖励计算、终止判定全部在此完成，不依赖外部 observations/ 或 rewards/ 模块。
+当前默认 arm actuator 配置：
 
-核心生命周期：
+- `joint2`（肩关节）组：`effort_limit = 60 N·m`
+- 其他 arm joints：`effort_limit = 30 N·m`
+- 默认 PD：`stiffness = 1000.0`，`damping = 100.0`
 
-```
-_setup_scene()        ──▶  场景实体由配置声明并由 Cloner 自动复制
+其中 `arm_pd_stiffness`、`arm_pd_damping` 与 `position_target_noise_std` 由 `configs/env/default.yaml -> control` 注入，再由 `scripts/train.py` 回写到 `scene.robot.actuators`。
 
-_reset_idx(env_ids)   ──▶  采样域随机化参数
-                            写入 base pose + 关节默认值
-                            重置门角度
-                            teleport 杯体（持杯 env 执行批量抓取初始化）
-                            应用物理参数（质量 / 阻尼）
-                            清零 per-env 状态
+## 3. 观测空间
 
-_pre_physics_step()   ──▶  缓存 raw action（用于 §6.3 力矩超限惩罚）
-                            clamp + 注入步级噪声
-                            写入 arm 关节 effort target
+### 3.1 Actor 观测
 
-_get_observations()   ──▶  读取关节状态 + body 状态
-                            世界系 → base_link 系变换
-                            数值微分算加速度
-                            计算 tilt proxy
-                            拼接 Actor obs (96D) / Critic obs (109D)
-                            缓存加速度/tilt_xy 供奖励使用
-
-_get_rewards()        ──▶  §4 任务奖励（角度增量 + 一次性成功 bonus + approach）
-                            §5 稳定性奖励（7 子项 × 双臂，mask 条件化）
-                            §6 安全惩罚（4 子项，始终激活）
-
-_get_dones()          ──▶  杯体脱落 → terminated
-                            门角度达标 → terminated
-                            步数超限 → truncated
-```
-
-### 3.3 训练管线适配：DirectRLEnvAdapter
-
-`DirectRLEnvAdapter` 将 DoorPushEnv 的 GPU batch tensor 接口包装为 RolloutCollector 期望的 `VecEnvProtocol` 格式：
-
-| DoorPushEnv 接口 | DirectRLEnvAdapter 转换 | RolloutCollector 期望 |
-|---|---|---|
-| `reset()` → `{"policy": (N, 96), "critic": (N, 109)}` | 解包为 per-env dict list | `(list[dict], list[dict])` |
-| `step(Tensor)` → `(obs_dict, reward, term, trunc, info)` | tensor→numpy + info list | `(list[dict], list[dict], ndarray, ndarray, list[dict])` |
-
-适配器同时提供 `set_curriculum()`、`set_episode_reset_fn()` 等兼容旧训练接口的方法。长期目标是训练侧原生支持 tensor dict，届时可移除。
-
----
-
-## 4. 观测空间
-
-### 4.1 Actor 观测 (96D)
-
-Actor 观测包含噪声（`obs_noise_std`），不含 privileged 信息：
+Actor 观测维度为 `84`：
 
 | 分段 | 内容 | 维度 |
 |---|---|---|
-| proprio | 关节位置 q(12) + 速度 dq(12) + 力矩 tau(12) + 上一步动作(12) | 48 |
-| left_ee | 位置(3) + 朝向 quat(4) + 线速度(3) + 角速度(3) + 线加速度(3) + 角加速度(3) | 19 |
-| right_ee | 同上 | 19 |
-| context | left_occupied(1) + right_occupied(1) | 2 |
-| stability | left_tilt(1) + right_tilt(1) | 2 |
-| door_geometry | door_center_in_base(3) + door_normal_in_base(3) | 6 |
-| **总计** | | **96** |
+| `proprio` | `joint_positions(12) + joint_velocities(12) + prev_joint_target(12)` | 36 |
+| `ee` | 左右末端 `position(3) + orientation(4) + linear_velocity(3) + angular_velocity(3) + linear_acceleration(3) + angular_acceleration(3)` | 38 |
+| `context` | `left_occupied + right_occupied` | 2 |
+| `stability` | `left_tilt + right_tilt` | 2 |
+| `door_geometry` | `door_center_in_base(3) + door_normal_in_base(3)` | 6 |
 
-所有 EE 状态均在 **base_link 相对坐标系**下表达。加速度通过数值微分（帧间速度差 / $\Delta t_{\text{control}}$）计算。tilt 为重力向量在 EE 局部系中的 $xy$ 投影范数。door_geometry 由门叶 body pose 结合固定 local offset 直接计算，不依赖相机或感知模块。
+总计：`36 + 38 + 2 + 2 + 6 = 84`
 
-### 4.2 Critic 观测 (109D)
+当前 actor 观测不再包含：
 
-Critic 观测 = Actor 观测（无噪声版） + privileged 信息：
+- `joint_torques`
+- `prev_action`
 
-| 分段 | 内容 | 维度 |
-|---|---|---|
-| actor 部分 | 与 Actor 相同的 proprio + ee + context + stability + door_geometry，但**无噪声** | 96 |
-| privileged | 门位姿(7) + 门铰链角度(1) + 门铰链速度(1) + 杯质量(1) + 门质量(1) + 门阻尼(1) + 杯掉落标志(1) | 13 |
-| **总计** | | **109** |
+其中 `prev_joint_target` 指的是“上一控制步送入仿真的裁剪后位置目标”，不是 raw policy 输出。
 
-门位姿在 base_link 坐标系下。域随机化参数（质量、阻尼）作为 privileged info 仅供 critic 消费，actor 对此完全不可知。privileged 中不再包含 base_pos(3)——该信息已通过 base_link 相对坐标系隐式可用。
+### 3.2 Critic 观测
 
----
+Critic 观测维度为 `97`：
 
-## 5. 动作空间
+`critic_obs = actor_obs_clean(84) + privileged(13)`
 
-策略输出 $\mathbf{a}_t \in \mathbb{R}^{12}$ — 双臂各 6 关节的**绝对力矩**（$\text{N}\cdot\text{m}$）。
+`privileged` 包含：
 
-执行流程：
+- `door_pose(7)`
+- `door_joint_pos(1)`
+- `door_joint_vel(1)`
+- `cup_mass(1)`
+- `door_mass(1)`
+- `door_damping(1)`
+- `cup_dropped(1)`
 
-1. 缓存 raw action（用于 §6.3 力矩超限惩罚）
-2. 硬裁剪至 $[-\tau_{\text{limit}}, \tau_{\text{limit}}]$（默认 33.5 N·m，来自 URDF effort_limit）
-3. 注入步级高斯噪声 $\sigma_a$（训练时）
-4. 写入 arm 关节 effort target（gripper 不受策略控制）
+### 3.3 噪声注入
 
-系统不做重力补偿——抵抗刚体重力和摩擦扰动的工作完全由策略网络隐式学习。
+默认路径下，actor 观测噪声只注入：
 
----
+- `joint_positions`
+- `joint_velocities`
 
-## 6. 奖励函数概要
+也就是 `proprio` 前 24 维。`prev_joint_target`、`ee`、`context`、`stability`、`door_geometry` 都不注入这一路噪声。critic 使用无噪声真值。
 
-DoorPushEnv 内置完整的奖励计算（详见 `Reward.md`）。总体公式：
+## 4. 奖励结构
 
-$$
-r_t = r_{\text{task}} + m_L \cdot r_{\text{stab}}^L + m_R \cdot r_{\text{stab}}^R - r_{\text{safe}}
-$$
+当前总奖励为：
 
-### §4 任务奖励（3 项）
+`r_total = r_task + r_stab_left + r_stab_right - r_safe`
 
-| 子项 | 公式概要 |
+### 4.1 任务奖励
+
+任务奖励由 3 项组成：
+
+- `task/delta`
+- `task/open_bonus`
+- `task/approach`
+
+其中 `task/approach_raw` 只作为日志中间量记录。
+
+### 4.2 稳定性奖励
+
+每侧稳定性奖励由 5 项组成，并受 occupancy mask 控制：
+
+- `stab_{side}/zero_acc`
+- `stab_{side}/zero_ang`
+- `stab_{side}/acc`
+- `stab_{side}/ang`
+- `stab_{side}/tilt`
+
+已经删除旧版 torque 语义下的：
+
+- `smooth`
+- `reg`
+
+### 4.3 安全惩罚
+
+当前安全项只有 3 项：
+
+- `safe/joint_vel`
+- `safe/target_limit`
+- `safe/cup_drop`
+
+重要语义：
+
+- `safe/target_limit` 基于 **policy 原始输出的目标角** 计算
+- 仿真层仍会先对目标角做 joint-limit clip，再交给 PD 执行
+- PD 输出力矩的 effort clipping 只发生在执行层，不进入 reward
+
+已经删除旧版安全项：
+
+- `safe/joint_limit`
+- `safe/torque_limit`
+
+奖励的完整数学形式见 [Reward.md](./Reward.md)。
+
+## 5. Reset 与域随机化
+
+`_reset_idx(env_ids)` 负责选择性 reset，并在其中完成：
+
+1. 采样 `cup_mass`、`door_mass`、`door_damping`
+2. 采样门外扇形环上的机器人 base pose
+3. 重置机器人与门的状态
+4. 根据 occupancy 对左右杯体执行 teleport / 抓取初始化
+5. 将随机化参数写回 PhysX
+6. 清零缓存：`_prev_joint_target`、`_prev_door_angle`、加速度缓存、成功标记等
+
+默认 episode 级随机化范围：
+
+- `cup_mass_range = (0.1, 0.8)`
+- `door_mass_range = (5.0, 20.0)`
+- `door_damping_range = (0.5, 5.0)`
+- `base_radius_range = (0.45, 0.60)`
+- `base_sector_half_angle_deg = 20.0`
+- `base_yaw_delta_deg = 10.0`
+
+## 6. 关键文件
+
+| 文件 | 作用 |
 |---|---|
-| 角度增量奖励 | $w(\theta_t) \cdot (\theta_t - \theta_{t-1})$，达标前满额激励，超标后线性衰减至下限 $\alpha$ |
-| 一次性成功 bonus | $\theta_t \geq \theta_{\text{success}}$ 时触发 $w_{\text{open}}$，仅触发一次 |
-| 接近门板大表面 | $\theta_t < \theta_{\text{stop}}$ 时激活 $w_{\text{approach}} \cdot \max(1-a_t^2/(b^2+\varepsilon), 0)$ |
+| [door_push_env.py](./door_push_env.py) | 环境主体，执行动作、构建观测、计算奖励与 done |
+| [door_push_env_cfg.py](./door_push_env_cfg.py) | 场景、动作空间、观测维度与默认参数 |
+| [direct_rl_env_adapter.py](./direct_rl_env_adapter.py) | 将 batched tensor 观测解包为训练侧使用的嵌套字典 |
+| [batch_math.py](./batch_math.py) | base 系坐标变换、四元数运算、基座采样 |
+| [Reward.md](./Reward.md) | 当前 reward 的数学定义 |
 
-### §5 稳定性奖励（7 子项 × 双臂）
+## 7. 当前默认参数入口
 
-按持杯 mask $m_L, m_R$ 条件化激活，不持杯侧归零：
+运行时最常调的参数入口是：
 
-| 子项 | 类型 | 作用 |
-|---|---|---|
-| 零线加速度奖励 | Gaussian bonus | 鼓励 EE 线加速度趋近 0 |
-| 零角加速度奖励 | Gaussian bonus | 鼓励 EE 角加速度趋近 0 |
-| 线加速度惩罚 | 二次 penalty | 抑制高加速冲击 |
-| 角加速度惩罚 | 二次 penalty | 抑制角加速度 |
-| 重力倾斜惩罚 | 二次 penalty | 保持杯口朝上 |
-| 力矩平滑项 | 二次 penalty | 抑制力矩抖动 |
-| 力矩正则项 | 二次 penalty | 约束力矩幅值 |
+- `configs/env/default.yaml`
+- `configs/task/default.yaml`
+- `configs/reward/default.yaml`
 
-### §6 安全惩罚（4 项，始终激活）
+其中：
 
-| 子项 | 触发条件 |
-|---|---|
-| 关节限位逼近 | $\|q_i - q_i^c\| > \mu \cdot \delta_i$ → 二次惩罚 |
-| 关节速度过大 | $\|\dot{q}_i\| > \mu \cdot \dot{q}_i^{\max}$ → 二次惩罚 |
-| 力矩超限 | raw action 超出 effort_limit → 二次惩罚 |
-| 杯体脱落 | cup-EE 距离 > $\epsilon_{\text{drop}}$ → 固定惩罚 $w_{\text{drop}}$ + episode 终止 |
-
----
-
-## 7. 终止条件
-
-| 条件 | 信号类型 | 触发逻辑 |
-|---|---|---|
-| 门角度达标 | `terminated` | $\theta_d \geq \theta_{\text{target}}$（默认 1.57 rad） |
-| 杯体脱落 | `terminated` | 持杯侧 cup-EE 距离 > `cup_drop_threshold`（默认 0.15 m） |
-| 步数超限 | `truncated` | `step_count >= max_episode_length` |
-
-注意 episode 成功终止阈值（1.57 rad）与奖励 success bonus 阈值（1.2 rad）是**不同的**：前者终止 episode，后者仅触发一次性 bonus。
-
----
-
-## 8. 选择性重置与持杯初始化
-
-`_reset_idx(env_ids)` 仅重置指定的环境子集（Isaac Lab auto-reset 框架），流程：
-
-1. **采样域随机化参数** — 杯质量、门质量、门阻尼、基座位姿（扇形环采样）
-2. **写入机器人 root state** — base_pos + base_yaw → 世界坐标
-3. **重置门关节** — 铰链角度归零
-4. **杯体 teleport** — 不持杯的杯体放到 $(100, 0, 0)$ 远处
-5. **批量持杯初始化** — 对需要持杯的 env：将臂关节直接设到预设抓取姿态，gripper 闭合，杯体 teleport 到夹爪位置（纯状态写入，不调 `sim.step()`，避免破坏其他 env）
-6. **应用物理参数** — 门板质量、铰链阻尼、杯体质量写入 PhysX
-7. **清零 per-env 状态** — step_count、prev_action、速度缓存等
-
----
-
-## 9. 门体几何观测
-
-DoorPushEnv **不包含任何相机或感知代码**。门体几何信息直接从仿真 ground truth 计算：
-
-```python
-# 在 _get_observations() 中直接计算，无需外部注入
-door_center_in_base  # (N, 3)  门叶中心在 base_link 系下的位置
-door_normal_in_base  # (N, 3)  门叶法向量在 base_link 系下的方向
-```
-
-计算方式：从门叶 body 的仿真 pose（position + orientation）出发，施加固定的 local offset 得到门叶中心位置，旋转 local normal 得到世界系法向量，再变换到 base_link 坐标系。整个过程为纯几何运算，无任何神经网络或感知模块参与。
-
-此前的视觉感知路径（Point-MAE 768D embedding 通过 `update_visual_embedding()` 外部注入）已从默认训练管线中移除。
-
----
-
-## 10. 域随机化
-
-每次 `_reset_idx()` 时自动采样的回合级物理参数：
-
-| 参数 | 范围 | 落地方式 |
-|---|---|---|
-| `cup_mass` | [0.1, 0.8] kg | 修改杯体 RigidObject 质量 |
-| `door_mass` | [5.0, 20.0] kg | 修改 DoorLeaf body 质量 |
-| `door_damping` | [0.5, 5.0] | 修改门铰链阻尼系数 |
-| `base_pos` | 门外扇形环 | 机器人 root pose 位置 |
-| `base_yaw` | 标称朝向 ± 10° | 机器人 root pose 朝向 |
-
-这些参数在 Critic 观测中作为 privileged information 暴露，Actor 不可见。外部课程管理器也可通过 `set_domain_params_batch()` 覆写。
-
----
-
-## 11. 坐标变换工具：batch_math.py
-
-提供 `(N, ...)` 批量 GPU tensor 操作，四元数约定为 `(w, x, y, z)`（与 Isaac Lab 一致）：
-
-| 函数 | 作用 |
-|---|---|
-| `batch_quat_conjugate` / `multiply` / `normalize` | 四元数基础运算 |
-| `batch_quat_to_rotation_matrix` | 四元数 → 3×3 旋转矩阵 |
-| `batch_quat_from_yaw` / `batch_yaw_from_quat` | yaw 角 ↔ 四元数互转 |
-| `batch_vector_world_to_base` | 世界系向量 → base_link 系 |
-| `batch_orientation_world_to_base` | 世界系四元数 → base_link 相对四元数 |
-| `batch_pose_world_to_base` | 世界系 pose → base_link 系 (pos3 + quat4 = 7D) |
-| `sample_base_poses` | 门外扇形环中批量采样基座位姿 |
-| `batch_rotate_relative_by_yaw` | base_link 局部偏移按 yaw 旋转到世界系 |
-
----
-
-## 12. 环境参数一览
-
-### 12.1 仿真参数
-
-| 参数 | 含义 | 默认值 |
-|---|---|---|
-| `physics_dt` | 物理仿真步长 | 1/120 s |
-| `decimation` | 策略控制间隔（物理步数） | 2（策略频率 60 Hz） |
-| `episode_length_s` | 单 episode 时长上限 | 15.0 s（900 控制步） |
-| `num_envs` | 并行环境数 | 64（可调至数千） |
-| `env_spacing` | 环境间距 | 4.0 m |
-
-### 12.2 任务判定参数
-
-| 参数 | 含义 | 默认值 |
-|---|---|---|
-| `door_angle_target` | episode 成功终止角度 | 1.57 rad（≈ 90°） |
-| `success_angle_threshold` | 奖励 success bonus 触发角度 | 1.2 rad |
-| `cup_drop_threshold` | 杯体脱落距离阈值 | 0.15 m |
-
-### 12.3 动作与噪声参数
-
-| 参数 | 含义 | 默认值 |
-|---|---|---|
-| `effort_limit` | 关节力矩硬截断 | 33.5 N·m |
-| `action_noise_std` | 步级动作噪声 $\sigma_a$ | 0.02 |
-| `obs_noise_std` | 观测噪声 $\sigma_o$（仅注入 Actor q/dq） | 0.01 |
-
-### 12.4 奖励超参
-
-所有奖励权重定义在 `DoorPushEnvCfg` 中，分为三组：
-
-- **任务奖励 (§4)**：`rew_w_delta`, `rew_alpha`, `rew_k_decay`, `rew_w_open`, `rew_w_approach`, `rew_approach_eps`, `rew_approach_stop_angle`
-- **稳定性奖励 (§5)**：`rew_w_zero_acc`, `rew_lambda_acc`, `rew_w_zero_ang`, `rew_lambda_ang`, `rew_w_acc`, `rew_w_ang`, `rew_w_tilt`, `rew_w_smooth`, `rew_w_reg`
-- **安全惩罚 (§6)**：`rew_beta_limit`, `rew_mu`, `rew_beta_vel`, `rew_beta_torque`, `rew_w_drop`
-
-具体数值和数学定义见 `Reward.md`。
-
----
-
-## 13. 外部注入接口
-
-DoorPushEnv 提供两个供外部模块调用的注入接口：
-
-| 方法 | 调用者 | 作用 |
-|---|---|---|
-| `set_occupancy(left, right)` | 课程管理器 | 设置所有 env 的左/右臂持杯 occupancy |
-| `set_domain_params_batch(params_list)` | 课程管理器 / 训练循环 | 覆写域随机化参数 |
-
----
-
-## 14. 关键设计决策
-
-### 为什么奖励计算内置在 DoorPushEnv 中？
-
-Isaac Lab `DirectRLEnv` 要求 `_get_rewards()` 作为子类方法实现。将完整奖励逻辑内置在环境中可以：
-
-- 直接访问仿真 ground truth tensor，无需序列化/反序列化
-- 奖励计算与观测构建共享缓存（如加速度、tilt_xy），避免重复计算
-- 所有 per-env 状态（如 `_already_succeeded`、`_prev_door_angle`）天然可用
-
-### 为什么 DoorPushEnv 自包含而不是拆分为多个模块？
-
-旧架构将环境、观测、奖励拆分到不同模块，导致数据传递复杂且容易出现语义分裂（如"加速度"在不同模块的定义不一致）。GPU 路径将所有逻辑收敛到 `DirectRLEnv` 子类中：
-
-- 加速度只有一种计算方式（数值微分 + 缓存）
-- tilt 的几何定义全局唯一
-- 稳定性 proxy 在观测和奖励间通过 `_cached_*` 字段天然共享
-
-### 为什么持杯初始化用 teleport 而不是物理步进？
-
-`_batch_cup_grasp_init()` 直接将关节设到最终抓取姿态，并将杯体 teleport 到夹爪位置。这避免了调用 `sim.step()` 推进**所有**环境——在选择性重置场景中，只有部分 env 需要重置，物理步进会破坏非目标 env 的状态。
-
-### 为什么需要 DirectRLEnvAdapter？
-
-现有训练管线（RolloutCollector + PPO）期望 `list[dict]` 格式的观测，而 DoorPushEnv 输出的是 batch tensor。适配器是一个过渡层，将 tensor 解包为 per-env dict，使训练侧无需大规模重构即可消费 GPU 并行环境。
-
-### 为什么用 door_geometry 替代视觉 embedding？
-
-门体几何信息（center + normal，共 6 维）直接从仿真 ground truth 的门叶 body pose 计算，替代了此前通过外部 Point-MAE 注入的 768 维视觉 embedding。原因是：
-
-- 6 维几何参数已充分编码门的位置和朝向，策略网络无需从高维 embedding 中自行提取这些信息
-- 消除了对相机渲染、点云采集、Point-MAE 推理的依赖，训练管线更简洁
-- 纯几何计算在 GPU 上与观测构建同步完成，无异步开销
-- 未来如需恢复感知路径，可将 door_geometry 替换为感知模块输出的估计值
+- `configs/env/default.yaml` 负责 `physics_dt`、`decimation`、`control.action_type`、`control.arm_pd_stiffness`、`control.arm_pd_damping`、`control.position_target_noise_std`
+- `configs/task/default.yaml` 负责 `door_angle_target`、`cup_drop_threshold`
+- `configs/reward/default.yaml` 负责 task / stability / safety 的有效 reward 权重
