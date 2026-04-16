@@ -139,8 +139,8 @@
       </geometry>
     </visual>
     <collision>
-      <origin rpy="0 0 0" xyz="0 0 0.0255"/>
-      <geometry><cylinder length="0.051" radius="0.0325"/></geometry>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry><mesh filename="package://z1_description/meshes/collision/z1_Link00.STL" scale="1 1 1"/></geometry>
     </collision>
     <inertial>
       <origin rpy="0 0 0" xyz="-0.00334984 -0.00013615 0.02495843"/>
@@ -189,8 +189,8 @@
       </geometry>
     </visual>
     <collision>
-      <origin rpy="1.5707963267948966 0 0" xyz="0 0 0"/>
-      <geometry><cylinder length="0.102" radius="0.0325"/></geometry>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry><mesh filename="package://z1_description/meshes/collision/z1_Link02.STL" scale="1 1 1"/></geometry>
     </collision>
     <inertial>
       <origin rpy="0 0 0" xyz="-0.11012601 0.00240029 0.00158266"/>
@@ -214,8 +214,8 @@
       </geometry>
     </visual>
     <collision>
-      <origin rpy="0 1.5707963267948966 0" xyz="0.128 0 0.055"/>
-      <geometry><cylinder length="0.116" radius="0.02"/></geometry>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry><mesh filename="package://z1_description/meshes/collision/z1_Link03.STL" scale="1 1 1"/></geometry>
     </collision>
     <inertial>
       <origin rpy="0 0 0" xyz="0.10609208 -0.00541815 0.03476383"/>
@@ -239,8 +239,8 @@
       </geometry>
     </visual>
     <collision>
-      <origin rpy="0 0 0" xyz="0.072 0 0"/>
-      <geometry><cylinder length="0.067" radius="0.0325"/></geometry>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry><mesh filename="package://z1_description/meshes/collision/z1_Link04.STL" scale="1 1 1"/></geometry>
     </collision>
     <inertial>
       <origin rpy="0 0 0" xyz="0.04366681 0.00364738 -0.00170192"/>
@@ -289,8 +289,8 @@
       </geometry>
     </visual>
     <collision>
-      <origin rpy="0 1.5707963267948966 0" xyz="0.0255 0 0"/>
-      <geometry><cylinder length="0.051" radius="0.0325"/></geometry>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry><mesh filename="package://z1_description/meshes/collision/z1_Link06.STL" scale="1 1 1"/></geometry>
     </collision>
     <inertial>
       <origin rpy="0 0 0" xyz="0.0241569 -0.00017355 -0.00143876"/>
@@ -360,8 +360,8 @@
       </geometry>
     </visual>
     <collision>
-      <origin rpy="0 0 0" xyz="0 0 0.0255"/>
-      <geometry><cylinder length="0.051" radius="0.0325"/></geometry>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry><mesh filename="package://z1_description/meshes/collision/z1_Link00.STL" scale="1 1 1"/></geometry>
     </collision>
     <inertial>
       <origin rpy="0 0 0" xyz="-0.00334984 -0.00013615 0.02495843"/>
@@ -410,8 +410,8 @@
       </geometry>
     </visual>
     <collision>
-      <origin rpy="1.5707963267948966 0 0" xyz="0 0 0"/>
-      <geometry><cylinder length="0.102" radius="0.0325"/></geometry>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry><mesh filename="package://z1_description/meshes/collision/z1_Link02.STL" scale="1 1 1"/></geometry>
     </collision>
     <inertial>
       <origin rpy="0 0 0" xyz="-0.11012601 0.00240029 0.00158266"/>
@@ -435,8 +435,8 @@
       </geometry>
     </visual>
     <collision>
-      <origin rpy="0 1.5707963267948966 0" xyz="0.128 0 0.055"/>
-      <geometry><cylinder length="0.116" radius="0.02"/></geometry>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry><mesh filename="package://z1_description/meshes/collision/z1_Link03.STL" scale="1 1 1"/></geometry>
     </collision>
     <inertial>
       <origin rpy="0 0 0" xyz="0.10609208 -0.00541815 0.03476383"/>
@@ -460,8 +460,8 @@
       </geometry>
     </visual>
     <collision>
-      <origin rpy="0 0 0" xyz="0.072 0 0"/>
-      <geometry><cylinder length="0.067" radius="0.0325"/></geometry>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry><mesh filename="package://z1_description/meshes/collision/z1_Link04.STL" scale="1 1 1"/></geometry>
     </collision>
     <inertial>
       <origin rpy="0 0 0" xyz="0.04366681 0.00364738 -0.00170192"/>
@@ -510,8 +510,8 @@
       </geometry>
     </visual>
     <collision>
-      <origin rpy="0 1.5707963267948966 0" xyz="0.0255 0 0"/>
-      <geometry><cylinder length="0.051" radius="0.0325"/></geometry>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry><mesh filename="package://z1_description/meshes/collision/z1_Link06.STL" scale="1 1 1"/></geometry>
     </collision>
     <inertial>
       <origin rpy="0 0 0" xyz="0.0241569 -0.00017355 -0.00143876"/>

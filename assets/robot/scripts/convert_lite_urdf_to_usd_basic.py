@@ -147,14 +147,15 @@ def configure_joint_drives(stage, robot_prim_path: str) -> int:
 
 
 def enable_self_collision(stage, robot_prim_path: str) -> None:
-    """在 articulation root 上启用自碰撞检测。"""
-    from pxr import PhysxSchema, Sdf
+    """在 articulation root 及所有子 prim 上启用自碰撞检测。"""
+    from pxr import PhysxSchema, Sdf, Usd
 
     robot_prim = stage.GetPrimAtPath(robot_prim_path)
     if not robot_prim or not robot_prim.IsValid():
         return
     if not robot_prim.HasAPI(PhysxSchema.PhysxArticulationAPI):
         PhysxSchema.PhysxArticulationAPI.Apply(robot_prim)
+    # 设置根节点
     attr = robot_prim.GetAttribute("physxArticulation:enabledSelfCollisions")
     if not attr.IsValid():
         attr = robot_prim.CreateAttribute(
@@ -163,6 +164,11 @@ def enable_self_collision(stage, robot_prim_path: str) -> None:
             True,
         )
     attr.Set(True)
+    # 覆盖所有子 prim 的 False 值
+    for prim in Usd.PrimRange(robot_prim):
+        child_attr = prim.GetAttribute("physxArticulation:enabledSelfCollisions")
+        if child_attr.IsValid() and child_attr.Get() == False:
+            child_attr.Set(True)
 
 
 def run_conversion(args: argparse.Namespace) -> int:

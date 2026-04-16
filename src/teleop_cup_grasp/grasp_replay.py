@@ -72,7 +72,7 @@ RIGHT_ARM_INIT_DEG = {
 }
 
 # 夹爪闭合参数
-GRIPPER_CLOSE_DEG = -34.0
+GRIPPER_CLOSE_DEG = -32.0
 GRIPPER_CLOSE_FRAMES = 120
 
 # ===================================================================
