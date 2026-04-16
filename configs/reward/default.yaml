@@ -10,6 +10,9 @@ task:
   k_decay: 0.5               # 超出目标角度后的衰减速率 k_decay
   w_open: 25000.0               # 任务成功 bonus w_open
   success_angle_threshold: 1.2  # success bonus 触发角度 (rad)
+  w_approach: 200.0             # 接近门板大表面奖励权重
+  approach_eps: 1.0e-6          # 归一化距离公式分母稳定项
+  approach_stop_angle: 0.10     # 门角度超过该阈值后关闭接近奖励
 
 # ── 稳定性奖励 (§5) ──────────────────────────────────────────────
 stability:

@@ -227,6 +227,9 @@ _REWARD_PARAM_MAP: dict[str, dict[str, str]] = {
         "k_decay": "rew_k_decay",
         "w_open": "rew_w_open",
         "success_angle_threshold": "success_angle_threshold",
+        "w_approach": "rew_w_approach",
+        "approach_eps": "rew_approach_eps",
+        "approach_stop_angle": "rew_approach_stop_angle",
     },
     "stability": {
         "w_zero_acc": "rew_w_zero_acc",
@@ -397,6 +400,54 @@ def load_checkpoint(
     )
 
 
+
+def _build_checkpoint_session_name(timestamp: str) -> str:
+    """Build the per-run checkpoint directory name."""
+    return f"checkpoints_{timestamp}"
+
+
+
+def _build_checkpoint_session_dir(ckpt_root: Path, timestamp: str) -> Path:
+    """Nest a per-run checkpoint directory under the configured root."""
+    return ckpt_root / _build_checkpoint_session_name(timestamp)
+
+
+
+def _build_stage_transition_checkpoint_path(
+    ckpt_session_dir: Path,
+    new_stage_name: str,
+) -> Path:
+    """Build the checkpoint path saved immediately after a stage transition."""
+    return ckpt_session_dir / f"ckpt_stage_{new_stage_name}.pt"
+
+
+
+def _save_stage_transition_checkpoint(
+    *,
+    save_fn,
+    ckpt_session_dir: Path,
+    new_stage_name: str,
+    iteration: int,
+    global_steps: int,
+    actor,
+    critic,
+    trainer,
+    curriculum,
+    best_success_rate: float,
+) -> None:
+    """Save an extra checkpoint right after the curriculum enters a new stage."""
+    save_fn(
+        _build_stage_transition_checkpoint_path(ckpt_session_dir, new_stage_name),
+        iteration=iteration,
+        global_steps=global_steps,
+        actor=actor,
+        critic=critic,
+        trainer=trainer,
+        curriculum=curriculum,
+        best_success_rate=best_success_rate,
+    )
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # 训练主函数
 # ═══════════════════════════════════════════════════════════════════════
@@ -523,10 +574,11 @@ def main() -> int:
     metrics = TrainingMetrics()
 
     # ── TensorBoard ──────────────────────────────────────────
+    run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     writer = None
     try:
         from torch.utils.tensorboard import SummaryWriter
-        run_name = f"ppo_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        run_name = f"ppo_{run_timestamp}"
         writer = SummaryWriter(log_dir=str(runtime_cfg.log_dir / run_name))
         print(f"📊 TensorBoard 日志: {runtime_cfg.log_dir / run_name}")
     except ImportError:
@@ -536,7 +588,9 @@ def main() -> int:
     start_iter = 0
     global_steps = 0
     best_success_rate = 0.0
-    ckpt_dir = runtime_cfg.ckpt_dir
+    ckpt_root_dir = runtime_cfg.ckpt_dir
+    ckpt_session_dir = _build_checkpoint_session_dir(ckpt_root_dir, run_timestamp)
+    print(f"💾 Checkpoint 目录: {ckpt_session_dir}")
 
     if runtime_cfg.resume is not None:
         resume_path = runtime_cfg.resume
@@ -638,6 +692,18 @@ def main() -> int:
                 print(f"\n📈 课程阶段跃迁 → {new_stage_cfg.name}: {new_stage_cfg.description}")
                 # 新阶段参数通过 _episode_reset_fn 在各 env 下一次 reset 时逐 env 注入，
                 # 无需立即覆盖正在运行的 episode（H3 修复）
+                _save_stage_transition_checkpoint(
+                    save_fn=save_checkpoint,
+                    ckpt_session_dir=ckpt_session_dir,
+                    new_stage_name=new_stage_cfg.name,
+                    iteration=iteration,
+                    global_steps=global_steps,
+                    actor=actor,
+                    critic=critic,
+                    trainer=ppo_trainer,
+                    curriculum=curriculum,
+                    best_success_rate=best_success_rate,
+                )
 
             # ── Step 7: 控制台日志 ────────────────────────────
             if iteration % log_interval == 0:
@@ -722,7 +788,7 @@ def main() -> int:
             # ── Step 9: Checkpoint 保存 ───────────────────────
             if iteration > 0 and iteration % ckpt_interval == 0:
                 save_checkpoint(
-                    ckpt_dir / f"ckpt_iter_{iteration}.pt",
+                    ckpt_session_dir / f"ckpt_iter_{iteration}.pt",
                     iteration=iteration,
                     global_steps=global_steps,
                     actor=actor,
@@ -749,7 +815,7 @@ def main() -> int:
 
     # 保存最终 checkpoint
     save_checkpoint(
-        ckpt_dir / "ckpt_final.pt",
+        ckpt_session_dir / "ckpt_final.pt",
         iteration=iteration,
         global_steps=global_steps,
         actor=actor,

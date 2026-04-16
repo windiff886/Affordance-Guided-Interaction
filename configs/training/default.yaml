@@ -32,7 +32,7 @@ runtime_defaults: &runtime_defaults
   seed: 42                  # 全局随机种子
   resume: null              # 恢复训练的 checkpoint 路径；null 表示从头开始
   log_dir: runs             # TensorBoard 日志根目录
-  ckpt_dir: checkpoints     # checkpoint 输出目录
+  ckpt_dir: checkpoints     # checkpoint 根目录；实际输出到 checkpoints/checkpoints_<timestamp>/
   env_variant: lite       # full | lite，控制训练使用的环境变体
 
 ppo_common: &ppo_common

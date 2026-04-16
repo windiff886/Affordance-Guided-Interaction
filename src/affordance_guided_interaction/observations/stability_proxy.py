@@ -33,11 +33,15 @@ def _quat_to_rotation_matrix(quat: np.ndarray) -> np.ndarray:
 
 
 def compute_tilt_xy(quat_ee: np.ndarray) -> np.ndarray:
-    """计算重力在 EE 局部坐标系中的 xy 投影。"""
+    """计算重力在 EE 局部坐标系中偏离 Y 轴的投影（xz 分量）。
+
+    抓取姿态下 joint6 = ±90° 使 EE Y 轴对齐世界竖直方向，
+    因此取 xz 分量度量杯子偏离竖直的程度。
+    """
     g_world = np.array([0.0, 0.0, -9.81], dtype=np.float64)
     r_ee = _quat_to_rotation_matrix(np.asarray(quat_ee, dtype=np.float64))
     g_local = r_ee.T @ g_world
-    return g_local[:2].astype(np.float64)
+    return g_local[[0, 2]].astype(np.float64)
 
 
 def compute_tilt(quat_ee: np.ndarray) -> float:

@@ -61,6 +61,10 @@ from .batch_math import (
     batch_yaw_from_quat,
     sample_base_poses,
 )
+from .door_reward_math import (
+    compute_normalized_approach_score,
+    compute_point_to_panel_face_distance,
+)
 from .gripper_hold import build_gripper_hold_targets
 from .physx_mass_ops import (
     build_articulation_mass_update,
@@ -75,8 +79,12 @@ logger = logging.getLogger(__name__)
 
 # DoorLeaf 局部坐标系下的门板中心偏移
 _DOOR_CENTER_OFFSET_LOCAL = (0.02, 0.45, 1.0)
+# DoorLeaf 局部坐标系下的推门侧大表面中心偏移
+_DOOR_PANEL_FACE_CENTER_OFFSET_LOCAL = (0.04, 0.45, 1.0)
 # DoorLeaf 局部坐标系下的推门侧法向量 (+X)
 _DOOR_NORMAL_LOCAL = (1.0, 0.0, 0.0)
+_DOOR_PANEL_HALF_EXTENT_Y = 0.45
+_DOOR_PANEL_HALF_EXTENT_Z = 1.0
 
 # 观测维度
 # actor: proprio(48) + ee(38) + context(2) + stability(2) + door_geometry(6) = 96
@@ -172,11 +180,17 @@ class DoorPushEnv(DirectRLEnv):
         self._cached_left_ee_aa = torch.zeros(N, 3, device=dev)
         self._cached_right_ee_la = torch.zeros(N, 3, device=dev)
         self._cached_right_ee_aa = torch.zeros(N, 3, device=dev)
-        self._cached_left_tilt_xy = torch.zeros(N, 2, device=dev)
-        self._cached_right_tilt_xy = torch.zeros(N, 2, device=dev)
+        self._cached_left_tilt_perp = torch.zeros(N, 2, device=dev)
+        self._cached_right_tilt_perp = torch.zeros(N, 2, device=dev)
         self._cached_raw_action = torch.zeros(N, 12, device=dev)
         # L12: 每步在 _get_observations() 中缓存，供 _get_rewards/_get_dones 共用
         self._cached_cup_dropped = torch.zeros(N, dtype=torch.bool, device=dev)
+        self._cached_left_ee_pos_base = torch.zeros(N, 3, device=dev)
+        self._cached_right_ee_pos_base = torch.zeros(N, 3, device=dev)
+        self._cached_door_panel_face_center_base = torch.zeros(N, 3, device=dev)
+        self._cached_door_panel_face_rot_base = torch.eye(3, device=dev).unsqueeze(0).repeat(N, 1, 1)
+        self._cached_approach_dist = torch.zeros(N, device=dev)
+        self._initial_approach_dist = torch.full((N,), float("nan"), device=dev)
 
 
     # ═══════════════════════════════════════════════════════════════════
@@ -186,6 +200,38 @@ class DoorPushEnv(DirectRLEnv):
     def _setup_scene(self) -> None:
         """场景实体已由 ``DoorPushSceneCfg`` 自动注册，此处无需额外装配。"""
         return
+
+    @staticmethod
+    def _compute_point_to_panel_face_distance(
+        *,
+        points_base: Tensor,
+        face_center_base: Tensor,
+        face_rot_base: Tensor,
+        half_extent_y: float,
+        half_extent_z: float,
+    ) -> Tensor:
+        """Thin wrapper around the pure reward-geometry helper."""
+        return compute_point_to_panel_face_distance(
+            points_base=points_base,
+            face_center_base=face_center_base,
+            face_rot_base=face_rot_base,
+            half_extent_y=half_extent_y,
+            half_extent_z=half_extent_z,
+        )
+
+    @staticmethod
+    def _compute_normalized_approach_score(
+        *,
+        current_dist: Tensor,
+        initial_dist: Tensor,
+        eps: float,
+    ) -> Tensor:
+        """Thin wrapper around the normalized approach helper."""
+        return compute_normalized_approach_score(
+            current_dist=current_dist,
+            initial_dist=initial_dist,
+            eps=eps,
+        )
 
     def _set_gripper_hold_targets(self, env_ids: Tensor | None = None) -> None:
         """刷新夹爪保持目标。
@@ -324,16 +370,18 @@ class DoorPushEnv(DirectRLEnv):
         self._prev_right_ee_ang_vel = right_ee_av_base.clone()
 
         # ── 稳定性 proxy: tilt ──────────────────────────────────
-        left_tilt, left_tilt_xy = self._compute_tilt(left_ee_quat_base)   # (N, 1), (N, 2)
-        right_tilt, right_tilt_xy = self._compute_tilt(right_ee_quat_base)  # (N, 1), (N, 2)
+        left_tilt, left_tilt_perp = self._compute_tilt(left_ee_quat_base)   # (N, 1), (N, 2)
+        right_tilt, right_tilt_perp = self._compute_tilt(right_ee_quat_base)  # (N, 1), (N, 2)
 
-        # ── 缓存加速度和 tilt_xy，供 _get_rewards 使用 ──────────
+        # ── 缓存 EE 位姿/加速度和 tilt_perp，供 _get_rewards 使用 ──
+        self._cached_left_ee_pos_base = left_ee_pos_base.clone()
+        self._cached_right_ee_pos_base = right_ee_pos_base.clone()
         self._cached_left_ee_la = left_ee_la.clone()
         self._cached_left_ee_aa = left_ee_aa.clone()
         self._cached_right_ee_la = right_ee_la.clone()
         self._cached_right_ee_aa = right_ee_aa.clone()
-        self._cached_left_tilt_xy = left_tilt_xy.clone()
-        self._cached_right_tilt_xy = right_tilt_xy.clone()
+        self._cached_left_tilt_perp = left_tilt_perp.clone()
+        self._cached_right_tilt_perp = right_tilt_perp.clone()
 
         # ── 上下文 ──────────────────────────────────────────────
         left_occ = self._left_occupied.float().unsqueeze(-1)   # (N, 1)
@@ -346,6 +394,9 @@ class DoorPushEnv(DirectRLEnv):
         center_offset_local = torch.tensor(
             _DOOR_CENTER_OFFSET_LOCAL, device=self.device, dtype=torch.float32
         )
+        panel_face_center_offset_local = torch.tensor(
+            _DOOR_PANEL_FACE_CENTER_OFFSET_LOCAL, device=self.device, dtype=torch.float32
+        )
         normal_local = torch.tensor(
             _DOOR_NORMAL_LOCAL, device=self.device, dtype=torch.float32
         )
@@ -355,6 +406,10 @@ class DoorPushEnv(DirectRLEnv):
             R_world_from_leaf,
             center_offset_local.view(1, 3, 1).expand(self.num_envs, -1, -1),
         ).squeeze(-1)  # (N, 3)
+        door_panel_face_center_w = door_leaf_pos_w + torch.bmm(
+            R_world_from_leaf,
+            panel_face_center_offset_local.view(1, 3, 1).expand(self.num_envs, -1, -1),
+        ).squeeze(-1)  # (N, 3)
         door_normal_w = torch.bmm(
             R_world_from_leaf,
             normal_local.view(1, 3, 1).expand(self.num_envs, -1, -1),
@@ -363,9 +418,44 @@ class DoorPushEnv(DirectRLEnv):
         door_center_base = batch_vector_world_to_base(
             door_center_w - base_pos, base_quat
         )  # (N, 3)
+        door_panel_face_center_base = batch_vector_world_to_base(
+            door_panel_face_center_w - base_pos, base_quat
+        )  # (N, 3)
         door_normal_base = batch_vector_world_to_base(
             door_normal_w, base_quat
         )  # (N, 3)
+        door_panel_face_quat_base = batch_orientation_world_to_base(
+            door_leaf_quat_w, base_quat
+        )
+        door_panel_face_rot_base = batch_quat_to_rotation_matrix(
+            door_panel_face_quat_base
+        )
+        self._cached_door_panel_face_center_base = door_panel_face_center_base.clone()
+        self._cached_door_panel_face_rot_base = door_panel_face_rot_base.clone()
+
+        left_approach_dist = self._compute_point_to_panel_face_distance(
+            points_base=left_ee_pos_base,
+            face_center_base=door_panel_face_center_base,
+            face_rot_base=door_panel_face_rot_base,
+            half_extent_y=_DOOR_PANEL_HALF_EXTENT_Y,
+            half_extent_z=_DOOR_PANEL_HALF_EXTENT_Z,
+        )
+        right_approach_dist = self._compute_point_to_panel_face_distance(
+            points_base=right_ee_pos_base,
+            face_center_base=door_panel_face_center_base,
+            face_rot_base=door_panel_face_rot_base,
+            half_extent_y=_DOOR_PANEL_HALF_EXTENT_Y,
+            half_extent_z=_DOOR_PANEL_HALF_EXTENT_Z,
+        )
+        current_approach_dist = torch.minimum(left_approach_dist, right_approach_dist)
+        self._cached_approach_dist = current_approach_dist.clone()
+        uninitialized = torch.isnan(self._initial_approach_dist)
+        self._initial_approach_dist = torch.where(
+            uninitialized,
+            current_approach_dist,
+            self._initial_approach_dist,
+        )
+
         door_geometry = torch.cat([door_center_base, door_normal_base], dim=-1)  # (N, 6)
 
         # ── Actor obs (含噪声) ──────────────────────────────────
@@ -463,15 +553,28 @@ class DoorPushEnv(DirectRLEnv):
 
         newly_succeeded = (theta >= target) & ~self._already_succeeded
         r_task_open_bonus = newly_succeeded.float() * self.cfg.rew_w_open
-        r_task = r_task_delta + r_task_open_bonus
+        r_task_approach_raw = self._compute_normalized_approach_score(
+            current_dist=self._cached_approach_dist,
+            initial_dist=self._initial_approach_dist,
+            eps=self.cfg.rew_approach_eps,
+        )
+        approach_active = (theta < self.cfg.rew_approach_stop_angle).float()
+        r_task_approach = (
+            approach_active
+            * self.cfg.rew_w_approach
+            * r_task_approach_raw
+        )
+        r_task = r_task_delta + r_task_open_bonus + r_task_approach
         self._already_succeeded = self._already_succeeded | newly_succeeded
 
         reward_info["task"] = r_task
         reward_info["task/delta"] = r_task_delta
         reward_info["task/open_bonus"] = r_task_open_bonus
+        reward_info["task/approach"] = r_task_approach
+        reward_info["task/approach_raw"] = r_task_approach_raw
 
         # ══════════════════════════════════════════════════════════════
-        # §5 稳定性奖励：7 子项 × 双臂（使用缓存的加速度 + tilt_xy）
+        # §5 稳定性奖励：7 子项 × 双臂（使用缓存的加速度 + tilt_perp）
         # ══════════════════════════════════════════════════════════════
         m_l = self._left_occupied.float()  # (N,)
         m_r = self._right_occupied.float()
@@ -480,11 +583,11 @@ class DoorPushEnv(DirectRLEnv):
         r_stab_left = torch.zeros(self.num_envs, device=self.device)
         r_stab_right = torch.zeros(self.num_envs, device=self.device)
 
-        for side_idx, (side_name, m, la, aa, tilt_xy, tau_slice) in enumerate([
+        for side_idx, (side_name, m, la, aa, tilt_perp, tau_slice) in enumerate([
             ("left", m_l, self._cached_left_ee_la, self._cached_left_ee_aa,
-             self._cached_left_tilt_xy, all_tau[:, :6]),
+             self._cached_left_tilt_perp, all_tau[:, :6]),
             ("right", m_r, self._cached_right_ee_la, self._cached_right_ee_aa,
-             self._cached_right_tilt_xy, all_tau[:, 6:]),
+             self._cached_right_tilt_perp, all_tau[:, 6:]),
         ]):
             prev_tau_slice = (
                 self._prev_prev_action[:, :6] if side_idx == 0
@@ -493,7 +596,7 @@ class DoorPushEnv(DirectRLEnv):
 
             la_sq = (la * la).sum(-1)
             aa_sq = (aa * aa).sum(-1)
-            tilt_sq = (tilt_xy * tilt_xy).sum(-1)
+            tilt_sq = (tilt_perp * tilt_perp).sum(-1)
             tau_diff_sq = ((tau_slice - prev_tau_slice) ** 2).sum(-1)
             tau_sq = (tau_slice * tau_slice).sum(-1)
 
@@ -715,6 +818,8 @@ class DoorPushEnv(DirectRLEnv):
         self._prev_right_ee_lin_vel[env_ids] = 0.0
         self._prev_right_ee_ang_vel[env_ids] = 0.0
         self._cached_cup_dropped[env_ids] = False
+        self._cached_approach_dist[env_ids] = 0.0
+        self._initial_approach_dist[env_ids] = float("nan")
 
     # ═══════════════════════════════════════════════════════════════════
     # 终止原因构建
@@ -997,7 +1102,11 @@ class DoorPushEnv(DirectRLEnv):
 
     @staticmethod
     def _compute_tilt(quat_base: Tensor) -> tuple[Tensor, Tensor]:
-        """计算 cup tilt-to-gravity proxy — 重力在 EE 局部系中的 xy 投影。
+        """计算 cup tilt-to-gravity proxy — 重力在 EE 局部系中偏离 Y 轴的投影。
+
+        抓取姿态下 joint6 = ±90° (绕 X 轴) 使 gripperMover Y 轴对齐世界竖直方向，
+        因此取 g_local 的 xz 分量（偏离 Y 轴的分量）作为倾斜度量。
+        当杯子竖直时 g_local 沿 Y 轴，tilt = 0；倾斜时 xz 分量增大，tilt > 0。
 
         Parameters
         ----------
@@ -1006,7 +1115,7 @@ class DoorPushEnv(DirectRLEnv):
         Returns
         -------
         tilt_norm : (N, 1) tilt 标量范数
-        tilt_xy : (N, 2) tilt 的 xy 分量（用于奖励计算）
+        tilt_perp : (N, 2) tilt 的 xz 分量（重力偏离 EE Y 轴的分量，用于奖励计算）
         """
         R = batch_quat_to_rotation_matrix(quat_base)  # (N, 3, 3)
         # 注：g_world 直接使用世界坐标系重力方向，隐含 base Z 轴与世界 Z 轴对齐。
@@ -1019,8 +1128,9 @@ class DoorPushEnv(DirectRLEnv):
             R.transpose(-1, -2),
             g_world.unsqueeze(-1),
         ).squeeze(-1)  # (N, 3)
-        tilt_xy = g_local[:, :2]  # (N, 2)
-        return tilt_xy.norm(dim=-1, keepdim=True), tilt_xy  # (N, 1), (N, 2)
+        # 抓取姿态下 EE Y 轴 ≈ 世界 Z 轴（竖直），取 xz 分量度量偏离竖直的程度
+        tilt_perp = g_local[:, [0, 2]]  # (N, 2)
+        return tilt_perp.norm(dim=-1, keepdim=True), tilt_perp  # (N, 1), (N, 2)
 
     def _check_cup_dropped(self) -> Tensor:
         """检测杯体是否脱落 — 通过 cup-EE 距离阈值判定。

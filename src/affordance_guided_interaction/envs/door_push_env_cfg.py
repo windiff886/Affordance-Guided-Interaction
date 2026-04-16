@@ -398,6 +398,9 @@ class DoorPushEnvCfg(DirectRLEnvCfg):
     rew_alpha: float = 0.3
     rew_k_decay: float = 0.5
     rew_w_open: float = 50.0
+    rew_w_approach: float = 200.0
+    rew_approach_eps: float = 1.0e-6
+    rew_approach_stop_angle: float = 0.10
 
     # 稳定性奖励 (§5)
     rew_w_zero_acc: float = 1.0

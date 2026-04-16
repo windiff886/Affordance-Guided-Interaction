@@ -24,7 +24,7 @@ envs 层是整个系统中**唯一直接与 Isaac Lab 物理引擎交互的层**
          │  _reset_idx()           选择性重置 + 持杯初始化   │
          │  _pre_physics_step()    力矩注入                  │
          │  _get_observations()    Actor(96D)/Critic(109D)  │
-         │  _get_rewards()         11-term 奖励              │
+         │  _get_rewards()         含 approach shaping 的奖励 │
          │  _get_dones()           终止判定                  │
          └─────────────────────────────────────────────────┘
          │                                                  │
@@ -35,7 +35,7 @@ envs 层是整个系统中**唯一直接与 Isaac Lab 物理引擎交互的层**
          │  GPU tensor 四元数 / 坐标变换工具                 │
          │                                                  │
          │  Reward.md                                       │
-         │  11-term 奖励函数的数学参考文档                   │
+         │  含 approach shaping 的奖励数学参考文档            │
          └──────────────────────────────────────────────────┘
 ```
 
@@ -49,7 +49,7 @@ envs 层是整个系统中**唯一直接与 Isaac Lab 物理引擎交互的层**
 | `door_push_env_cfg.py` | **DoorPushEnvCfg** + **DoorPushSceneCfg** — 声明式 `@configclass` 配置 |
 | `direct_rl_env_adapter.py` | **DirectRLEnvAdapter** — 将 tensor 接口包装为 `VecEnvProtocol`，桥接 RolloutCollector |
 | `batch_math.py` | GPU 批量四元数运算、坐标系变换、基座位姿采样 |
-| `Reward.md` | 11-term 奖励函数的数学定义与超参参考 |
+| `Reward.md` | 含 approach shaping 的奖励数学定义与超参参考 |
 | `__init__.py` | 对外导出 `DoorPushEnv`、`DoorPushEnvCfg`、`DoorPushSceneCfg`、`DirectRLEnvAdapter` |
 
 ---
@@ -97,7 +97,7 @@ _get_observations()   ──▶  读取关节状态 + body 状态
                             拼接 Actor obs (96D) / Critic obs (109D)
                             缓存加速度/tilt_xy 供奖励使用
 
-_get_rewards()        ──▶  §4 任务奖励（角度增量 + 一次性成功 bonus）
+_get_rewards()        ──▶  §4 任务奖励（角度增量 + 一次性成功 bonus + approach）
                             §5 稳定性奖励（7 子项 × 双臂，mask 条件化）
                             §6 安全惩罚（4 子项，始终激活）
 
@@ -168,18 +168,19 @@ Critic 观测 = Actor 观测（无噪声版） + privileged 信息：
 
 ## 6. 奖励函数概要
 
-DoorPushEnv 内置完整的 11-term 奖励计算（详见 `Reward.md`）。总体公式：
+DoorPushEnv 内置完整的奖励计算（详见 `Reward.md`）。总体公式：
 
 $$
 r_t = r_{\text{task}} + m_L \cdot r_{\text{stab}}^L + m_R \cdot r_{\text{stab}}^R - r_{\text{safe}}
 $$
 
-### §4 任务奖励（2 项）
+### §4 任务奖励（3 项）
 
 | 子项 | 公式概要 |
 |---|---|
 | 角度增量奖励 | $w(\theta_t) \cdot (\theta_t - \theta_{t-1})$，达标前满额激励，超标后线性衰减至下限 $\alpha$ |
 | 一次性成功 bonus | $\theta_t \geq \theta_{\text{success}}$ 时触发 $w_{\text{open}}$，仅触发一次 |
+| 接近门板大表面 | $\theta_t < \theta_{\text{stop}}$ 时激活 $w_{\text{approach}} \cdot \max(1-a_t^2/(b^2+\varepsilon), 0)$ |
 
 ### §5 稳定性奖励（7 子项 × 双臂）
 
@@ -313,7 +314,7 @@ door_normal_in_base  # (N, 3)  门叶法向量在 base_link 系下的方向
 
 所有奖励权重定义在 `DoorPushEnvCfg` 中，分为三组：
 
-- **任务奖励 (§4)**：`rew_w_delta`, `rew_alpha`, `rew_k_decay`, `rew_w_open`
+- **任务奖励 (§4)**：`rew_w_delta`, `rew_alpha`, `rew_k_decay`, `rew_w_open`, `rew_w_approach`, `rew_approach_eps`, `rew_approach_stop_angle`
 - **稳定性奖励 (§5)**：`rew_w_zero_acc`, `rew_lambda_acc`, `rew_w_zero_ang`, `rew_lambda_ang`, `rew_w_acc`, `rew_w_ang`, `rew_w_tilt`, `rew_w_smooth`, `rew_w_reg`
 - **安全惩罚 (§6)**：`rew_beta_limit`, `rew_mu`, `rew_beta_vel`, `rew_beta_torque`, `rew_w_drop`
 
@@ -336,7 +337,7 @@ DoorPushEnv 提供两个供外部模块调用的注入接口：
 
 ### 为什么奖励计算内置在 DoorPushEnv 中？
 
-Isaac Lab `DirectRLEnv` 要求 `_get_rewards()` 作为子类方法实现。将全部 12 个奖励子项内置在环境中可以：
+Isaac Lab `DirectRLEnv` 要求 `_get_rewards()` 作为子类方法实现。将完整奖励逻辑内置在环境中可以：
 
 - 直接访问仿真 ground truth tensor，无需序列化/反序列化
 - 奖励计算与观测构建共享缓存（如加速度、tilt_xy），避免重复计算

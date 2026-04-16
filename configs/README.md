@@ -18,13 +18,14 @@
 | `policy/default.yaml` | 8 | 100% |
 | `curriculum/default.yaml` | 3 | 100% |
 | `task/default.yaml` | 2 | 100% |
-| `reward/default.yaml` | 22 | 100% |
+| `reward/default.yaml` | 25 | 100% |
 | `visualization/default.yaml` | 14 | 100% |
 
-**整体**：79 个参数，全部被代码消费。
+**整体**：82 个参数，全部被代码消费。
 
-> **已恢复**: `reward/default.yaml`（22 参数）— 奖励超参数从 `DoorPushEnvCfg` 迁移到独立 YAML 配置文件，由 `train.py` 的 `_inject_reward_params()` 注入。
+> **已恢复**: `reward/default.yaml`（25 参数）— 奖励超参数从 `DoorPushEnvCfg` 迁移到独立 YAML 配置文件，由 `train.py` 的 `_inject_reward_params()` 注入。
 > 数学公式参考见 `envs/Reward.md`。
+> 当前 `task` 奖励侧新增 `w_approach`、`approach_eps`、`approach_stop_angle` 三个键，用于“接近门板大表面”的 shaping。
 
 ---
 
@@ -63,7 +64,7 @@ cfg = {
 | `seed` | `42` | `train_runtime_config.py` → `train.py:313` | 全局随机种子，设置 PyTorch 和 NumPy |
 | `resume` | `null` | `train_runtime_config.py` → `train.py:417` | checkpoint 恢复路径；`null` 表示从头训练 |
 | `log_dir` | `runs` | `train_runtime_config.py` → `train.py:406` | TensorBoard 日志输出目录 |
-| `ckpt_dir` | `checkpoints` | `train_runtime_config.py` → `train.py:415` | checkpoint 文件保存目录 |
+| `ckpt_dir` | `checkpoints` | `train_runtime_config.py` → `train.py` | checkpoint 根目录；单次训练实际输出到 `checkpoints/checkpoints_<timestamp>/` |
 
 #### 基本训练参数
 
@@ -94,10 +95,12 @@ cfg = {
 
 #### 日志与 checkpoint
 
+训练会沿用 `runs/ppo_<timestamp>/` 的命名方式，同时把 checkpoint 统一写到 `checkpoints/checkpoints_<timestamp>/`。除固定间隔 checkpoint 外，课程从 `stage_1 -> stage_2`、`stage_2 -> stage_3` 跃迁时会额外保存 `ckpt_stage_<new_stage_name>.pt`。
+
 | YAML 键 | 默认值 | 消费位置 | 含义 |
 |---------|--------|---------|------|
 | `log_interval` | `1` | `train.py:514` | 每多少轮迭代打印一次控制台日志 |
-| `checkpoint_interval` | `50` | `train.py:575` | 每多少轮迭代保存一次中间 checkpoint |
+| `checkpoint_interval` | `50` | `train.py` | 每多少轮迭代保存一次中间 checkpoint；stage 跃迁时还会额外保存 `ckpt_stage_<new_stage_name>.pt` |
 
 #### 调试选项
 

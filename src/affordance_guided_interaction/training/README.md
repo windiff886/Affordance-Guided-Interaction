@@ -279,9 +279,11 @@ $$
 \theta \leftarrow \theta - \alpha_\theta \nabla_\theta \mathcal{L}(\theta), \quad \phi \leftarrow \phi - \alpha_\phi \nabla_\phi \mathcal{L}_{\text{critic}}(\phi)
 $$
 
-**Step 4 — 课程判定**：统计本轮成功率 $\eta$，更新滑动窗口，判断是否满足阶段跃迁条件（§4.3）。
+**Step 4 — 课程判定**：统计本轮成功率 $\eta$，更新滑动窗口，判断是否满足阶段跃迁条件（§4.3）。若发生阶段跃迁，立即额外保存 `ckpt_stage_<new_stage_name>.pt`。
 
 **Step 5 — 指标记录**：分项奖励、混合成功率、`success_none / success_left_only / success_right_only / success_both`、杯体脱落率等关键指标送入 TensorBoard / WandB。
+
+**Step 6 — Checkpoint 落盘**：固定间隔 checkpoint 与最终 checkpoint 统一写入 `checkpoints/checkpoints_<timestamp>/`，从而与 `runs/ppo_<timestamp>/` 的单次训练目录对应。
 
 ### 6.2 梯度裁剪
 

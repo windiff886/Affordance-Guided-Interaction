@@ -183,7 +183,7 @@ DirectRLEnvAdapter ──► RolloutCollector
 | `configs/policy/default.yaml` | `rnn_hidden = 512`, `rnn_layers = 1`, `log_std_init = -0.5` | `build_models()` |
 | `configs/task/default.yaml` | `door_angle_target = 1.57` rad, `cup_drop_threshold = 0.15` m | `DoorPushEnvCfg` |
 | `configs/curriculum/default.yaml` | `initial_stage`, `window_size = 50`, `threshold = 0.8` | `CurriculumManager` |
-| `configs/reward/default.yaml` | 奖励权重 17 项（详见 §8.3） | `_inject_reward_params()` → `DoorPushEnvCfg` |
+| `configs/reward/default.yaml` | 奖励权重 20 项（详见 §8.3） | `_inject_reward_params()` → `DoorPushEnvCfg` |
 | `configs/visualization/default.yaml` | rollout 可视化参数 | `rollout_demo.py` |
 
 **训练 profile 系统**：`training/default.yaml` 内置 5 档可扩展 profile，通过 `num_envs` 选择：
@@ -430,17 +430,23 @@ $$r_t = r_t^{\text{task}} + m_L \cdot r_t^{\text{stab},L} + m_R \cdot r_t^{\text
 
 ### 8.1 任务奖励
 
-任务奖励由角度增量奖励与一次性成功 bonus 组成：
+任务奖励由角度增量奖励、一次性成功 bonus 与接近门板大表面的 shaping 项组成：
 
-$$r_t^{\text{task}} = w(\theta_t) \cdot \Delta\theta_t + w_{\text{open}} \cdot \mathbb{1}[\theta_t \geq \theta_{\text{bonus}} \;\wedge\; \neg\text{already\_succeeded}]$$
+$$r_t^{\text{task}} = w(\theta_t) \cdot \Delta\theta_t + w_{\text{open}} \cdot \mathbb{1}[\theta_t \geq \theta_{\text{bonus}} \;\wedge\; \neg\text{already\_succeeded}] + \mathbb{1}[\theta_t < \theta_{\text{stop}}] \cdot w_{\text{approach}} \cdot r_{\text{approach}, t}$$
 
-其中 $\Delta\theta_t = \theta_t - \theta_{t-1}$ 为门角度增量，$w_{\text{open}} = 50.0$ 为成功 bonus 权重，$\theta_{\text{bonus}} = 1.2$ rad 为 bonus 触发阈值。
+其中 $\Delta\theta_t = \theta_t - \theta_{t-1}$ 为门角度增量，接近门奖励定义为：
+
+$$r_{\text{approach}, t} = \max\!\left(1 - \frac{a_t^2}{b^2 + \varepsilon},\; 0\right)$$
+
+$$a_t = \min_{\mathbf{x} \in \mathcal{A}_t,\; \mathbf{y} \in \mathcal{D}_t} \|\mathbf{x} - \mathbf{y}\|_2, \qquad b = \min_{\mathbf{x} \in \mathcal{A}_0,\; \mathbf{y} \in \mathcal{D}_0} \|\mathbf{x} - \mathbf{y}\|_2$$
+
+当前最小实现中，$\mathcal{A}_t$ 取左右 EE 控制点，$\mathcal{D}_t$ 取门板 `Panel` 的推门侧大矩形表面。
 
 权重函数 $w(\theta_t)$ 的设计目的是在门接近完全打开后逐步衰减增量奖励，避免策略过度优化已完成的子目标：
 
 $$w(\theta_t) = \begin{cases} w_\delta & \text{if } \theta_t \leq \theta_{\text{bonus}} \\ w_\delta \cdot \max\!\left(\alpha,\; 1 - k_{\text{decay}} \cdot (\theta_t - \theta_{\text{bonus}})\right) & \text{if } \theta_t > \theta_{\text{bonus}} \end{cases}$$
 
-默认参数：$w_\delta = 10.0$，$\alpha = 0.3$（衰减下限比例），$k_{\text{decay}} = 0.5$（衰减速率）。
+默认参数：$w_\delta = 10.0$，$\alpha = 0.3$，$k_{\text{decay}} = 0.5$，$w_{\text{approach}} = 200.0$，$\varepsilon = 10^{-6}$，$\theta_{\text{stop}} = 0.10$ rad。
 
 ### 8.2 稳定性奖励（每侧 7 项）
 
@@ -942,13 +948,13 @@ DomainRandomizer                  DoorPushEnv
 | `timing/*` | rollout_s, update_s, env_steps_per_s | §11.1 |
 | `collect/*` | mean_reward, completed/successful_episodes, episode_success_rate, 上下文成功率 | §9.1 |
 | `reward/*` | total, task, stab_left, stab_right, safe | §8 |
-| `reward_terms/*` | delta, open_bonus, zero_acc, zero_ang, acc, ang, tilt, smooth, reg, joint_limit, joint_vel, torque_limit, cup_drop | §8 |
+| `reward_terms/*` | task/delta, task/open_bonus, task/approach, task/approach_raw, zero_acc, zero_ang, acc, ang, tilt, smooth, reg, joint_limit, joint_vel, torque_limit, cup_drop | §8 |
 | `curriculum/*` | stage, window_mean | §9.4 |
 | `metrics/ppo/*` | 聚合周期内的 PPO 指标均值 | §9.6 |
 
 ### 13.3 Checkpoint 结构
 
-默认训练按 `checkpoint_interval` 保存中间 checkpoint，训练结束或用户中断时保存 `ckpt_final.pt`。每个 checkpoint 包含：
+默认训练会为每次运行创建独立目录 `checkpoints/checkpoints_<timestamp>/`，并沿用 `runs/ppo_<timestamp>/` 的时间戳。固定间隔 checkpoint 仍由 `checkpoint_interval` 控制；当课程发生 `stage_1 -> stage_2` 或 `stage_2 -> stage_3` 跃迁时，会额外立即保存 `ckpt_stage_<new_stage_name>.pt`。训练结束或用户中断时保存 `ckpt_final.pt`。每个 checkpoint 包含：
 
 ```python
 {
@@ -989,7 +995,9 @@ DomainRandomizer                  DoorPushEnv
 reward_info/
 ├── task
 │   ├── task/delta
-│   └── task/open_bonus
+│   ├── task/open_bonus
+│   ├── task/approach
+│   └── task/approach_raw
 ├── stab_left
 │   ├── stab_left/zero_acc
 │   ├── stab_left/zero_ang
@@ -1121,4 +1129,4 @@ reward/
 
 本项目的训练系统由资源、环境、观测、策略、训练、监控与输出六层协同构成。环境层提供 GPU 批量并行的交互世界；观测层将仿真状态整理为结构化输入；策略层在部分可观测条件下输出连续控制信号；训练层通过 PPO + GAE + TBPTT 将交互数据转化为稳定的参数更新；监控与输出层保证整个过程可解释、可恢复、可分析。
 
-默认训练路径以 6D `door_geometry` 为门相关输入，以 asymmetric Actor-Critic + GRU 为策略架构，以三阶段课程和 8 维域随机化为泛化机制，以 17 项奖励分量为训练信号，构成当前项目的主干实现。理解这套系统的关键在于把握各层之间的职责划分与数据流向，从而准确判断改动的影响范围与正确的实现位置。
+默认训练路径以 6D `door_geometry` 为门相关输入，以 asymmetric Actor-Critic + GRU 为策略架构，以三阶段课程和 8 维域随机化为泛化机制，以 20 项奖励超参数和显式 stage checkpoint 为训练信号与运行保障，构成当前项目的主干实现。理解这套系统的关键在于把握各层之间的职责划分与数据流向，从而准确判断改动的影响范围与正确的实现位置。

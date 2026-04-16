@@ -19,7 +19,7 @@
 #         ep000_step00001.png
 #         ...
 # ── 运行时参数（当前生效值）──────────────────────────────────────────
-checkpoint: checkpoints/ckpt_iter_1320.pt                # 模型 checkpoint 路径（相对项目根目录）；null 使用随机初始化策略
+checkpoint: checkpoints/ckpt_iter_640.pt                # 模型 checkpoint 路径（相对项目根目录）；null 使用随机初始化策略
 device: cuda                     # 推理设备：cpu / cuda
 seed: 42                        # 全局随机种子
 headless: true                  # 是否以无窗口模式启动 Isaac Sim

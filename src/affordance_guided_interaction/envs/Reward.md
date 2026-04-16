@@ -85,14 +85,14 @@ $$
 
 现阶段主任务为**推门**。奖励函数奖励门角度的进展本身而不是特定的接触方式，确保策略自行发现有效的推门策略。
 
-奖励由**基于进展增量的稠密奖励**加**成功 bonus** 构成，避免稀疏奖励带来的探索困难。
+奖励由**基于进展增量的稠密奖励**、**一次性成功 bonus** 和 **接近门板大表面的 shaping 项**构成，既保留推门进展信号，也在早期探索阶段鼓励机械臂先靠近正确的交互区域。
 
 ### 4.2 推门奖励
 
-进展度量为门铰链角度增量，权重 $w(\theta_t)$ 是关于当前角度的**分段递减函数**。按当前目标定义，reward 层单独维护 success bonus 阈值 $\theta_{\text{reward\_success}} = 1.2\ \text{rad}$；它**不等同于** env / TaskManager 使用的 episode 结束阈值 `1.57 rad`。在到达奖励目标角度前保持满额激励（不衰减），超过奖励目标角度后开始逐步衰减，防止过度推门：
+进展度量为门铰链角度增量，权重 $w(\theta_t)$ 是关于当前角度的**分段递减函数**。按当前目标定义，reward 层单独维护 success bonus 阈值 $\theta_{\text{reward\_success}} = 1.2\ \text{rad}$；它**不等同于** env / TaskManager 使用的 episode 结束阈值 `1.57 rad`。同时新增一个仅在推门前期激活的接近门奖励：
 
 $$
-r_{\text{task}} = w(\theta_t) \cdot (\theta_t - \theta_{t-1}) + w_{\text{open}} \cdot \mathbf{1}[\theta_t \geq \theta_{\text{reward\_success}}]
+r_{\text{task}} = w(\theta_t) \cdot (\theta_t - \theta_{t-1}) + w_{\text{open}} \cdot \mathbf{1}[\theta_t \geq \theta_{\text{reward\_success}}] + \mathbf{1}[\theta_t < \theta_{\text{stop}}] \cdot w_{\text{approach}} \cdot r_{\text{approach}, t}
 $$
 
 其中：
@@ -104,8 +104,21 @@ w(\theta_t) = \begin{cases}
 \end{cases}
 $$
 
+$$
+r_{\text{approach}, t} = \max\!\left(1 - \frac{a_t^2}{b^2 + \varepsilon},\; 0\right)
+$$
+
+$$
+a_t = \min_{\mathbf{x} \in \mathcal{A}_t,\; \mathbf{y} \in \mathcal{D}_t} \|\mathbf{x} - \mathbf{y}\|_2,
+\qquad
+b = \min_{\mathbf{x} \in \mathcal{A}_0,\; \mathbf{y} \in \mathcal{D}_0} \|\mathbf{x} - \mathbf{y}\|_2
+$$
+
+当前最小实现中，$\mathcal{A}_t = \{\mathbf{p}_{\mathrm{ee}}^L(t), \mathbf{p}_{\mathrm{ee}}^R(t)\}$，即左右末端执行器控制点；$\mathcal{D}_t$ 为门板 `Panel` 推门侧的大矩形表面，而不是 `PushPlate` 的单点近似。
+
 - $\theta_t \leq \theta_{\text{reward\_success}}$ 时：$w = w_\delta$（满额激励，不衰减）
-- $\theta_t > \theta_{\text{reward\_success}}$ 时：权重由于超出奖励目标角度而线性衰减，直到降至下限 $\alpha \cdot w_\delta$。$k_{\text{decay}}$ 控制衰减速率。
+- $\theta_t > \theta_{\text{reward\_success}}$ 时：权重由于超出奖励目标角度而线性衰减，直到降至下限 $\alpha \cdot w_\delta$
+- $\theta_t \geq \theta_{\text{stop}}$ 时：关闭接近奖励，避免学成“贴着门站着不推”
 
 参数说明：
 
@@ -114,8 +127,12 @@ $$
 - $k_{\text{decay}}$：超出目标角度后的衰减速率系数
 - $\theta_{\text{reward\_success}}$：reward 层 success bonus 触发角度，目标值为 `1.2 rad`
 - $w_{\text{open}}$：完成 bonus（一次性）
+- $w_{\text{approach}}$：接近门板大表面的奖励权重
+- $\varepsilon$：归一化平方距离公式的稳定项
+- $\theta_{\text{stop}}$：关闭接近奖励的门角度阈值
 
 env / TaskManager 的 episode 结束角度由环境层单独维护，目标值为 `1.57 rad`。reward 文档中的成功阈值不再与 episode 结束阈值共用同一名字，以避免再次混淆。
+
 
 ---
 
@@ -339,6 +356,7 @@ $$
 | 数据 | 来源 | 用途 |
 |------|------|------|
 | $\theta_t, \theta_{t-1}$ | `door.data.joint_pos` + `_prev_door_angle` 缓存 | 任务奖励 |
+| $a_t, b$ | `_cached_approach_dist` + `_initial_approach_dist` + 门板大表面几何缓存 | approach reward |
 | $\mathbf{a}_t, \boldsymbol{\alpha}_t$ | 连续两步 EE 速度的数值微分（`_get_observations` 中缓存） | 稳定性奖励 |
 | $\text{tilt}$ | EE 姿态四元数 + 重力方向几何推理（`_compute_tilt`） | 稳定性奖励 |
 | $m_L, m_R$ | `_left_occupied` / `_right_occupied` 持杯状态标记 | 稳定性 mask |
@@ -367,6 +385,9 @@ $$
 | $\alpha$ | `task.alpha` | 权重衰减下限比例 |
 | $k_{\text{decay}}$ | `task.k_decay` | 超出目标角度后的衰减速率 |
 | $w_{\text{open}}$ | `task.w_open` | 任务成功 bonus |
+| $w_{\text{approach}}$ | `task.w_approach` | 接近门板大表面奖励权重 |
+| $\varepsilon$ | `task.approach_eps` | 归一化距离公式稳定项 |
+| $\theta_{\text{stop}}$ | `task.approach_stop_angle` | 关闭接近奖励的门角度阈值 |
 
 ### 9.2 稳定性权重
 
@@ -408,10 +429,10 @@ $$
 
 当前可观测的主标签包括：
 
-- `reward/total`
-- `reward/task`、`reward/task/delta`、`reward/task/open_bonus`
-- `reward/stab_left`、`reward/stab_right` 及其各自 7 个子项
-- `reward/safe` 及其 5 个正惩罚子项
+- `reward/total`、`reward/task`、`reward/stab_left`、`reward/stab_right`、`reward/safe`
+- `reward_terms/task/delta`、`reward_terms/task/open_bonus`、`reward_terms/task/approach`、`reward_terms/task/approach_raw`
+- `reward_terms/stab_left/*`、`reward_terms/stab_right/*`
+- `reward_terms/safe/joint_limit`、`reward_terms/safe/joint_vel`、`reward_terms/safe/torque_limit`、`reward_terms/safe/cup_drop`
 
 其中 `task`、`stab_left`、`stab_right` 采用进入总奖励时的有符号贡献；`safe` 与 `safe/*` 采用正惩罚量记录，在总奖励中统一以减号扣除。
 

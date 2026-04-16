@@ -45,6 +45,9 @@ def main() -> int:
 
     from train import build_env_cfg, build_models, load_config
     from affordance_guided_interaction.utils.runtime_env import resolve_headless_mode
+    from affordance_guided_interaction.utils.train_runtime_config import (
+        resolve_train_runtime_config,
+    )
     from affordance_guided_interaction.utils.sim_runtime import launch_simulation_app
     from affordance_guided_interaction.envs.door_push_env import DoorPushEnv
     from affordance_guided_interaction.envs.direct_rl_env_adapter import DirectRLEnvAdapter
@@ -57,6 +60,7 @@ def main() -> int:
 
     device = torch.device(args.device)
     cfg = load_config(args.config)
+    runtime_cfg = resolve_train_runtime_config(cfg, project_root=_PROJECT_ROOT)
     simulation_app = launch_simulation_app(
         headless=resolve_headless_mode(args.headless, os.environ),
         enable_cameras=False,
@@ -72,7 +76,14 @@ def main() -> int:
         actor.load_state_dict(checkpoint["actor_state_dict"])
 
     # 使用 GPU 环境 (num_envs=1 用于评估)
-    env_cfg = build_env_cfg(cfg, n_envs=1, device=str(device), seed=args.seed, enable_cameras=False)
+    env_cfg = build_env_cfg(
+        cfg,
+        n_envs=1,
+        device=str(device),
+        seed=args.seed,
+        enable_cameras=False,
+        variant=runtime_cfg.env_variant,
+    )
     _direct_env = DoorPushEnv(cfg=env_cfg)
     envs = DirectRLEnvAdapter(_direct_env)
 
