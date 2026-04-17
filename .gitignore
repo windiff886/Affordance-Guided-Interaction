@@ -9,3 +9,4 @@ runs/
 checkpoints/
 tests/
 artifacts/
+.vscode/

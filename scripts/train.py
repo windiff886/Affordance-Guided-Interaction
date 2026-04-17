@@ -1,88 +1,61 @@
-"""PPO 训练主入口 — 完整的采集-优化-课程-日志循环。
+"""RL-Games training entrypoint aligned to the IsaacLab official flow.
 
-用法:
-    python scripts/train.py
-
-训练运行参数统一从 ``configs/training/default.yaml`` 读取。
-如需切换本地验证 / A100 训练配置，请直接修改 YAML 中的生效值。
+Chain:
+    YAML -> task registry -> env_cfg / agent_cfg -> AppLauncher -> gym.make
+    -> RlGamesVecEnvWrapper -> rl_games.Runner.load(...) -> runner.run(...)
 """
 
 from __future__ import annotations
 
+import argparse
+import collections
+import importlib
+import math
 import os
 import sys
 import time
+from copy import deepcopy
 from datetime import datetime
-from functools import partial
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import torch
 import yaml
 
-# 确保项目 src 在 Python 路径中
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _SRC_ROOT = _PROJECT_ROOT / "src"
 if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
-from affordance_guided_interaction.utils.sim_runtime import (
-    launch_simulation_app,
-)
 from affordance_guided_interaction.utils.runtime_env import resolve_headless_mode
-from affordance_guided_interaction.utils.train_runtime_config import (
-    resolve_train_runtime_config,
-)
+from affordance_guided_interaction.utils.train_runtime_config import TrainRuntimeConfig, resolve_train_runtime_config
 
+DEFAULT_TASK_NAME = "Affordance-DoorPush-Direct-v0"
+DEFAULT_AGENT_ENTRY_POINT = "rl_games_cfg_entry_point"
+_DEFAULT_LOG_ROOT = "rl_games"
 
-# ═══════════════════════════════════════════════════════════════════════
-# 配置加载
-# ═══════════════════════════════════════════════════════════════════════
 
 def load_config(configs_dir: str | Path | None = None) -> dict[str, Any]:
-    """加载并合并所有 YAML 配置文件。
-
-    默认从项目根目录下的 ``configs/`` 目录读取各子目录中的
-    ``default.yaml``，无需手动指定路径。
-
-    Parameters
-    ----------
-    configs_dir:
-        配置根目录，默认为 ``<project_root>/configs``。
-    """
+    """Load the active YAML configuration files for the rl_games-only workflow."""
     configs_dir = _resolve_configs_root(configs_dir)
-
     merged: dict[str, Any] = {}
-
     config_files = {
         "training": configs_dir / "training/default.yaml",
         "env": configs_dir / "env/default.yaml",
-        "policy": configs_dir / "policy/default.yaml",
         "task": configs_dir / "task/default.yaml",
-        "curriculum": configs_dir / "curriculum/default.yaml",
         "reward": configs_dir / "reward/default.yaml",
-        "visualization": configs_dir / "visualization/default.yaml",
     }
 
     for key, path in config_files.items():
-        if path.exists():
-            with open(path, "r", encoding="utf-8") as f:
-                merged[key] = yaml.safe_load(f) or {}
-        else:
-            print(f"⚠️ 配置文件不存在: {path}")
-            merged[key] = {}
+        if not path.exists():
+            raise FileNotFoundError(f"Missing required config file: {path}")
+        with open(path, "r", encoding="utf-8") as f:
+            merged[key] = yaml.safe_load(f) or {}
 
     return merged
 
 
 def _resolve_configs_root(configs_dir: str | Path | None) -> Path:
-    """将配置根解析为 ``configs/`` 目录。
-
-    兼容两种输入：
-    1. 配置根目录本身，如 ``configs/``
-    2. 其中任一 YAML 文件，如 ``configs/training/default.yaml``
-    """
     if configs_dir is None:
         return (_PROJECT_ROOT / "configs").resolve()
 
@@ -90,76 +63,12 @@ def _resolve_configs_root(configs_dir: str | Path | None) -> Path:
     if path.is_file():
         return path.parents[1]
 
-    if path.name in {"training", "env", "policy", "task", "curriculum", "reward", "visualization"}:
+    if path.name in {"training", "env", "task", "reward"}:
         default_yaml = path / "default.yaml"
         if default_yaml.exists():
             return path.parent
 
     return path
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# 组件工厂
-# ═══════════════════════════════════════════════════════════════════════
-
-def build_models(cfg: dict, device: torch.device):
-    """创建 Actor 和 Critic 网络实例。"""
-    from affordance_guided_interaction.policy import (
-        Actor, ActorConfig,
-        Critic, CriticConfig,
-    )
-
-    policy_cfg = cfg.get("policy", {})
-    actor_section = policy_cfg.get("actor", {})
-    critic_section = policy_cfg.get("critic", {})
-
-    actor_cfg = ActorConfig(
-        rnn_hidden=actor_section.get("rnn_hidden", 512),
-        rnn_layers=actor_section.get("rnn_layers", 1),
-        rnn_type=actor_section.get("rnn_type", "gru"),
-        action_dim=actor_section.get("action_dim", 12),
-        log_std_init=actor_section.get("log_std_init", -0.5),
-    )
-
-    critic_cfg = CriticConfig(
-        hidden_dims=tuple(critic_section.get("hidden_dims", [512, 256, 128])),
-    )
-
-    actor = Actor(actor_cfg).to(device)
-    critic = Critic(actor_cfg, critic_cfg).to(device)
-
-    return actor, critic, actor_cfg
-
-
-def build_ppo_trainer(actor, critic, cfg: dict, device: torch.device):
-    """创建 PPO 训练器实例。"""
-    from affordance_guided_interaction.training.ppo_trainer import (
-        PPOTrainer, PPOConfig,
-    )
-
-    t_cfg = cfg.get("training", {})
-    ppo_section = t_cfg.get("ppo", {})
-
-    ppo_cfg = PPOConfig(
-        gamma=ppo_section.get("gamma", 0.99),
-        lam=ppo_section.get("lam", 0.95),
-        clip_eps=ppo_section.get("clip_eps", 0.2),
-        value_clip_eps=ppo_section.get("value_clip_eps", 0.2),
-        use_clipped_value_loss=ppo_section.get("use_clipped_value_loss", True),
-        entropy_coef=ppo_section.get("entropy_coef", 0.01),
-        value_coef=ppo_section.get("value_coef", 0.5),
-        max_grad_norm=ppo_section.get("max_grad_norm", 1.0),
-        actor_lr=ppo_section.get("actor_lr", 3e-4),
-        critic_lr=ppo_section.get("critic_lr", 3e-4),
-        num_mini_batches=ppo_section.get("num_mini_batches", 4),
-        num_epochs=ppo_section.get("num_epochs", 5),
-        seq_length=ppo_section.get("seq_length", 16),
-        normalize_advantages=ppo_section.get("normalize_advantages", True),
-        lr_decay=ppo_section.get("lr_decay", False),
-        lr_total_steps=ppo_section.get("lr_total_steps", 10_000_000),
-    )
-
-    return PPOTrainer(actor, critic, ppo_cfg, device), ppo_cfg
 
 
 def build_env_cfg(
@@ -169,13 +78,16 @@ def build_env_cfg(
     device: str | None = None,
     seed: int | None = None,
     enable_cameras: bool = True,
+    task_name: str | None = None,
 ):
-    """基于 YAML 配置构建 DoorPushEnvCfg。"""
-    from affordance_guided_interaction.envs.door_push_env_cfg import (
-        DoorPushEnvCfg,
-    )
+    """Build DoorPushEnvCfg from the registered default config plus YAML overrides."""
+    del enable_cameras
 
-    env_cfg = DoorPushEnvCfg()
+    resolved_task_name = task_name or _resolve_task_name(cfg)
+    env_cfg = _load_cfg_from_registry(resolved_task_name, "env_cfg_entry_point")
+    if isinstance(env_cfg, dict):
+        raise RuntimeError(f"Task '{resolved_task_name}' returned a dict env config; a config class is required.")
+
     env_cfg.scene.num_envs = int(n_envs)
     env_cfg.sim.render_interval = int(env_cfg.decimation)
 
@@ -191,7 +103,6 @@ def build_env_cfg(
         env_cfg.decimation = int(env_cfg_yaml["decimation"])
         env_cfg.sim.render_interval = env_cfg.decimation
 
-    # 注入控制器参数
     control_cfg = env_cfg_yaml.get("control", {})
     if "action_type" in control_cfg:
         env_cfg.control_action_type = str(control_cfg["action_type"])
@@ -203,62 +114,104 @@ def build_env_cfg(
         env_cfg.position_target_noise_std = float(control_cfg["position_target_noise_std"])
     _apply_arm_control_to_actuators(env_cfg)
 
-    # NOTE: tiled_camera 已从 DoorPushSceneCfg 默认配置中移除，
-    # 不再需要 env_cfg.scene.tiled_camera = None 的守卫逻辑。
-
     task_cfg = cfg.get("task", {})
     if "door_angle_target" in task_cfg:
         env_cfg.door_angle_target = float(task_cfg["door_angle_target"])
     if "cup_drop_threshold" in task_cfg:
         env_cfg.cup_drop_threshold = float(task_cfg["cup_drop_threshold"])
 
-    # ── 从 reward YAML 注入奖励超参 ─────────────────────────────────
-    reward_cfg = cfg.get("reward", {})
-    _inject_reward_params(env_cfg, reward_cfg)
-
+    _inject_reward_params(env_cfg, cfg.get("reward", {}))
     return env_cfg
 
 
-def _apply_arm_control_to_actuators(env_cfg: Any) -> None:
-    """将环境级 arm 控制参数回写到 scene actuator 配置。
+def build_rl_games_agent_cfg(
+    cfg: dict[str, Any],
+    runtime_cfg: TrainRuntimeConfig,
+    *,
+    task_name: str | None = None,
+    agent_entry_point: str = DEFAULT_AGENT_ENTRY_POINT,
+    device: str | None = None,
+    checkpoint_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Build the rl_games agent config from the registered default YAML plus project YAML overrides."""
+    resolved_task_name = task_name or _resolve_task_name(cfg)
+    default_agent_cfg = _load_cfg_from_registry(resolved_task_name, agent_entry_point)
+    if not isinstance(default_agent_cfg, dict):
+        raise RuntimeError(f"Task '{resolved_task_name}' returned a non-dict rl_games agent config.")
 
-    这样 `configs/env/default.yaml` 中的 PD 参数不是只停留在 DoorPushEnvCfg
-    字段上，而会真实驱动 shoulder / arm actuator 的 stiffness / damping /
-    effort_limit。
-    """
-    if getattr(env_cfg, "control_action_type", "joint_position") != "joint_position":
+    agent_cfg = deepcopy(default_agent_cfg)
+    training_cfg = cfg.get("training", {})
+    ppo_cfg = training_cfg.get("ppo", {})
+
+    rl_device = _normalize_device(device or runtime_cfg.device)
+    horizon_length = int(training_cfg.get("n_steps_per_rollout", agent_cfg["params"]["config"]["horizon_length"]))
+    num_envs = int(training_cfg.get("num_envs", runtime_cfg.num_envs or 1))
+    num_mini_batches = int(ppo_cfg.get("num_mini_batches", 1))
+    total_batch_size = num_envs * horizon_length
+    if total_batch_size % num_mini_batches != 0:
         raise ValueError(
-            f"Unsupported control action type: {env_cfg.control_action_type}"
+            "The effective batch size must be divisible by num_mini_batches for rl_games. "
+            f"Got total_batch_size={total_batch_size}, num_mini_batches={num_mini_batches}."
         )
 
-    robot_actuators = env_cfg.scene.robot.actuators
-    shoulder = robot_actuators["shoulder_joints"]
-    arm = robot_actuators["arm_joints"]
+    actor_lr = float(ppo_cfg.get("actor_lr", agent_cfg["params"]["config"]["learning_rate"]))
+    critic_lr = float(ppo_cfg.get("critic_lr", actor_lr))
+    if not math.isclose(actor_lr, critic_lr, rel_tol=0.0, abs_tol=1.0e-12):
+        raise ValueError(
+            "The rl_games-only path uses a single optimizer. "
+            f"Expected actor_lr == critic_lr, got {actor_lr} vs {critic_lr}."
+        )
 
-    shoulder.stiffness = float(env_cfg.arm_pd_stiffness)
-    shoulder.damping = float(env_cfg.arm_pd_damping)
-    arm.stiffness = float(env_cfg.arm_pd_stiffness)
-    arm.damping = float(env_cfg.arm_pd_damping)
+    total_steps = int(training_cfg.get("total_steps", 0))
+    if total_steps <= 0:
+        raise ValueError(f"training.total_steps must be positive, got {total_steps}.")
+    max_epochs = math.ceil(total_steps / max(1, total_batch_size))
 
-    effort_limits = tuple(getattr(env_cfg, "effort_limits", ()))
-    if len(effort_limits) >= 8:
-        shoulder_indices = (1, 7)
-        shoulder_limits = [effort_limits[i] for i in shoulder_indices]
-        arm_limits = [
-            limit for idx, limit in enumerate(effort_limits)
-            if idx not in shoulder_indices
-        ]
-        if shoulder_limits:
-            shoulder.effort_limit = float(max(shoulder_limits))
-        if arm_limits:
-            arm.effort_limit = float(max(arm_limits))
+    params = agent_cfg.setdefault("params", {})
+    env_section = params.setdefault("env", {})
+    config_section = params.setdefault("config", {})
+
+    params["seed"] = int(runtime_cfg.seed)
+    env_section["clip_actions"] = float(training_cfg.get("clip_actions", env_section.get("clip_actions", 100.0)))
+    env_section["clip_observations"] = float(
+        training_cfg.get("clip_observations", env_section.get("clip_observations", 100.0))
+    )
+
+    config_section["name"] = str(training_cfg.get("experiment_name", config_section.get("name", "door_push_direct")))
+    config_section["device"] = rl_device
+    config_section["device_name"] = rl_device
+    config_section["horizon_length"] = horizon_length
+    config_section["minibatch_size"] = total_batch_size // num_mini_batches
+    config_section["mini_epochs"] = int(ppo_cfg.get("num_epochs", config_section.get("mini_epochs", 1)))
+    config_section["seq_length"] = int(ppo_cfg.get("seq_length", config_section.get("seq_length", 4)))
+    config_section["normalize_advantage"] = bool(
+        ppo_cfg.get("normalize_advantages", config_section.get("normalize_advantage", True))
+    )
+    config_section["gamma"] = float(ppo_cfg.get("gamma", config_section.get("gamma", 0.99)))
+    config_section["tau"] = float(ppo_cfg.get("lam", config_section.get("tau", 0.95)))
+    config_section["learning_rate"] = actor_lr
+    config_section["entropy_coef"] = float(ppo_cfg.get("entropy_coef", config_section.get("entropy_coef", 0.0)))
+    config_section["critic_coef"] = float(ppo_cfg.get("value_coef", config_section.get("critic_coef", 1.0)))
+    config_section["grad_norm"] = float(ppo_cfg.get("max_grad_norm", config_section.get("grad_norm", 1.0)))
+    config_section["e_clip"] = float(ppo_cfg.get("clip_eps", config_section.get("e_clip", 0.2)))
+    config_section["clip_value"] = bool(
+        ppo_cfg.get("use_clipped_value_loss", config_section.get("clip_value", True))
+    )
+    config_section["max_epochs"] = max_epochs
+    config_section["save_frequency"] = int(
+        training_cfg.get("checkpoint_interval", config_section.get("save_frequency", 100))
+    )
+    config_section["save_best_after"] = min(config_section["save_frequency"], max_epochs)
+
+    reward_shaper = config_section.setdefault("reward_shaper", {})
+    reward_shaper["scale_value"] = float(training_cfg.get("reward_scale", reward_shaper.get("scale_value", 1.0)))
+
+    resume_path = Path(checkpoint_path) if checkpoint_path is not None else runtime_cfg.resume
+    params["load_checkpoint"] = resume_path is not None
+    params["load_path"] = str(resume_path) if resume_path is not None else ""
+    return agent_cfg
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# 奖励参数注入
-# ═══════════════════════════════════════════════════════════════════════
-
-# YAML 键 → DoorPushEnvCfg 属性 的映射表
 _REWARD_PARAM_MAP: dict[str, dict[str, str]] = {
     "task": {
         "w_delta": "rew_w_delta",
@@ -288,8 +241,31 @@ _REWARD_PARAM_MAP: dict[str, dict[str, str]] = {
 }
 
 
+def _apply_arm_control_to_actuators(env_cfg: Any) -> None:
+    if getattr(env_cfg, "control_action_type", "joint_position") != "joint_position":
+        raise ValueError(f"Unsupported control action type: {env_cfg.control_action_type}")
+
+    robot_actuators = env_cfg.scene.robot.actuators
+    shoulder = robot_actuators["shoulder_joints"]
+    arm = robot_actuators["arm_joints"]
+
+    shoulder.stiffness = float(env_cfg.arm_pd_stiffness)
+    shoulder.damping = float(env_cfg.arm_pd_damping)
+    arm.stiffness = float(env_cfg.arm_pd_stiffness)
+    arm.damping = float(env_cfg.arm_pd_damping)
+
+    effort_limits = tuple(getattr(env_cfg, "effort_limits", ()))
+    if len(effort_limits) >= 8:
+        shoulder_indices = (1, 7)
+        shoulder_limits = [effort_limits[i] for i in shoulder_indices]
+        arm_limits = [limit for idx, limit in enumerate(effort_limits) if idx not in shoulder_indices]
+        if shoulder_limits:
+            shoulder.effort_limit = float(max(shoulder_limits))
+        if arm_limits:
+            arm.effort_limit = float(max(arm_limits))
+
+
 def _inject_reward_params(env_cfg: Any, reward_cfg: dict[str, Any]) -> None:
-    """将 reward YAML 中的参数注入到 DoorPushEnvCfg 实例。"""
     for section, mapping in _REWARD_PARAM_MAP.items():
         section_cfg = reward_cfg.get(section, {})
         for yaml_key, cfg_attr in mapping.items():
@@ -297,588 +273,208 @@ def _inject_reward_params(env_cfg: Any, reward_cfg: dict[str, Any]) -> None:
                 setattr(env_cfg, cfg_attr, float(section_cfg[yaml_key]))
 
 
-_REWARD_SUMMARY_KEYS = frozenset({"total", "task", "stab_left", "stab_right", "safe"})
+def main(argv: list[str] | None = None) -> int:
+    """Train DoorPush with the IsaacLab rl_games downstream flow."""
+    argv_list = list(sys.argv[1:] if argv is None else argv)
+    parser = _build_arg_parser()
+    args_cli = parser.parse_args(argv_list)
 
-
-def _iter_reward_scalar_tags(collect_stats: dict[str, float]):
-    """将 reward 统计路由到 TensorBoard 标签。
-
-    `reward/` 仅保留总项，细分子项统一写入 `reward_terms/`。
-    """
-    for key, val in collect_stats.items():
-        if not key.startswith("reward/"):
-            continue
-        suffix = key[len("reward/"):]
-        if suffix in _REWARD_SUMMARY_KEYS:
-            yield key, val
-        else:
-            yield f"reward_terms/{suffix}", val
-
-
-def build_curriculum_reset_batch(
-    stage_cfg: Any,
-    randomizer: Any,
-    n_envs: int,
-) -> tuple[list[Any], list[str], list[bool], list[bool]]:
-    """根据当前课程阶段生成一批 reset 参数。"""
-    domain_params_list = randomizer.sample_batch_episode_params(n_envs)
-    door_types = [str(randomizer._rng.choice(stage_cfg.door_types)) for _ in range(n_envs)]
-    left_occupied, right_occupied = stage_cfg.sample_occupancy_batch(n_envs)
-    return domain_params_list, door_types, left_occupied, right_occupied
-
-
-def build_collector(
-    actor, critic, actor_cfg, cfg: dict, ppo_cfg, device: torch.device
-):
-    """创建轨迹采集器和 RolloutBuffer 实例。"""
-    from affordance_guided_interaction.training.rollout_buffer import RolloutBuffer
-    from affordance_guided_interaction.training.rollout_collector import RolloutCollector
-    from affordance_guided_interaction.policy import (
-        batch_flatten_actor_obs,
-        flatten_privileged,
-    )
-
-    t_cfg = cfg.get("training", {})
-    n_envs = t_cfg.get("num_envs", 4)
-    n_steps = t_cfg.get("n_steps_per_rollout", 128)
-
-    # 计算各分支维度（与 Actor 网络输入一致）
-    proprio_dim = (
-        12                                               # q (TOTAL_ARM_JOINTS)
-        + 12                                             # dq
-        + 12                                             # prev_joint_target
-    )
-
-    actor_branch_dims = {
-        "proprio": proprio_dim,
-        "ee": 38,                                           # 双臂各 19
-        "context": 2,                                       # left_occ + right_occ
-        "stability": 2,                                     # left/right tilt
-        "door_geometry": 6,                                 # center(3) + normal(3)
-    }
-
-    buffer = RolloutBuffer(
-        n_envs=n_envs,
-        n_steps=n_steps,
-        actor_branch_dims=actor_branch_dims,
-        privileged_dim=13,
-        action_dim=12,
-        rnn_hidden_dim=actor_cfg.rnn_hidden,
-        rnn_num_layers=actor_cfg.rnn_layers,
-        device=device,
-    )
-
-    # partial 绑定展平函数
-    batch_flatten_fn = partial(batch_flatten_actor_obs, cfg=actor_cfg)
-
-    collector = RolloutCollector(
-        actor=actor,
-        critic=critic,
-        buffer=buffer,
-        batch_actor_flatten_fn=batch_flatten_fn,
-        priv_flatten_fn=flatten_privileged,
-        perception_runtime=None,
-        device=device,
-    )
-
-    return collector, buffer, n_steps
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# Checkpoint 管理
-# ═══════════════════════════════════════════════════════════════════════
-
-def save_checkpoint(
-    path: Path,
-    iteration: int,
-    global_steps: int,
-    actor: torch.nn.Module,
-    critic: torch.nn.Module,
-    trainer,
-    curriculum,
-    best_success_rate: float,
-) -> None:
-    """保存训练 checkpoint，包含模型权重和训练器/课程管理器状态。"""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({
-        "iteration": iteration,
-        "global_steps": global_steps,
-        "actor_state_dict": actor.state_dict(),
-        "critic_state_dict": critic.state_dict(),
-        "trainer_state_dict": trainer.state_dict(),
-        "curriculum_state_dict": curriculum.state_dict(),
-        "best_success_rate": best_success_rate,
-    }, str(path))
-    print(f"💾 Checkpoint 已保存: {path}")
-
-
-def load_checkpoint(
-    path: Path,
-    actor: torch.nn.Module,
-    critic: torch.nn.Module,
-    trainer,
-    curriculum,
-    device: torch.device,
-) -> tuple[int, int, float]:
-    """加载训练 checkpoint。"""
-    ckpt = torch.load(str(path), map_location=device, weights_only=False)
-    actor.load_state_dict(ckpt["actor_state_dict"])
-    critic.load_state_dict(ckpt["critic_state_dict"])
-    trainer.load_state_dict(ckpt["trainer_state_dict"])
-    if "curriculum_state_dict" in ckpt:
-        curriculum.load_state_dict(ckpt["curriculum_state_dict"])
-    print(f"✅ Checkpoint 已加载: {path}")
-    return (
-        ckpt.get("iteration", 0),
-        ckpt.get("global_steps", 0),
-        ckpt.get("best_success_rate", 0.0),
-    )
-
-
-
-def _build_checkpoint_session_name(timestamp: str) -> str:
-    """Build the per-run checkpoint directory name."""
-    return f"checkpoints_{timestamp}"
-
-
-
-def _build_checkpoint_session_dir(ckpt_root: Path, timestamp: str) -> Path:
-    """Nest a per-run checkpoint directory under the configured root."""
-    return ckpt_root / _build_checkpoint_session_name(timestamp)
-
-
-
-def _build_stage_transition_checkpoint_path(
-    ckpt_session_dir: Path,
-    new_stage_name: str,
-) -> Path:
-    """Build the checkpoint path saved immediately after a stage transition."""
-    return ckpt_session_dir / f"ckpt_stage_{new_stage_name}.pt"
-
-
-
-def _save_stage_transition_checkpoint(
-    *,
-    save_fn,
-    ckpt_session_dir: Path,
-    new_stage_name: str,
-    iteration: int,
-    global_steps: int,
-    actor,
-    critic,
-    trainer,
-    curriculum,
-    best_success_rate: float,
-) -> None:
-    """Save an extra checkpoint right after the curriculum enters a new stage."""
-    save_fn(
-        _build_stage_transition_checkpoint_path(ckpt_session_dir, new_stage_name),
-        iteration=iteration,
-        global_steps=global_steps,
-        actor=actor,
-        critic=critic,
-        trainer=trainer,
-        curriculum=curriculum,
-        best_success_rate=best_success_rate,
-    )
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# 训练主函数
-# ═══════════════════════════════════════════════════════════════════════
-
-def main() -> int:
-    """训练主入口。"""
-    cfg = load_config()
+    cfg = load_config(args_cli.configs_dir)
     runtime_cfg = resolve_train_runtime_config(cfg, project_root=_PROJECT_ROOT)
 
-    # ── 设备选择 ─────────────────────────────────────────────
-    if runtime_cfg.device:
-        device = torch.device(runtime_cfg.device)
-    elif torch.cuda.is_available():
-        device = torch.device("cuda")
+    task_name = args_cli.task or _resolve_task_name(cfg)
+    num_envs = args_cli.num_envs if args_cli.num_envs is not None else _resolve_num_envs(cfg, runtime_cfg)
+    seed = args_cli.seed if args_cli.seed is not None else runtime_cfg.seed
+    device = _normalize_device(args_cli.device or runtime_cfg.device)
+    checkpoint_path = args_cli.checkpoint or runtime_cfg.resume
+
+    if not _cli_option_present(argv_list, "--headless"):
+        args_cli.headless = resolve_headless_mode(runtime_cfg.headless, os.environ)
     else:
-        device = torch.device("cpu")
-    print(f"🖥️  计算设备: {device}")
+        args_cli.headless = resolve_headless_mode(bool(args_cli.headless), os.environ)
+    if not _cli_option_present(argv_list, "--device"):
+        args_cli.device = device
+    if args_cli.video:
+        args_cli.enable_cameras = True
 
-    # ── 随机种子 ─────────────────────────────────────────────
-    torch.manual_seed(runtime_cfg.seed)
-    np.random.seed(runtime_cfg.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(runtime_cfg.seed)
-
-    t_cfg = cfg.get("training", {})
-    debug_cfg = t_cfg.get("debug", {})
-
-    n_envs = runtime_cfg.num_envs or t_cfg.get("num_envs", 4)
-    total_steps = t_cfg.get("total_steps", 10_000_000)
-    n_steps_per_rollout = t_cfg.get("n_steps_per_rollout", 128)
-    ckpt_interval = t_cfg.get("checkpoint_interval", 50)
-    log_interval = t_cfg.get("log_interval", 1)
-    requested_headless = runtime_cfg.headless or ("--headless" in sys.argv[1:])
-    headless = resolve_headless_mode(requested_headless, os.environ)
-    enable_cameras = False  # door geometry replaces visual embedding; cameras not needed
-
-    print(f"📋 训练配置:")
-    print(f"   并行环境数: {n_envs}")
-    print(f"   总步数: {total_steps:,}")
-    print(f"   每轮采集步数: {n_steps_per_rollout}")
-    print(f"   无头模式: {headless}")
-    print(f"   随机种子: {runtime_cfg.seed}")
-
-    simulation_app = launch_simulation_app(
-        headless=headless,
-        enable_cameras=enable_cameras,
-        import_error_message=(
-            "未检测到 isaacsim 运行时，train.py 将继续使用当前 Python 环境。"
-        ),
+    env_cfg = build_env_cfg(cfg, n_envs=num_envs, device=device, seed=seed, task_name=task_name)
+    runtime_cfg = TrainRuntimeConfig(
+        headless=args_cli.headless,
+        device=device,
+        seed=seed,
+        resume=Path(checkpoint_path) if checkpoint_path is not None else None,
+        log_dir=runtime_cfg.log_dir,
+        num_envs=num_envs,
     )
-    if simulation_app is not None:
-        mode = "headless" if headless else "windowed"
-        print(f"✅ Isaac Sim 已启动 ({mode})")
-
-    # ── 构建环境 ─────────────────────────────────────────────
-    # GPU 批量并行环境（DirectRLEnv）— 唯一训练路径
-    from affordance_guided_interaction.envs.door_push_env import DoorPushEnv
-    from affordance_guided_interaction.envs.direct_rl_env_adapter import DirectRLEnvAdapter
-
-    env_cfg = build_env_cfg(
+    agent_cfg = build_rl_games_agent_cfg(
         cfg,
-        n_envs,
-        device=str(device),
-        seed=runtime_cfg.seed,
-        enable_cameras=enable_cameras,
-    )
-    _direct_env = DoorPushEnv(cfg=env_cfg)
-    envs = DirectRLEnvAdapter(_direct_env)
-    print(f"✅ 已创建 {n_envs} 个 GPU 批量并行环境 (DirectRLEnv)")
-
-    # ── 构建模型 ─────────────────────────────────────────────
-    actor, critic, actor_cfg = build_models(cfg, device)
-    n_actor_params = sum(p.numel() for p in actor.parameters())
-    n_critic_params = sum(p.numel() for p in critic.parameters())
-    print(f"✅ Actor 参数量: {n_actor_params:,}")
-    print(f"✅ Critic 参数量: {n_critic_params:,}")
-
-    # ── 构建训练器 ────────────────────────────────────────────
-    ppo_trainer, ppo_cfg = build_ppo_trainer(actor, critic, cfg, device)
-
-    # ── 构建采集器 ────────────────────────────────────────────
-    collector, buffer, n_steps = build_collector(
-        actor, critic, actor_cfg, cfg, ppo_cfg, device
-    )
-    print(f"✅ RolloutCollector: n_steps={n_steps}, buffer={n_envs}×{n_steps}={n_envs * n_steps} transitions/iter")
-
-    # ── 课程管理器 ────────────────────────────────────────────
-    from affordance_guided_interaction.training.curriculum_manager import CurriculumManager
-    from affordance_guided_interaction.training.episode_stats import (
-        extract_curriculum_success_rate,
-    )
-    cur_cfg = cfg.get("curriculum", {})
-    curriculum = CurriculumManager(
-        window_size=cur_cfg.get("window_size", 50),
-        threshold=cur_cfg.get("threshold", 0.8),
-        initial_stage=cur_cfg.get("initial_stage"),
+        runtime_cfg,
+        task_name=task_name,
+        device=device,
+        checkpoint_path=checkpoint_path,
     )
 
-    # ── 域随机化器 ────────────────────────────────────────────
-    from affordance_guided_interaction.training.domain_randomizer import DomainRandomizer
-    randomizer = DomainRandomizer(seed=runtime_cfg.seed)
+    from isaaclab.app import AppLauncher
 
-    # ── 注入 episode 重采样回调 ─────────────────────────────────
-    # 让 auto-reset 时每个 done 的环境都能独立重新采样域参数和课程上下文，
-    # 而不是复用旧缓存（修复 episode 级域随机化）。
-    def _episode_reset_fn(env_idx: int):
-        stage_cfg = curriculum.get_stage_config()
-        domain_params = randomizer.sample_episode_params()
-        door_type = str(randomizer._rng.choice(stage_cfg.door_types))
-        left_occ, right_occ = stage_cfg.sample_occupancy_batch(1)
-        return domain_params, door_type, left_occ[0], right_occ[0]
-
-    envs.set_episode_reset_fn(_episode_reset_fn)
-
-    # ── 兼容旧接口（no-op）─────────────────────────────────────
-    # 当前默认路径下，step-level 噪声由 DoorPushEnv cfg 直接控制：
-    #   - 动作侧：position_target_noise_std
-    #   - 观测侧：obs_noise_std
-    # 外部 randomizer 只实际用于 episode 级 domain params 采样；
-    # set_randomizer() 仍保留为兼容接口，但在 DirectRLEnvAdapter 中是 no-op。
-    envs.set_randomizer(randomizer)
-
-    # ── 指标聚合器 ────────────────────────────────────────────
-    from affordance_guided_interaction.training.metrics import TrainingMetrics
-    metrics = TrainingMetrics()
-
-    # ── TensorBoard ──────────────────────────────────────────
-    run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    writer = None
-    try:
-        from torch.utils.tensorboard import SummaryWriter
-        run_name = f"ppo_{run_timestamp}"
-        writer = SummaryWriter(log_dir=str(runtime_cfg.log_dir / run_name))
-        print(f"📊 TensorBoard 日志: {runtime_cfg.log_dir / run_name}")
-    except ImportError:
-        print("⚠️ TensorBoard 不可用，跳过日志记录")
-
-    # ── 恢复 checkpoint ──────────────────────────────────────
-    start_iter = 0
-    global_steps = 0
-    best_success_rate = 0.0
-    ckpt_root_dir = runtime_cfg.ckpt_dir
-    ckpt_session_dir = _build_checkpoint_session_dir(ckpt_root_dir, run_timestamp)
-    print(f"💾 Checkpoint 目录: {ckpt_session_dir}")
-
-    if runtime_cfg.resume is not None:
-        resume_path = runtime_cfg.resume
-        if resume_path.exists():
-            start_iter, global_steps, best_success_rate = load_checkpoint(
-                resume_path, actor, critic, ppo_trainer, curriculum, device
-            )
-        else:
-            print(f"⚠️ Checkpoint 文件不存在: {resume_path}，从头开始训练")
-
-    # ── 初始化环境 ────────────────────────────────────────────
-    initial_stage_cfg = curriculum.get_stage_config()
-    print(f"✅ 初始课程阶段: {initial_stage_cfg.name} ({initial_stage_cfg.description})")
-    domain_params_list, door_types, left_occupied, right_occupied = (
-        build_curriculum_reset_batch(initial_stage_cfg, randomizer, n_envs)
-    )
-
-    if hasattr(envs, "reset_batch"):
-        actor_obs_list, critic_obs_list = envs.reset_batch(
-            domain_params_list=domain_params_list,
-            door_types=door_types,
-            left_occupied_list=left_occupied,
-            right_occupied_list=right_occupied,
-        )
-    else:
-        actor_obs_list, critic_obs_list = envs.reset(
-            domain_params_list=domain_params_list,
-            door_types=door_types,
-            left_occupied_list=left_occupied,
-            right_occupied_list=right_occupied,
-        )
-    collector.reset_hidden(n_envs)
-
-    # ═══════════════════════════════════════════════════════════════════
-    # 训练主循环
-    # ═══════════════════════════════════════════════════════════════════
-
-    max_iterations = total_steps // (n_envs * n_steps_per_rollout) + 1
-    print(f"\n🚀 开始训练（最大 {max_iterations:,} 轮迭代）\n{'─' * 70}")
-    t_start = time.time()
-    iteration = start_iter  # 用于 finally 块
+    app_launcher = AppLauncher(args_cli)
+    simulation_app = app_launcher.app
 
     try:
-        for iteration in range(start_iter, max_iterations):
-            iter_start = time.time()
+        import gymnasium as gym
+        from rl_games.common import env_configurations, vecenv
+        from rl_games.common.algo_observer import IsaacAlgoObserver
+        from rl_games.torch_runner import Runner
 
-            # ── Step 1: 轨迹采集 ──────────────────────────────
-            collect_start = time.time()
-            actor_obs_list, critic_obs_list, collect_stats = collector.collect(
-                envs=envs,
-                n_steps=n_steps,
-                current_actor_obs=actor_obs_list,
-                current_critic_obs=critic_obs_list,
-            )
-            rollout_s = time.time() - collect_start
+        from isaaclab.utils.io import dump_yaml
+        from isaaclab_rl.rl_games import RlGamesGpuEnv, RlGamesVecEnvWrapper
 
-            # ── Step 2: 计算 GAE ──────────────────────────────
-            buffer.compute_gae(
-                gamma=ppo_cfg.gamma,
-                lam=ppo_cfg.lam,
-                last_values=collector.last_values,
-                last_dones=collector.last_dones,
-            )
+        _ensure_tasks_registered()
 
-            # ── Step 3: PPO 参数更新 ──────────────────────────
-            update_start = time.time()
-            update_metrics = ppo_trainer.update(buffer)
-            update_s = time.time() - update_start
+        config_name = agent_cfg["params"]["config"]["name"]
+        log_root_path = (runtime_cfg.log_dir / _DEFAULT_LOG_ROOT / config_name).resolve()
+        run_name = agent_cfg["params"]["config"].get("full_experiment_name") or datetime.now().strftime(
+            "%Y-%m-%d_%H-%M-%S"
+        )
+        run_dir = log_root_path / run_name
 
-            # ── Step 4: 更新全局步数计数器 & 学习率衰减 ──────────
-            steps_this_iter = n_envs * n_steps
-            global_steps += steps_this_iter
-            ppo_trainer.step_lr(global_steps)
+        agent_cfg["params"]["config"]["train_dir"] = str(log_root_path)
+        agent_cfg["params"]["config"]["full_experiment_name"] = run_name
+        env_cfg.log_dir = str(run_dir)
 
-            # ── Step 5: 指标更新 ──────────────────────────────
-            metrics.update_ppo(
-                actor_loss=update_metrics["actor_loss"],
-                critic_loss=update_metrics["critic_loss"],
-                entropy=update_metrics["entropy"],
-                clip_fraction=update_metrics["clip_fraction"],
-                approx_kl=update_metrics["approx_kl"],
-                explained_variance=update_metrics["explained_variance"],
-            )
+        dump_yaml(run_dir / "params" / "env.yaml", env_cfg)
+        dump_yaml(run_dir / "params" / "agent.yaml", agent_cfg)
+        dump_yaml(run_dir / "params" / "project.yaml", cfg)
 
-            iter_time = time.time() - iter_start
-            fps = steps_this_iter / max(iter_time, 1e-6)
+        rl_device = agent_cfg["params"]["config"]["device"]
+        clip_obs = agent_cfg["params"]["env"].get("clip_observations", math.inf)
+        clip_actions = agent_cfg["params"]["env"].get("clip_actions", math.inf)
 
-            # ── Step 6: 课程管理器跃迁判定 ─────────────────────
-            mean_reward = collect_stats.get("collect/mean_reward", 0.0)
-            completed_eps = collect_stats.get("collect/completed_episodes", 0.0)
-            successful_eps = collect_stats.get("collect/successful_episodes", 0.0)
-            epoch_success_rate = extract_curriculum_success_rate(collect_stats)
+        env = gym.make(task_name, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+        if args_cli.video:
+            video_kwargs = {
+                "video_folder": str(run_dir / "videos" / "train"),
+                "step_trigger": lambda step: step % args_cli.video_interval == 0,
+                "video_length": args_cli.video_length,
+                "disable_logger": True,
+            }
+            env = gym.wrappers.RecordVideo(env, **video_kwargs)
 
-            best_success_rate = max(best_success_rate, epoch_success_rate)
-            stage_changed = curriculum.report_epoch(epoch_success_rate)
+        start_time = time.time()
+        env = RlGamesVecEnvWrapper(env, rl_device, clip_obs, clip_actions)
+        vecenv.register(
+            "IsaacRlgWrapper",
+            lambda config_name, num_actors, **kwargs: RlGamesGpuEnv(config_name, num_actors, **kwargs),
+        )
+        env_configurations.register("rlgpu", {"vecenv_type": "IsaacRlgWrapper", "env_creator": lambda **kwargs: env})
 
-            if stage_changed:
-                new_stage_cfg = curriculum.get_stage_config()
-                print(f"\n📈 课程阶段跃迁 → {new_stage_cfg.name}: {new_stage_cfg.description}")
-                # 新阶段参数通过 _episode_reset_fn 在各 env 下一次 reset 时逐 env 注入，
-                # 无需立即覆盖正在运行的 episode（H3 修复）
-                _save_stage_transition_checkpoint(
-                    save_fn=save_checkpoint,
-                    ckpt_session_dir=ckpt_session_dir,
-                    new_stage_name=new_stage_cfg.name,
-                    iteration=iteration,
-                    global_steps=global_steps,
-                    actor=actor,
-                    critic=critic,
-                    trainer=ppo_trainer,
-                    curriculum=curriculum,
-                    best_success_rate=best_success_rate,
-                )
+        agent_cfg["params"]["config"]["num_actors"] = env.unwrapped.num_envs
 
-            # ── Step 7: 控制台日志 ────────────────────────────
-            if iteration % log_interval == 0:
-                elapsed = time.time() - t_start
-                eta_sec = elapsed / max(iteration - start_iter + 1, 1) * (max_iterations - iteration)
-                eta_h = eta_sec / 3600
+        runner = Runner(IsaacAlgoObserver())
+        runner.load(agent_cfg)
+        runner.reset()
 
-                print(
-                    f"[Iter {iteration:>6d}] "
-                    f"steps={global_steps:>10,} | "
-                    f"fps={fps:>6.0f} | "
-                    f"a_loss={update_metrics['actor_loss']:>8.4f} | "
-                    f"c_loss={update_metrics['critic_loss']:>8.4f} | "
-                    f"ent={update_metrics['entropy']:>7.4f} | "
-                    f"clip={update_metrics['clip_fraction']:>5.3f} | "
-                    f"r̄={mean_reward:>.4f} | "
-                    f"succ={epoch_success_rate:>5.3f} | "
-                    f"rollout={rollout_s:>5.2f}s | "
-                    f"update={update_s:>5.2f}s | "
-                    f"stage={curriculum.current_stage} | "
-                    f"ETA={eta_h:.1f}h"
-                )
+        run_kwargs = {"train": True, "play": False, "sigma": None}
+        if checkpoint_path is not None:
+            run_kwargs["checkpoint"] = str(checkpoint_path)
+        runner.run(run_kwargs)
 
-            # ── Step 8: TensorBoard ───────────────────────────
-            if writer is not None:
-                writer.add_scalar("train/actor_loss", update_metrics["actor_loss"], global_steps)
-                writer.add_scalar("train/critic_loss", update_metrics["critic_loss"], global_steps)
-                writer.add_scalar("train/entropy", update_metrics["entropy"], global_steps)
-                writer.add_scalar("train/clip_fraction", update_metrics["clip_fraction"], global_steps)
-                writer.add_scalar("train/approx_kl", update_metrics["approx_kl"], global_steps)
-                writer.add_scalar("train/explained_variance", update_metrics["explained_variance"], global_steps)
-                writer.add_scalar("train/fps", fps, global_steps)
-                writer.add_scalar("timing/rollout_s", rollout_s, global_steps)
-                writer.add_scalar("timing/update_s", update_s, global_steps)
-                writer.add_scalar(
-                    "timing/env_steps_per_s",
-                    steps_this_iter / max(rollout_s, 1e-6),
-                    global_steps,
-                )
-                writer.add_scalar("collect/mean_reward", mean_reward, global_steps)
-                for tag, val in _iter_reward_scalar_tags(collect_stats):
-                    writer.add_scalar(tag, val, global_steps)
-                writer.add_scalar("collect/completed_episodes", completed_eps, global_steps)
-                writer.add_scalar("collect/successful_episodes", successful_eps, global_steps)
-                writer.add_scalar("collect/episode_success_rate", epoch_success_rate, global_steps)
-                writer.add_scalar(
-                    "collect/success_mixed",
-                    collect_stats.get("collect/success_mixed", epoch_success_rate),
-                    global_steps,
-                )
-                writer.add_scalar(
-                    "collect/success_none",
-                    collect_stats.get("collect/success_none", 0.0),
-                    global_steps,
-                )
-                writer.add_scalar(
-                    "collect/success_left_only",
-                    collect_stats.get("collect/success_left_only", 0.0),
-                    global_steps,
-                )
-                writer.add_scalar(
-                    "collect/success_right_only",
-                    collect_stats.get("collect/success_right_only", 0.0),
-                    global_steps,
-                )
-                writer.add_scalar(
-                    "collect/success_both",
-                    collect_stats.get("collect/success_both", 0.0),
-                    global_steps,
-                )
-                writer.add_scalar("curriculum/stage", curriculum.current_stage, global_steps)
-                writer.add_scalar("curriculum/window_mean", curriculum.window_mean, global_steps)
-
-                # 写入聚合指标
-                summary = metrics.summarize()
-                for key, val in summary.items():
-                    writer.add_scalar(f"metrics/{key}", val, global_steps)
-
-            # metrics 无论是否有 writer 都必须重置，否则列表无限增长（H4 修复）
-            metrics.reset()
-
-            # ── Step 9: Checkpoint 保存 ───────────────────────
-            if iteration > 0 and iteration % ckpt_interval == 0:
-                save_checkpoint(
-                    ckpt_session_dir / f"ckpt_iter_{iteration}.pt",
-                    iteration=iteration,
-                    global_steps=global_steps,
-                    actor=actor,
-                    critic=critic,
-                    trainer=ppo_trainer,
-                    curriculum=curriculum,
-                    best_success_rate=best_success_rate,
-                )
-
-            # ── Step 10: 清空 buffer 准备下轮采集 ─────────────
-            buffer.clear()
-
-            # 检查是否达到总步数
-            if global_steps >= total_steps:
-                print(f"\n✅ 达到总步数上限 {total_steps:,}，训练结束")
-                break
-
-    except KeyboardInterrupt:
-        print("\n\n⏹ 用户中断训练")
-
-    # ═══════════════════════════════════════════════════════════════════
-    # 清理与总结
-    # ═══════════════════════════════════════════════════════════════════
-
-    # 保存最终 checkpoint
-    save_checkpoint(
-        ckpt_session_dir / "ckpt_final.pt",
-        iteration=iteration,
-        global_steps=global_steps,
-        actor=actor,
-        critic=critic,
-        trainer=ppo_trainer,
-        curriculum=curriculum,
-        best_success_rate=best_success_rate,
-    )
-
-    elapsed = time.time() - t_start
-    print(f"\n{'═' * 70}")
-    print(f"📊 训练总结:")
-    print(f"   总用时: {elapsed / 3600:.2f} 小时")
-    print(f"   总步数: {global_steps:,}")
-    print(f"   平均 FPS: {global_steps / max(elapsed, 1):.0f}")
-    print(f"   最终课程阶段: {curriculum.current_stage_name}")
-    print(f"   课程窗口成功率: {curriculum.window_mean:.3f}")
-    print(f"{'═' * 70}")
-
-    # 资源释放
-    envs.close()
-    if writer is not None:
-        writer.close()
-    if simulation_app is not None:
+        print(f"Training time: {round(time.time() - start_time, 2)} seconds")
+        env.close()
+        return 0
+    finally:
         simulation_app.close()
 
-    return 0
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    from isaaclab.app import AppLauncher
+
+    parser = argparse.ArgumentParser(description="Train DoorPush with IsaacLab rl_games flow.")
+    parser.add_argument("--configs-dir", type=str, default=None, help="Path to the project configs root or one YAML.")
+    parser.add_argument("--task", type=str, default=None, help="Registered task name.")
+    parser.add_argument("--num_envs", type=int, default=None, help="Override the number of environments.")
+    parser.add_argument("--seed", type=int, default=None, help="Override the training seed.")
+    parser.add_argument("--checkpoint", type=str, default=None, help="Resume from a checkpoint path.")
+    parser.add_argument("--video", action="store_true", default=False, help="Record videos during training.")
+    parser.add_argument("--video_length", type=int, default=200, help="Length of each recorded video in steps.")
+    parser.add_argument("--video_interval", type=int, default=2000, help="Step interval between video captures.")
+    AppLauncher.add_app_launcher_args(parser)
+    return parser
+
+
+def _load_cfg_from_registry(task_name: str, entry_point_key: str) -> dict[str, Any] | object:
+    import gymnasium as gym
+
+    _ensure_tasks_registered()
+    spec = gym.spec(task_name.split(":")[-1])
+    cfg_entry_point = spec.kwargs.get(entry_point_key)
+    if cfg_entry_point is None:
+        agents = collections.defaultdict(list)
+        for key in spec.kwargs:
+            if key.endswith("_cfg_entry_point") and key != "env_cfg_entry_point":
+                parts = key.replace("_cfg_entry_point", "").replace("rl_games", "rl-games").split("_")
+                agent = parts[0].replace("-", "_")
+                algorithms = [item.upper() for item in (parts[1:] if len(parts) > 1 else ["PPO"])]
+                agents[agent].extend(algorithms)
+        details = ""
+        if agents:
+            details = "\nExisting RL config entry points:"
+            for agent, algorithms in agents.items():
+                details += f"\n  |-- {agent}: {', '.join(algorithms)}"
+        raise ValueError(
+            f"Could not find configuration for task '{task_name}' and entry point '{entry_point_key}'.{details}"
+        )
+
+    if isinstance(cfg_entry_point, str) and cfg_entry_point.endswith(".yaml"):
+        if os.path.exists(cfg_entry_point):
+            config_file = cfg_entry_point
+        else:
+            mod_name, file_name = cfg_entry_point.split(":")
+            mod_path = os.path.dirname(importlib.import_module(mod_name).__file__)
+            config_file = os.path.join(mod_path, file_name)
+        with open(config_file, encoding="utf-8") as f:
+            return yaml.full_load(f)
+
+    if callable(cfg_entry_point):
+        cfg_cls = cfg_entry_point()
+    elif isinstance(cfg_entry_point, str):
+        mod_name, attr_name = cfg_entry_point.split(":")
+        mod = importlib.import_module(mod_name)
+        cfg_cls = getattr(mod, attr_name)
+    else:
+        cfg_cls = cfg_entry_point
+
+    if callable(cfg_cls):
+        return cfg_cls()
+    return cfg_cls
+
+
+def _ensure_tasks_registered() -> None:
+    import affordance_guided_interaction.tasks  # noqa: F401
+
+
+def _resolve_task_name(cfg: dict[str, Any]) -> str:
+    return str(cfg.get("training", {}).get("task", DEFAULT_TASK_NAME))
+
+
+def _resolve_num_envs(cfg: dict[str, Any], runtime_cfg: TrainRuntimeConfig) -> int:
+    if runtime_cfg.num_envs is not None:
+        return int(runtime_cfg.num_envs)
+    if "num_envs" in cfg.get("training", {}):
+        return int(cfg["training"]["num_envs"])
+    raise ValueError("No num_envs configured in training YAML.")
+
+
+def _normalize_device(device: str | None) -> str:
+    if device is None:
+        return "cuda:0" if torch.cuda.is_available() else "cpu"
+    text = str(device).strip()
+    if text == "cuda":
+        return "cuda:0"
+    return text
+
+
+def _cli_option_present(argv: list[str], option_name: str) -> bool:
+    return any(arg == option_name or arg.startswith(f"{option_name}=") for arg in argv)
 
 
 if __name__ == "__main__":

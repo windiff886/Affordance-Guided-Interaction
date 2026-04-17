@@ -7,14 +7,13 @@ from typing import Any
 
 @dataclass(frozen=True)
 class TrainRuntimeConfig:
-    """Resolved runtime settings for ``scripts/train.py``."""
+    """Resolved runtime settings for the rl_games-only training entrypoint."""
 
     headless: bool
     device: str | None
     seed: int
     resume: Path | None
     log_dir: Path
-    ckpt_dir: Path
     num_envs: int | None
 
 
@@ -23,7 +22,7 @@ def resolve_train_runtime_config(
     *,
     project_root: Path,
 ) -> TrainRuntimeConfig:
-    """Resolve train runtime settings from the merged YAML config."""
+    """Resolve runtime settings from the merged training YAML."""
     t_cfg = cfg.get("training", {})
 
     return TrainRuntimeConfig(
@@ -32,9 +31,6 @@ def resolve_train_runtime_config(
         seed=int(t_cfg.get("seed", 42)),
         resume=_resolve_optional_path(project_root, t_cfg.get("resume")),
         log_dir=_resolve_required_path(project_root, t_cfg.get("log_dir", "runs")),
-        ckpt_dir=_resolve_required_path(
-            project_root, t_cfg.get("ckpt_dir", "checkpoints")
-        ),
         num_envs=_normalize_optional_int(t_cfg.get("num_envs")),
     )
 

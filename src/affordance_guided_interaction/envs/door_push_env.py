@@ -694,7 +694,7 @@ class DoorPushEnv(DirectRLEnv):
         truncated = self._step_count >= self.max_episode_length
 
         # C3: 在 auto-reset 之前将 per-env success 写入 extras，
-        # 供 DirectRLEnvAdapter 通过 info_dict 消费（reset 后状态已归零无法重读）
+        # 供训练侧在 reset 后仍能读取完成 episode 的成功标记。
         self.extras["success"] = angle_reached & ~cup_dropped
 
         # D7: 缓存 pre-reset occupancy，auto-reset 中 _episode_reset_fn 会覆写
@@ -921,6 +921,24 @@ class DoorPushEnv(DirectRLEnv):
         """
         self._left_occupied[:] = left_occupied
         self._right_occupied[:] = right_occupied
+
+    def get_debug_state(self) -> dict[str, Tensor]:
+        """返回当前环境调试状态，供手动验证脚本读取。"""
+        robot: Articulation = self.scene["robot"]
+        door: Articulation = self.scene["door"]
+        cup_dropped = self._check_cup_dropped()
+        door_angle = door.data.joint_pos[:, 0].clone()
+        episode_success = (door_angle >= self.cfg.door_angle_target) & ~cup_dropped
+
+        return {
+            "left_occupied": self._left_occupied.clone(),
+            "right_occupied": self._right_occupied.clone(),
+            "door_angle": door_angle,
+            "cup_dropped": cup_dropped,
+            "episode_success": episode_success,
+            "arm_joint_positions": robot.data.joint_pos[:, self._arm_joint_ids].clone(),
+            "arm_joint_targets": self._prev_joint_target.clone(),
+        }
 
     def set_episode_reset_fn(self, fn) -> None:
         """注册 auto-reset 回调，在 `_reset_idx()` 中逐 env 调用。"""

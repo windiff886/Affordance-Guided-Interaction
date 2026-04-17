@@ -1,49 +1,20 @@
-# ═══════════════════════════════════════════════════════════════════════
-# 训练管线超参数配置
-# 对应文档：src/affordance_guided_interaction/training/README.md
-# ═══════════════════════════════════════════════════════════════════════
-
-# ── 使用方式说明 ─────────────────────────────────────────────────────
-# 训练入口固定为：
-#   python scripts/train.py
-#
-# 所有运行参数都在本文件中修改，不再依赖命令行覆盖。
-#
-# ── 快捷切换说明 ─────────────────────────────────────────────────────
-# 只需要修改下面这 1 行里的 profile 引用：
-#   <<: [*runtime_defaults, *profile_env1024]
-#
-# 可选 profile：
-#   *profile_env256
-#   *profile_env512
-#   *profile_env1024
-#   *profile_env2048
-#   *profile_env4096
-#
-# 说明：
-# 1. runtime_defaults 提供公共运行时参数。
-# 2. 每个 profile 提供一整套可直接生效的训练参数。
-# 3. 4096 档为了控制单轮 batch，额外把 n_steps_per_rollout 调成 16。
-# 4. 当前默认激活的是 1024 档；切换时只改 merge 行里的锚点即可。
-
 runtime_defaults: &runtime_defaults
-  headless: true             # 是否以无窗口模式启动仿真
-  device: cuda              # null 表示自动选择 cuda/cpu
-  seed: 42                  # 全局随机种子
-  resume: null              # 恢复训练的 checkpoint 路径；null 表示从头开始
-  log_dir: runs             # TensorBoard 日志根目录
-  ckpt_dir: checkpoints     # checkpoint 根目录；实际输出到 checkpoints/checkpoints_<timestamp>/
+  headless: true
+  device: cuda
+  seed: 42
+  resume: null
+  log_dir: runs
 
 ppo_common: &ppo_common
-  gamma: 0.99               # 折扣因子 γ
-  lam: 0.95                 # GAE 偏差-方差权衡 λ
-  clip_eps: 0.2             # PPO-Clip 策略比率裁剪参数 ε
-  value_clip_eps: 0.2       # Value function 裁剪参数 ε_v
+  gamma: 0.99
+  lam: 0.95
+  clip_eps: 0.2
+  value_clip_eps: 0.2
   use_clipped_value_loss: true
-  entropy_coef: 0.01        # 熵正则化系数 c_e
-  value_coef: 0.5           # Critic 损失权重 c_v
-  max_grad_norm: 1.0        # 全局梯度范数上限 g_max
-  seq_length: 16            # TBPTT 截断长度 L
+  entropy_coef: 0.01
+  value_coef: 0.5
+  max_grad_norm: 1.0
+  seq_length: 16
   normalize_advantages: true
 
 profiles:
@@ -51,7 +22,6 @@ profiles:
     num_envs: 256
     total_steps: 500_000_000
     n_steps_per_rollout: 64
-    log_interval: 5
     checkpoint_interval: 100
     ppo:
       <<: *ppo_common
@@ -64,7 +34,6 @@ profiles:
     num_envs: 512
     total_steps: 400_000_000
     n_steps_per_rollout: 64
-    log_interval: 3
     checkpoint_interval: 75
     ppo:
       <<: *ppo_common
@@ -77,7 +46,6 @@ profiles:
     num_envs: 1024
     total_steps: 300_000_000
     n_steps_per_rollout: 64
-    log_interval: 2
     checkpoint_interval: 50
     ppo:
       <<: *ppo_common
@@ -90,7 +58,6 @@ profiles:
     num_envs: 2048
     total_steps: 200_000_000
     n_steps_per_rollout: 64
-    log_interval: 1
     checkpoint_interval: 25
     ppo:
       <<: *ppo_common
@@ -103,7 +70,6 @@ profiles:
     num_envs: 4096
     total_steps: 300_000_000
     n_steps_per_rollout: 16
-    log_interval: 1
     checkpoint_interval: 20
     ppo:
       <<: *ppo_common
@@ -112,10 +78,4 @@ profiles:
       num_mini_batches: 16
       num_epochs: 3
 
-# ── 当前生效值（切换这里即可）────────────────────────────────────────
 <<: [*runtime_defaults, *profile_env4096]
-
-# ── 调试选项 ──────────────────────────────────────────────────────────
-debug:
-  strict_mode: true         # 正式训练设 true → 缺 Isaac Lab 时直接报错退出
-                             # 本地开发设 false → 保持 placeholder 退化行为

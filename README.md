@@ -170,56 +170,19 @@ ppo:
 ```
 Affordance-Guided-Interaction/
 ├── scripts/
-│   ├── train.py                  # 训练入口
-│   ├── evaluate.py               # 评估（开发中）
-│   ├── export_policy.py          # 策略导出
-│   ├── load_scene.py             # Isaac Sim 场景加载/调试
-│   └── rollout_demo.py           # Rollout 可视化
+│   └── train.py                  # rl_games 训练入口
 ├── src/affordance_guided_interaction/
-│   ├── envs/                     # GPU 并行环境（DirectRLEnv）
-│   │   ├── door_push_env.py      #   DoorPushEnv — 自包含环境（obs/rew/term/init）
-│   │   ├── door_push_env_cfg.py  #   DoorPushEnvCfg + DoorPushSceneCfg 声明式配置
-│   │   ├── direct_rl_env_adapter.py  # DirectRLEnvAdapter — VecEnvProtocol 桥接
-│   │   ├── batch_math.py         #   GPU 批量坐标变换工具
-│   │   └── Reward.md             #   奖励函数数学参考文档
-│   ├── observations/             # 观测工具类
-│   │   ├── history_buffer.py     #   HistoryBuffer — 历史帧缓冲
-│   │   └── stability_proxy.py    #   StabilityProxy — 稳定性评估
-│   ├── policy/                   # Actor-Critic 网络
-│   │   ├── actor.py              #   Actor（GRU + 分支输出）
-│   │   ├── critic.py             #   Critic（非对称 MLP）
-│   │   ├── recurrent_backbone.py #   GRU 循环骨干
-│   │   └── action_head.py        #   动作分布头
-│   ├── training/                 # PPO 训练组件
-│   │   ├── ppo_trainer.py        #   PPOTrainer — 优化器
-│   │   ├── rollout_collector.py  #   RolloutCollector — 轨迹采集
-│   │   ├── rollout_buffer.py     #   RolloutBuffer — 经验存储
-│   │   ├── curriculum_manager.py #   CurriculumManager — 课程跃迁
-│   │   ├── domain_randomizer.py  #   DomainRandomizer — 域随机化
-│   │   ├── episode_stats.py      #   EpisodeStats — 回合统计
-│   │   ├── metrics.py            #   Metrics — TensorBoard 日志
-│   │   ├── evaluation.py         #   Evaluation — 评估管线
-│   │   └── perception_runtime.py #   [历史] 视觉推理桥接（默认训练不使用）
-│   ├── door_perception/          # [历史] 视觉感知模块（默认训练不使用）
-│   │   ├── affordance_pipeline.py #  Affordance 检测管线
-│   │   ├── frozen_encoder.py     #   冻结视觉编码器
-│   │   ├── segmentation.py       #   门体分割
-│   │   ├── depth_projection.py   #   深度点云投影
-│   │   ├── config.py             #   感知配置
-│   │   └── debug_visualizer.py   #   调试可视化
-│   └── utils/                    # 工具函数
-│       ├── train_runtime_config.py # 训练运行时配置解析
-│       ├── sim_runtime.py        #   SimulationApp 启动辅助
-│       ├── usd_assets.py         #   USD 资产加载
-│       ├── usd_math.py           #   USD 数学工具
-│       ├── paths.py              #   项目路径常量
-│       ├── pose_alignment.py     #   位姿对齐工具
-│       └── runtime_env.py        #   运行环境检测
+│   ├── envs/                     # DoorPush DirectRLEnv 及配置
+│   ├── tasks/                    # Gym task registry + rl_games agent 配置
+│   └── utils/
+│       ├── runtime_env.py        # 运行环境与 headless 解析
+│       └── train_runtime_config.py # 训练运行时配置解析
 ├── src/teleop_cup_grasp/         # 杯体抓取遥操作（独立模块）
-├── configs/                      # YAML 配置文件
+├── configs/                      # 训练链路 YAML 配置
 ├── assets/                       # USD 仿真资产
 ├── model/                        # 预训练权重
-├── docs/                         # 设计文档
+├── docs/                         # 当前流程文档
+```
 └── checkpoints/                  # 训练 checkpoint（自动生成）
 ```
 
