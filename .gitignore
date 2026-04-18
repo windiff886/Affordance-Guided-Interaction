@@ -10,3 +10,4 @@ checkpoints/
 tests/
 artifacts/
 .vscode/
+pyrightconfig.json

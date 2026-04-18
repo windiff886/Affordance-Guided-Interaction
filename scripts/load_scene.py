@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Sequence
@@ -22,9 +24,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.train import DEFAULT_TASK_NAME, _ensure_tasks_registered, build_env_cfg, load_config
-from affordance_guided_interaction.utils.runtime_env import resolve_headless_mode
+from affordance_guided_interaction.utils.runtime_env import (
+    configure_omniverse_client_environment,
+    resolve_headless_mode,
+)
 from affordance_guided_interaction.utils.train_runtime_config import resolve_train_runtime_config
 
 ACTION_DIM = 12
@@ -66,6 +73,11 @@ class UiJointTargetDevice:
 
     def reset(self) -> None:
         self._action_values[:] = [0.0] * ACTION_DIM
+
+    def set_action_values(self, values: Sequence[float]) -> None:
+        if len(values) != ACTION_DIM:
+            raise ValueError(f"Expected {ACTION_DIM} action values, got {len(values)}.")
+        self._action_values[:] = [float(value) for value in values]
 
     def add_callback(self, key: str, func: Any) -> None:
         self._callbacks[key] = func
@@ -134,7 +146,12 @@ class ManualDoorPushController:
             torch.tensor([right_occ], dtype=torch.bool, device=self.base_env.device),
         )
         self.env.reset()
+        self._sync_device_actions_to_current_pose()
         self.pending_reset_mode = None
+
+    def _sync_device_actions_to_current_pose(self) -> None:
+        state = self.base_env.get_debug_state()
+        self.device.set_action_values(_extract_manual_action_values(state))
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -143,7 +160,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Manual single-env DoorPush scene loader.")
     parser.add_argument("--configs-dir", type=str, default=None, help="Path to the project configs root or one YAML.")
     parser.add_argument("--task", type=str, default=DEFAULT_TASK_NAME, help="Registered task name.")
-    parser.add_argument("--device", type=str, default=None, help="Override the simulation device.")
     parser.add_argument("--seed", type=int, default=None, help="Override the environment seed.")
     AppLauncher.add_app_launcher_args(parser)
     return parser
@@ -233,6 +249,41 @@ def _joint_slider_label(name: str) -> str:
     )
 
 
+def _manual_window_kwargs() -> dict[str, Any]:
+    """Window options for the standalone manual control panel."""
+    return {
+        "width": 520,
+        "height": 960,
+        "visible": True,
+    }
+
+
+def _extract_manual_action_values(state: dict[str, Any]) -> list[float]:
+    """Convert the single-env debug state into absolute arm joint targets for the UI device."""
+    arm_joint_positions = torch.as_tensor(state["arm_joint_positions"], dtype=torch.float32)
+    if arm_joint_positions.ndim != 2 or arm_joint_positions.shape[1] != ACTION_DIM:
+        raise ValueError(
+            "Expected 'arm_joint_positions' to have shape (num_envs, 12) for manual control sync."
+        )
+    return arm_joint_positions[0].detach().cpu().tolist()
+
+
+def _sync_slider_models(slider_models: Sequence[Any], action_values: Sequence[float]) -> None:
+    """Mirror controller action values into the UI sliders after programmatic resets."""
+    if len(slider_models) != len(action_values):
+        raise ValueError("slider_models and action_values must have the same length.")
+    for model, value in zip(slider_models, action_values, strict=True):
+        target = float(value)
+        if abs(model.get_value_as_float() - target) > 1.0e-9:
+            model.set_value(target)
+
+
+def _retain_manual_window_reference(controller: ManualDoorPushController, window: Any) -> Any:
+    """Keep a strong reference to the standalone omni.ui window for the process lifetime."""
+    controller._manual_window = window
+    return window
+
+
 def _build_ui(controller: ManualDoorPushController) -> tuple[list[Any], Any, Any]:
     import omni.ui as ui
 
@@ -241,7 +292,10 @@ def _build_ui(controller: ManualDoorPushController) -> tuple[list[Any], Any, Any
     arm_joint_names = [robot.joint_names[idx] for idx in arm_joint_ids]
     joint_limits = robot.data.soft_joint_pos_limits[0, arm_joint_ids].detach().cpu()
 
-    window = ui.Window("DoorPush Manual Validation", width=520, height=960)
+    window = _retain_manual_window_reference(
+        controller,
+        ui.Window("DoorPush Manual Validation", **_manual_window_kwargs()),
+    )
     slider_models: list[Any] = []
     slider_labels: list[Any] = []
     status_label = None
@@ -296,6 +350,68 @@ def _build_ui(controller: ManualDoorPushController) -> tuple[list[Any], Any, Any
     return slider_models, slider_labels, status_label, pause_button
 
 
+def _prepare_visual_launch_env(env: dict[str, str]) -> None:
+    """Prepare a writable Omniverse runtime and require a usable local GUI display."""
+    configure_omniverse_client_environment(env)
+    if resolve_headless_mode(False, env):
+        display = str(env.get("DISPLAY", "")).strip() or "<unset>"
+        wayland_display = str(env.get("WAYLAND_DISPLAY", "")).strip() or "<unset>"
+        raise RuntimeError(
+            "scripts/load_scene.py requires a local GUI display. "
+            f"Resolved DISPLAY={display}, WAYLAND_DISPLAY={wayland_display}."
+        )
+    _assert_local_display_access(env)
+
+    env["HEADLESS"] = "0"
+    env["LIVESTREAM"] = "0"
+    env["ENABLE_CAMERAS"] = "0"
+
+
+def _assert_local_display_access(env: dict[str, str]) -> None:
+    """Fail fast when X11 appears configured but is not usable by this process."""
+    display = str(env.get("DISPLAY", "")).strip()
+    if not display:
+        return
+
+    probe_cmd: list[str] | None = None
+    if shutil.which("xset") is not None:
+        probe_cmd = ["xset", "q"]
+    elif shutil.which("xdpyinfo") is not None:
+        probe_cmd = ["xdpyinfo"]
+
+    if probe_cmd is None:
+        return
+
+    result = subprocess.run(
+        probe_cmd,
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=3,
+        check=False,
+    )
+    if result.returncode != 0:
+        message = result.stderr.strip() or f"{probe_cmd[0]} exited with status {result.returncode}"
+        raise RuntimeError(
+            "scripts/load_scene.py cannot access the X11 display exported to this process. "
+            f"DISPLAY={display}. Probe error: {message}"
+        )
+
+
+def _configure_visual_app_launcher_args(args_cli: argparse.Namespace, *, device: str) -> None:
+    """Force the IsaacLab AppLauncher into local GUI mode for manual scene control."""
+    args_cli.headless = False
+    args_cli.livestream = 0
+    args_cli.enable_cameras = False
+    args_cli.device = device
+
+
+def _configure_env_cfg_for_manual_ui(env_cfg: Any) -> None:
+    """Disable IsaacLab's default environment window for this standalone manual UI."""
+    env_cfg.ui_window_class_type = None
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _build_arg_parser()
     args_cli = parser.parse_args(list(sys.argv[1:] if argv is None else argv))
@@ -304,13 +420,13 @@ def main(argv: list[str] | None = None) -> int:
     runtime_cfg = resolve_train_runtime_config(cfg, project_root=PROJECT_ROOT)
     seed = args_cli.seed if args_cli.seed is not None else runtime_cfg.seed
     device = args_cli.device or runtime_cfg.device or "cuda:0"
+    _prepare_visual_launch_env(os.environ)
+    _configure_visual_app_launcher_args(args_cli, device=device)
 
-    if "--headless" not in (argv or sys.argv[1:]):
-        args_cli.headless = resolve_headless_mode(False, os.environ)
-    else:
-        args_cli.headless = resolve_headless_mode(bool(args_cli.headless), os.environ)
-    args_cli.device = device
-    args_cli.enable_cameras = False
+    from isaaclab.app import AppLauncher
+
+    app_launcher = AppLauncher(args_cli)
+    simulation_app = app_launcher.app
 
     env_cfg = build_env_cfg(
         cfg,
@@ -319,11 +435,7 @@ def main(argv: list[str] | None = None) -> int:
         seed=seed,
         task_name=args_cli.task,
     )
-
-    from isaaclab.app import AppLauncher
-
-    app_launcher = AppLauncher(args_cli)
-    simulation_app = app_launcher.app
+    _configure_env_cfg_for_manual_ui(env_cfg)
 
     env = None
     try:
@@ -336,13 +448,17 @@ def main(argv: list[str] | None = None) -> int:
         controller.initialize()
 
         slider_models, slider_labels, status_label, pause_button = _build_ui(controller)
+        _sync_slider_models(slider_models, controller.device.action_values)
 
         while simulation_app.is_running():
+            simulation_app.update()
+            controller.tick()
+            _sync_slider_models(slider_models, controller.device.action_values)
+
             for idx, model in enumerate(slider_models):
                 value = model.get_value_as_float()
                 slider_labels[idx].text = f"{value:+.3f}"
 
-            controller.tick()
             pause_button.text = "Resume" if controller.paused else "Pause"
             status_label.text = _format_status_text(controller)
 

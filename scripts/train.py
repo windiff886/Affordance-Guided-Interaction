@@ -297,6 +297,11 @@ def main(argv: list[str] | None = None) -> int:
     if args_cli.video:
         args_cli.enable_cameras = True
 
+    from isaaclab.app import AppLauncher
+
+    app_launcher = AppLauncher(args_cli)
+    simulation_app = app_launcher.app
+
     env_cfg = build_env_cfg(cfg, n_envs=num_envs, device=device, seed=seed, task_name=task_name)
     runtime_cfg = TrainRuntimeConfig(
         headless=args_cli.headless,
@@ -313,11 +318,6 @@ def main(argv: list[str] | None = None) -> int:
         device=device,
         checkpoint_path=checkpoint_path,
     )
-
-    from isaaclab.app import AppLauncher
-
-    app_launcher = AppLauncher(args_cli)
-    simulation_app = app_launcher.app
 
     try:
         import gymnasium as gym
@@ -341,9 +341,9 @@ def main(argv: list[str] | None = None) -> int:
         agent_cfg["params"]["config"]["full_experiment_name"] = run_name
         env_cfg.log_dir = str(run_dir)
 
-        dump_yaml(run_dir / "params" / "env.yaml", env_cfg)
-        dump_yaml(run_dir / "params" / "agent.yaml", agent_cfg)
-        dump_yaml(run_dir / "params" / "project.yaml", cfg)
+        dump_yaml(str(run_dir / "params" / "env.yaml"), env_cfg)
+        dump_yaml(str(run_dir / "params" / "agent.yaml"), agent_cfg)
+        dump_yaml(str(run_dir / "params" / "project.yaml"), cfg)
 
         rl_device = agent_cfg["params"]["config"]["device"]
         clip_obs = agent_cfg["params"]["env"].get("clip_observations", math.inf)
