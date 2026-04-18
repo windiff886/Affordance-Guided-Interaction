@@ -52,14 +52,39 @@ def build_action_tensor(action_values: Sequence[float], *, device: str | torch.d
     return torch.tensor([list(action_values)], dtype=torch.float32, device=device)
 
 
-class ManualDoorPushController:
-    """Bridge between omni.ui widgets and the training environment."""
+class UiJointTargetDevice:
+    """UI-backed manual device that mirrors IsaacLab teleop device semantics."""
 
-    def __init__(self, env: Any, simulation_app: Any) -> None:
+    def __init__(self, *, sim_device: str | torch.device) -> None:
+        self._sim_device = str(sim_device)
+        self._action_values = [0.0] * ACTION_DIM
+        self._callbacks: dict[str, Any] = {}
+
+    @property
+    def action_values(self) -> list[float]:
+        return list(self._action_values)
+
+    def reset(self) -> None:
+        self._action_values[:] = [0.0] * ACTION_DIM
+
+    def add_callback(self, key: str, func: Any) -> None:
+        self._callbacks[key] = func
+
+    def set_action_value(self, index: int, value: float) -> None:
+        self._action_values[index] = float(value)
+
+    def advance(self) -> torch.Tensor:
+        return build_action_tensor(self._action_values, device=self._sim_device).squeeze(0)
+
+
+class ManualDoorPushController:
+    """Bridge between a manual device and the training environment."""
+
+    def __init__(self, env: Any, simulation_app: Any, device: UiJointTargetDevice) -> None:
         self.env = env
         self.base_env = env.unwrapped
         self.simulation_app = simulation_app
-        self.action_values = [0.0] * ACTION_DIM
+        self.device = device
         self.paused = False
         self.pending_reset_mode: str | None = None
         self.last_step_info: dict[str, Any] = {}
@@ -69,10 +94,7 @@ class ManualDoorPushController:
         self.pending_reset_mode = mode
 
     def zero_actions(self) -> None:
-        self.action_values[:] = [0.0] * ACTION_DIM
-
-    def set_action_value(self, index: int, value: float) -> None:
-        self.action_values[index] = float(value)
+        self.device.reset()
 
     def toggle_pause(self) -> None:
         self.paused = not self.paused
@@ -88,7 +110,7 @@ class ManualDoorPushController:
             self.refresh_debug_state()
             return
 
-        action = build_action_tensor(self.action_values, device=self.base_env.device)
+        action = self.device.advance().unsqueeze(0)
         _, _, _, _, info = self.env.step(action)
         self.last_step_info = info if isinstance(info, dict) else {}
         self.refresh_debug_state()
@@ -197,7 +219,7 @@ def _format_status_text(controller: ManualDoorPushController) -> str:
         *tracking_lines,
         "",
         "ui_action:",
-        ", ".join(f"{value:+.3f}" for value in controller.action_values),
+        ", ".join(f"{value:+.3f}" for value in controller.device.action_values),
     ]
     return "\n".join(lines)
 
@@ -248,6 +270,11 @@ def _build_ui(controller: ManualDoorPushController) -> tuple[list[Any], Any, Any
                 for idx, joint_name in enumerate(arm_joint_names):
                     model = ui.SimpleFloatModel(0.0)
                     slider_models.append(model)
+                    model.add_value_changed_fn(
+                        lambda m, action_index=idx: controller.device.set_action_value(
+                            action_index, m.get_value_as_float()
+                        )
+                    )
                     slider_labels.append(
                         _make_slider_row(
                             ui=ui,
@@ -304,7 +331,8 @@ def main(argv: list[str] | None = None) -> int:
 
         _ensure_tasks_registered()
         env = gym.make(args_cli.task, cfg=env_cfg, render_mode=None)
-        controller = ManualDoorPushController(env, simulation_app)
+        device = UiJointTargetDevice(sim_device=env.unwrapped.device)
+        controller = ManualDoorPushController(env, simulation_app, device)
         controller.initialize()
 
         slider_models, slider_labels, status_label, pause_button = _build_ui(controller)
@@ -312,7 +340,6 @@ def main(argv: list[str] | None = None) -> int:
         while simulation_app.is_running():
             for idx, model in enumerate(slider_models):
                 value = model.get_value_as_float()
-                controller.set_action_value(idx, value)
                 slider_labels[idx].text = f"{value:+.3f}"
 
             controller.tick()
