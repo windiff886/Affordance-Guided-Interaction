@@ -31,6 +31,8 @@ safety:
   beta_target: 0.2           # 目标角边界带惩罚系数
   target_margin_ratio: 0.05   # 距离上下限 5% 范围内开始惩罚
   beta_joint_move: 0.1        # 关节移动惩罚系数
+  beta_cup_door_prox: 1.0    # 杯体-门板接近惩罚系数
+  cup_door_prox_threshold: 0.05  # 杯体-门板距离阈值 (m)
   w_drop: 100.0              # 杯体脱落惩罚
   mu_base: 0.9               # 底盘速度触发比例（相对各轴速度上限）
   beta_base_speed: 0.0       # 底盘速度惩罚系数

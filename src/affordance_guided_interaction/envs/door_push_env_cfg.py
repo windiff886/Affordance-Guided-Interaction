@@ -85,6 +85,10 @@ BASE_LINK_NAME: str = "base_link"
 LEFT_EE_LINK_NAME: str = "left_gripperMover"
 RIGHT_EE_LINK_NAME: str = "right_gripperMover"
 
+# 移动底盘静止落地时的 base_link 高度：
+# wheel axis z (0.035145 m) + wheel radius (0.050 m) = 0.085145 m
+BASE_LINK_SPAWN_HEIGHT: float = 0.085145
+
 # 门板 body 名称
 DOOR_LEAF_BODY_NAME: str = "DoorLeaf"
 
@@ -226,7 +230,7 @@ class DoorPushSceneCfg(InteractiveSceneCfg):
         ),
         init_state=ArticulationCfg.InitialStateCfg(
             # 标称初始位置：推板正前方，在采样范围中心
-            pos=(3.72, 0.27, 0.12),
+            pos=(3.72, 0.27, BASE_LINK_SPAWN_HEIGHT),
             rot=(0.0, 0.0, 0.0, 1.0),  # wxyz 180° yaw — 匹配 scene_factory
             joint_pos={
                 "left_joint.*": 0.0,
@@ -437,7 +441,7 @@ class DoorPushEnvCfg(DirectRLEnvCfg):
     # 半径需留 ≥ 0.10m 安全余量。
     door_center_xy: tuple[float, float] = (2.95, 0.00)
     base_reference_xy: tuple[float, float] = (3.72, 0.27)
-    base_height: float = 0.12
+    base_height: float = BASE_LINK_SPAWN_HEIGHT
     base_radius_range: tuple[float, float] = (0.45, 0.60)
     base_sector_half_angle_deg: float = 20.0
     base_yaw_delta_deg: float = 10.0
@@ -474,6 +478,8 @@ class DoorPushEnvCfg(DirectRLEnvCfg):
     rew_beta_target: float = 1.0
     rew_target_margin_ratio: float = 0.1
     rew_beta_joint_move: float = 0.1
+    rew_beta_cup_door_prox: float = 1.0
+    rew_cup_door_prox_threshold: float = 0.05
     rew_w_drop: float = 100.0
     rew_mu_base: float = 0.9
     rew_beta_base_speed: float = 0.0

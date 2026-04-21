@@ -848,6 +848,7 @@ r_t^{\text{safe}}=
 r_t^{\text{vel}}
 +r_t^{\text{target}}
 +r_t^{\text{joint\_move}}
++r_t^{\text{cup\_door\_prox}}
 +r_t^{\text{drop}}.
 $$
 
@@ -934,7 +935,26 @@ $$
 \beta_{\text{joint\_move}}=0.1.
 $$
 
-#### 3.6.4 掉杯惩罚
+#### 3.6.4 杯体-门板接近惩罚
+
+只对持杯侧生效。计算杯体质心到门板矩形面的距离 $d_t^k$（与接近奖励使用相同的点到面距离公式），当距离低于阈值时施加二次惩罚：
+
+$$
+r_t^{\text{cup\_door\_prox}}=
+\sum_{k\in\{L,R\}} m_t^k\cdot
+\beta_{\text{cup\_door\_prox}}\cdot
+\bigl[\max(d_{\text{thresh}}-d_t^k,\;0)\bigr]^2.
+$$
+
+默认训练入口的实际常数：
+
+$$
+\beta_{\text{cup\_door\_prox}}=1.0,\qquad d_{\text{thresh}}=0.05\;\text{m}.
+$$
+
+当 occupancy 为 0 时该项自动为 0，不影响空手推门行为。
+
+#### 3.6.5 掉杯惩罚
 
 $$
 r_t^{\text{drop}}=
@@ -1792,6 +1812,7 @@ $$
 | `reward_detail/safe/joint_vel` | 关节速度越界惩罚 |
 | `reward_detail/safe/target_limit` | 目标边界带惩罚 |
 | `reward_detail/safe/joint_move` | 关节移动惩罚 |
+| `reward_detail/safe/cup_door_prox` | 杯体-门板接近惩罚 |
 | `reward_detail/safe/cup_drop` | 杯子掉落惩罚 |
 
 它们同样记录当前统计窗口内已完成 episode 上对应分项的均值。

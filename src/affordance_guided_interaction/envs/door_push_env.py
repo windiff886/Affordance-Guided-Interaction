@@ -115,6 +115,7 @@ _EPISODE_REWARD_KEYS = (
     "safe/joint_vel",
     "safe/target_limit",
     "safe/joint_move",
+    "safe/cup_door_prox",
     "safe/cup_drop",
     "safe/base_speed",
     "safe/base_cmd_delta",
@@ -788,6 +789,38 @@ class DoorPushEnv(DirectRLEnv):
         # 关节移动惩罚：惩罚相邻步的关节角变化量
         arm_joint_pos = robot.data.joint_pos[:, self._arm_joint_ids]  # (N, 12)
         r_safe_joint_move = self.cfg.rew_beta_joint_move * ((arm_joint_pos - self._prev_arm_joint_pos) ** 2).sum(-1)
+
+        # 杯体-门板接近惩罚：只对持杯侧生效
+        cup_left: RigidObject = self.scene["cup_left"]
+        cup_right: RigidObject = self.scene["cup_right"]
+        base_pos_w = robot.data.body_pos_w[:, self._base_body_idx]
+        base_quat_w = robot.data.body_quat_w[:, self._base_body_idx]
+        left_cup_base = batch_vector_world_to_base(
+            cup_left.data.root_pos_w - base_pos_w, base_quat_w
+        )
+        right_cup_base = batch_vector_world_to_base(
+            cup_right.data.root_pos_w - base_pos_w, base_quat_w
+        )
+        left_cup_door_dist = self._compute_point_to_panel_face_distance(
+            points_base=left_cup_base,
+            face_center_base=self._cached_door_panel_face_center_base,
+            face_rot_base=self._cached_door_panel_face_rot_base,
+            half_extent_y=_DOOR_PANEL_HALF_EXTENT_Y,
+            half_extent_z=_DOOR_PANEL_HALF_EXTENT_Z,
+        )
+        right_cup_door_dist = self._compute_point_to_panel_face_distance(
+            points_base=right_cup_base,
+            face_center_base=self._cached_door_panel_face_center_base,
+            face_rot_base=self._cached_door_panel_face_rot_base,
+            half_extent_y=_DOOR_PANEL_HALF_EXTENT_Y,
+            half_extent_z=_DOOR_PANEL_HALF_EXTENT_Z,
+        )
+        prox_thresh = self.cfg.rew_cup_door_prox_threshold
+        left_prox_intrusion = torch.clamp(prox_thresh - left_cup_door_dist, min=0)
+        right_prox_intrusion = torch.clamp(prox_thresh - right_cup_door_dist, min=0)
+        r_safe_cup_door_prox = self.cfg.rew_beta_cup_door_prox * (
+            m_l * left_prox_intrusion ** 2 + m_r * right_prox_intrusion ** 2
+        )
         base_lv = batch_vector_world_to_base(
             robot.data.body_lin_vel_w[:, self._base_body_idx],
             robot.data.body_quat_w[:, self._base_body_idx],
@@ -814,6 +847,7 @@ class DoorPushEnv(DirectRLEnv):
             + r_safe_target_limit
             + r_safe_cup_drop
             + r_safe_joint_move
+            + r_safe_cup_door_prox
             + r_safe_base_speed
             + r_safe_base_cmd_delta
         )
@@ -823,6 +857,7 @@ class DoorPushEnv(DirectRLEnv):
         reward_info["safe/target_limit"] = r_safe_target_limit
         reward_info["safe/cup_drop"] = r_safe_cup_drop
         reward_info["safe/joint_move"] = r_safe_joint_move
+        reward_info["safe/cup_door_prox"] = r_safe_cup_door_prox
         reward_info["safe/base_speed"] = r_safe_base_speed
         reward_info["safe/base_cmd_delta"] = r_safe_base_cmd_delta
 
