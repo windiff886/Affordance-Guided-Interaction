@@ -1,0 +1,8 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>dingo_description</name>
+  <version>0.0.0</version>
+  <description>Temporary overlay package for Isaac Sim URDF import.</description>
+  <maintainer email="noreply@example.com">Codex</maintainer>
+  <license>Apache-2.0</license>
+</package>

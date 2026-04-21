@@ -4,9 +4,9 @@
 由 Cloner 自动为每个并行环境复制完整场景子树，实现 GPU 批量并行仿真。
 
 场景包含：
-    - 双臂固定底座机器人 (UniDingo Lite Z1)
+    - 双臂移动底盘机器人 (UniDingo Lite Z1)
     - 推门 (minimal_push_door)
-    - 左/右杯体（预生成，按课程 occupancy 启停）
+    - 左/右杯体（预生成，按 reset-time occupancy 启停）
     - 地面平面 + 照明
 
 基座位姿在每次 episode reset 时通过扇形环采样随机化。
@@ -16,10 +16,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import gymnasium as gym
 import isaaclab.sim as sim_utils
+import torch
 from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg, RigidObjectCfg
 from isaaclab.envs import DirectRLEnvCfg
+from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sensors import TiledCameraCfg  # optional, kept for future visual experiments
 from isaaclab.utils import configclass
@@ -63,6 +66,14 @@ GRIPPER_JOINT_NAMES: list[str] = [
     "right_jointGripper",
 ]
 
+# 底盘轮子关节（由 3 维底盘速度命令间接驱动）
+WHEEL_JOINT_NAMES: list[str] = [
+    "front_left_wheel",
+    "front_right_wheel",
+    "rear_left_wheel",
+    "rear_right_wheel",
+]
+
 # 云台关节（相机姿态；不进入策略动作空间）
 PAN_TILT_JOINT_NAMES: list[str] = [
     "pan_tilt_yaw_joint",
@@ -83,7 +94,7 @@ DOOR_LEAF_BODY_NAME: str = "DoorLeaf"
 
 # 杯体相对 base_link 的局部偏移 (x, y, z)
 LEFT_CUP_RELATIVE_XYZ: tuple[float, float, float] = (0.29, 0.1111, 0.6814)
-RIGHT_CUP_RELATIVE_XYZ: tuple[float, float, float] = (0.29, -0.1111, 0.6814)
+RIGHT_CUP_RELATIVE_XYZ: tuple[float, float, float] = (0.29, -0.12306, 0.6814)
 
 # 抓取初始化臂关节角度（度）
 LEFT_ARM_GRASP_INIT_DEG: dict[str, float] = {
@@ -100,12 +111,12 @@ RIGHT_ARM_GRASP_INIT_DEG: dict[str, float] = {
     "right_joint3": 0.0,
     "right_joint4": 0.0,
     "right_joint5": 0.0,
-    "right_joint6": -90.0,
+    "right_joint6": 90.0,
 }
 
 # Gripper 角度
 GRIPPER_OPEN_DEG: float = -90.0
-GRIPPER_CLOSE_DEG: float = -34.0
+GRIPPER_CLOSE_DEG: float = -32.0
 GRIPPER_FULLY_CLOSED_DEG: float = 0.0
 
 # 持杯初始化物理步进数
@@ -117,6 +128,34 @@ POST_REMOVE_SETTLE_STEPS: int = 30
 
 # 托盘尺寸 (用于临时支撑杯体)
 TRAY_SIZE_XYZ: tuple[float, float, float] = (0.12, 0.12, 0.008)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Reset 随机化事件
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def randomize_reset_occupancy(env, env_ids) -> None:
+    """在 reset 时为指定 env 均匀采样 empty/left/right/both occupancy。"""
+    if env_ids is None:
+        env_ids = torch.arange(env.num_envs, device=env.device, dtype=torch.long)
+    else:
+        env_ids = torch.as_tensor(env_ids, device=env.device, dtype=torch.long)
+
+    sampled_modes = torch.randint(0, 4, (len(env_ids),), device=env.device)
+    left_occupied = (sampled_modes == 1) | (sampled_modes == 3)
+    right_occupied = (sampled_modes == 2) | (sampled_modes == 3)
+    env.set_occupancy(left_occupied, right_occupied, env_ids=env_ids)
+
+
+@configclass
+class EventCfg:
+    """Configuration for reset-time randomization."""
+
+    randomize_occupancy = EventTerm(
+        func=randomize_reset_occupancy,
+        mode="reset",
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -133,8 +172,8 @@ class DoorPushSceneCfg(InteractiveSceneCfg):
 
     特征：
         - 保留 ``room`` 字段但默认禁用（``room=None``）
-        - 使用精简版机器人 USD（无轮子/云台/支架），底座固定
-        - 仅保留双臂 + gripper actuator
+        - 使用精简版机器人 USD
+        - 保留双臂、gripper 与 4 个底盘轮子 actuator
         - 机器人自碰撞保持启用
         - 基座位姿在每次 episode reset 时随机化（扇形环采样）
     """
@@ -168,7 +207,7 @@ class DoorPushSceneCfg(InteractiveSceneCfg):
         ),
     )
 
-    # ── 双臂机器人（轻量化，固定底座）──────────────────────────────
+    # ── 双臂机器人（轻量化移动底盘）──────────────────────────────
     robot: ArticulationCfg = ArticulationCfg(
         prim_path="{ENV_REGEX_NS}/Robot",
         spawn=sim_utils.UsdFileCfg(
@@ -179,7 +218,7 @@ class DoorPushSceneCfg(InteractiveSceneCfg):
                 max_depenetration_velocity=1.0,
             ),
             articulation_props=sim_utils.ArticulationRootPropertiesCfg(
-                fix_root_link=True,
+                fix_root_link=False,
                 enabled_self_collisions=True,
                 solver_position_iteration_count=8,
                 solver_velocity_iteration_count=4,
@@ -222,6 +261,13 @@ class DoorPushSceneCfg(InteractiveSceneCfg):
                 velocity_limit=2.175,
                 stiffness=400.0,
                 damping=40.0,
+            ),
+            "wheel_joints": ImplicitActuatorCfg(
+                joint_names_expr=WHEEL_JOINT_NAMES,
+                effort_limit=120.0,
+                velocity_limit=40.0,
+                stiffness=0.0,
+                damping=1500.0,
             ),
         },
     )
@@ -306,7 +352,7 @@ class DoorPushEnvCfg(DirectRLEnvCfg):
 
     包含场景配置引用和所有任务级超参数。
 
-    使用轻量化场景（固定底座、无轮子/云台、`room=None`、自碰撞启用），
+    使用轻量化场景（移动底盘、`room=None`、自碰撞启用），
     基座位姿在每次 episode reset 时通过扇形环采样随机化。
     """
 
@@ -315,6 +361,11 @@ class DoorPushEnvCfg(DirectRLEnvCfg):
 
     sim: sim_utils.SimulationCfg = sim_utils.SimulationCfg(
         create_stage_in_memory=True,
+        physx=sim_utils.PhysxCfg(
+            # 6144 env + dual-arm self-collision + door/cup contacts can exceed
+            # Isaac Lab's default rigid patch buffer during GPU narrow phase.
+            gpu_max_rigid_patch_count=2**19,
+        ),
     )
 
     scene: DoorPushSceneCfg = DoorPushSceneCfg(
@@ -323,27 +374,28 @@ class DoorPushEnvCfg(DirectRLEnvCfg):
         replicate_physics=True,
         clone_in_fabric=True,
     )
+    events: EventCfg = EventCfg()
 
     # ── 仿真步进 ────────────────────────────────────────────────────
     decimation: int = 2           # 策略频率 = physics_dt / decimation = 60 Hz
     episode_length_s: float = 15.0  # 900 steps × (1/60 s)
     num_rerenders_on_reset: int = 3
 
-    # ── 动作空间：双臂 6+6 = 12 关节位置目标 (rad) ──────────────
-    num_actions: int = 12
-    action_space: int = 12
+    # ── 动作空间：双臂 12 维 + 底盘 3 维速度命令 = 15 ─────────────
+    num_actions: int = 15
+    action_space: gym.spaces.Box = gym.spaces.Box(low=-1.0, high=1.0, shape=(15,))
 
     # ── 观测空间 ────────────────────────────────────────────────────
     # Actor obs: proprio(36) + ee(38) + context(2) + stability(2) +
-    #            door_geometry(6) = 84
-    num_observations: int = 84
-    observation_space: int = 84
+    #            door_geometry(6) + base_twist/cmd(6) = 90
+    num_observations: int = 90
+    observation_space: int = 90
 
-    # Critic obs (privileged): actor_obs(84) + door_pose(7) +
+    # Critic obs (privileged): actor_obs(90) + door_pose(7) +
     #     door_joint_pos(1) + door_joint_vel(1) + cup_mass(1) +
-    #     door_mass(1) + door_damping(1) + cup_dropped(1) = 97
-    num_states: int = 97
-    state_space: int = 97
+    #     door_mass(1) + door_damping(1) + cup_dropped(1) = 103
+    num_states: int = 103
+    state_space: int = 103
 
     # ── 任务判定阈值 ────────────────────────────────────────────────
     # 门角度到达 target → terminated(success)
@@ -366,7 +418,14 @@ class DoorPushEnvCfg(DirectRLEnvCfg):
     control_action_type: str = "joint_position"
     arm_pd_stiffness: float = 1000.0
     arm_pd_damping: float = 100.0
-    position_target_noise_std: float = 0.0
+    position_target_noise_std: float = 0.01
+    base_max_lin_vel_x: float = 0.6
+    base_max_lin_vel_y: float = 0.6
+    base_max_ang_vel_z: float = 1.2
+    wheel_radius: float = 0.05
+    wheel_base_half_length: float = 0.285
+    wheel_base_half_width: float = 0.2104
+    wheel_velocity_limit: float = 40.0
 
     # ── 域随机化范围（回合级静态参数）──────────────────────────────
     cup_mass_range: tuple[float, float] = (0.1, 0.8)
@@ -376,7 +435,7 @@ class DoorPushEnvCfg(DirectRLEnvCfg):
     # 基座采样几何（门外侧扇形环）
     # Z1 臂有效水平可达 ≈ 0.95m（肩偏移 0.15m + 臂链 0.80m），
     # 半径需留 ≥ 0.10m 安全余量。
-    push_plate_center_xy: tuple[float, float] = (2.98, 0.27)
+    door_center_xy: tuple[float, float] = (2.95, 0.00)
     base_reference_xy: tuple[float, float] = (3.72, 0.27)
     base_height: float = 0.12
     base_radius_range: tuple[float, float] = (0.45, 0.60)
@@ -413,7 +472,12 @@ class DoorPushEnvCfg(DirectRLEnvCfg):
     rew_mu: float = 0.9
     rew_beta_vel: float = 0.5
     rew_beta_target: float = 1.0
+    rew_target_margin_ratio: float = 0.1
+    rew_beta_joint_move: float = 0.1
     rew_w_drop: float = 100.0
+    rew_mu_base: float = 0.9
+    rew_beta_base_speed: float = 0.0
+    rew_beta_base_cmd: float = 0.0
 
     # ── 门几何观测 ────────────────────────────────────────────────────
     door_geometry_dim: int = 6  # center(3) + normal(3)

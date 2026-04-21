@@ -5,7 +5,7 @@ This script reuses the same environment construction path as training:
 YAML -> build_env_cfg(...) -> gym.make(...) -> DoorPushEnv
 
 The only difference is that the policy output is replaced by a persistent
-12D action vector driven from an omni.ui control panel.
+15D action vector driven from an omni.ui control panel.
 """
 
 from __future__ import annotations
@@ -34,8 +34,12 @@ from affordance_guided_interaction.utils.runtime_env import (
 )
 from affordance_guided_interaction.utils.train_runtime_config import resolve_train_runtime_config
 
-ACTION_DIM = 12
+ARM_ACTION_DIM = 12
+BASE_ACTION_DIM = 3
+ACTION_DIM = ARM_ACTION_DIM + BASE_ACTION_DIM
 RESET_MODES = ("empty", "left", "right", "both")
+BASE_ACTION_LABELS = ("Base Vx", "Base Vy", "Base Wz")
+BASE_ACTION_RANGES = ((-0.6, 0.6), (-0.6, 0.6), (-1.2, 1.2))
 
 
 def resolve_occupancy_mode(mode: str) -> tuple[bool, bool]:
@@ -218,6 +222,12 @@ def _format_status_text(controller: ManualDoorPushController) -> str:
     arm_joint_names = [robot.joint_names[idx] for idx in controller.base_env._arm_joint_ids]
     arm_q = state["arm_joint_positions"][0].detach().cpu().tolist()
     arm_targets = state["arm_joint_targets"][0].detach().cpu().tolist()
+    base_pos = state["base_pos_w"][0].detach().cpu().tolist()
+    base_lin_vel = state["base_lin_vel_base"][0].detach().cpu().tolist()
+    base_ang_vel = state["base_ang_vel_base"][0].detach().cpu().tolist()
+    base_cmd = state["base_cmd"][0].detach().cpu().tolist()
+    wheel_vel = state["wheel_joint_velocities"][0].detach().cpu().tolist()
+    wheel_saturation_ratio = float(state["wheel_saturation_ratio"][0].item())
     tracking_lines = format_joint_tracking_lines(
         joint_names=arm_joint_names,
         target_values=arm_targets,
@@ -230,6 +240,12 @@ def _format_status_text(controller: ManualDoorPushController) -> str:
         f"door_angle: {float(state['door_angle'][0].item()):.4f}",
         f"cup_dropped: {bool(state['cup_dropped'][0].item())}",
         f"episode_success: {bool(state['episode_success'][0].item())}",
+        f"base_pos_w: ({base_pos[0]:+.3f}, {base_pos[1]:+.3f}, {base_pos[2]:+.3f})",
+        f"base_lin_vel_base: ({base_lin_vel[0]:+.3f}, {base_lin_vel[1]:+.3f}, {base_lin_vel[2]:+.3f})",
+        f"base_ang_vel_base: ({base_ang_vel[0]:+.3f}, {base_ang_vel[1]:+.3f}, {base_ang_vel[2]:+.3f})",
+        f"base_cmd: ({base_cmd[0]:+.3f}, {base_cmd[1]:+.3f}, {base_cmd[2]:+.3f})",
+        f"wheel_vel: {', '.join(f'{value:+.3f}' for value in wheel_vel)}",
+        f"wheel_saturation_ratio: {wheel_saturation_ratio:.2f}",
         "",
         "joint_tracking:",
         *tracking_lines,
@@ -259,13 +275,16 @@ def _manual_window_kwargs() -> dict[str, Any]:
 
 
 def _extract_manual_action_values(state: dict[str, Any]) -> list[float]:
-    """Convert the single-env debug state into absolute arm joint targets for the UI device."""
+    """Convert the single-env debug state into arm targets + base command for the UI device."""
     arm_joint_positions = torch.as_tensor(state["arm_joint_positions"], dtype=torch.float32)
-    if arm_joint_positions.ndim != 2 or arm_joint_positions.shape[1] != ACTION_DIM:
+    if arm_joint_positions.ndim != 2 or arm_joint_positions.shape[1] != ARM_ACTION_DIM:
         raise ValueError(
             "Expected 'arm_joint_positions' to have shape (num_envs, 12) for manual control sync."
         )
-    return arm_joint_positions[0].detach().cpu().tolist()
+    base_cmd = torch.as_tensor(state["base_cmd"], dtype=torch.float32)
+    if base_cmd.ndim != 2 or base_cmd.shape[1] != BASE_ACTION_DIM:
+        raise ValueError("Expected 'base_cmd' to have shape (num_envs, 3) for manual control sync.")
+    return arm_joint_positions[0].detach().cpu().tolist() + base_cmd[0].detach().cpu().tolist()
 
 
 def _sync_slider_models(slider_models: Sequence[Any], action_values: Sequence[float]) -> None:
@@ -319,7 +338,7 @@ def _build_ui(controller: ManualDoorPushController) -> tuple[list[Any], Any, Any
                     ui.Button("Zero Actions", clicked_fn=controller.zero_actions)
 
                 ui.Spacer(height=6)
-                ui.Label("12D Action Sliders", height=22)
+                ui.Label("15D Action Sliders", height=22)
 
                 for idx, joint_name in enumerate(arm_joint_names):
                     model = ui.SimpleFloatModel(0.0)
@@ -337,6 +356,29 @@ def _build_ui(controller: ManualDoorPushController) -> tuple[list[Any], Any, Any
                             range_min=float(joint_limits[idx, 0].item()),
                             range_max=float(joint_limits[idx, 1].item()),
                             step=0.02,
+                            value_format=".3f",
+                        )
+                    )
+
+                ui.Spacer(height=6)
+                ui.Label("Base Twist Commands", height=22)
+                for idx, (label_text, value_range) in enumerate(zip(BASE_ACTION_LABELS, BASE_ACTION_RANGES, strict=True)):
+                    action_index = ARM_ACTION_DIM + idx
+                    model = ui.SimpleFloatModel(0.0)
+                    slider_models.append(model)
+                    model.add_value_changed_fn(
+                        lambda m, base_action_index=action_index: controller.device.set_action_value(
+                            base_action_index, m.get_value_as_float()
+                        )
+                    )
+                    slider_labels.append(
+                        _make_slider_row(
+                            ui=ui,
+                            label_text=label_text,
+                            model=model,
+                            range_min=float(value_range[0]),
+                            range_max=float(value_range[1]),
+                            step=0.02 if idx < 2 else 0.05,
                             value_format=".3f",
                         )
                     )

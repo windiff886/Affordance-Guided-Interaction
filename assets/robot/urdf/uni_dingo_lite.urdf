@@ -1,12 +1,9 @@
 <?xml version="1.0" ?>
 <!--
-  Uni-Dingo Lite — Training-only fixed-base dual-arm robot
+  Uni-Dingo Lite — Dingo-O omni-chassis + dual-arm robot
 
-  Stripped from uni_dingo_dual_arm.urdf for memory-efficient RL training.
-  Kept: base, chassis (box proxy), dual-arm mounting brackets, full Z1 arms + grippers.
-  Removed: wheels, mounting brackets, IMU, pan-tilt, camera, decorative meshes.
-
-  Chassis and arm-mount meshes replaced with simple collision primitives.
+  Based on uni_dingo_dual_arm.urdf, with real Dingo-O chassis mesh and 4 omnidirectional wheels.
+  Removed: mounting brackets, IMU, pan-tilt, camera, decorative meshes.
   Arm link collision geometry preserved for contact fidelity.
 -->
 <robot name="uni_dingo_lite">
@@ -27,8 +24,7 @@
   </link>
 
   <!-- ═══════════════════════════════════════════════════════════════ -->
-  <!-- Chassis: box proxy (replaces 25MB omni_chassis mesh)         -->
-  <!-- Dimensions approximate Dingo-O footprint: ~0.57 x 0.42 x 0.24 -->
+  <!-- Chassis: real Dingo-O omni-chassis mesh                       -->
   <!-- ═══════════════════════════════════════════════════════════════ -->
   <joint name="base_link_joint" type="fixed">
     <origin rpy="0 0 0" xyz="0 0 0"/>
@@ -39,7 +35,7 @@
     <visual>
       <origin rpy="0 0 0" xyz="0 0 0"/>
       <geometry>
-        <box size="0.57 0.42 0.24"/>
+        <mesh filename="package://dingo_description/meshes/omni_chassis.dae"/>
       </geometry>
       <material name="dark_grey">
         <color rgba="0.2 0.2 0.2 1.0"/>
@@ -48,7 +44,7 @@
     <collision>
       <origin rpy="0 0 0" xyz="0 0 0"/>
       <geometry>
-        <box size="0.57 0.42 0.24"/>
+        <mesh filename="package://dingo_description/meshes/omni_chassis_collision.stl"/>
       </geometry>
     </collision>
     <inertial>
@@ -57,6 +53,132 @@
       <inertia ixx="0.35498" ixy="0" ixz="0" iyy="0.7266" iyz="0" izz="1.0553"/>
     </inertial>
   </link>
+
+  <!-- ═══════════════════════════════════════════════════════════════ -->
+  <!-- Wheels: 4x omnidirectional (Dingo-O parameters)               -->
+  <!-- wheelbase=0.570  track=0.3708  wheel_vertical_offset=0.035145 -->
+  <!-- wheel_radius=0.050  wheel_width=0.050  wheel_mass=0.4         -->
+  <!-- ═══════════════════════════════════════════════════════════════ -->
+
+  <!-- Front-left wheel -->
+  <link name="front_left_wheel_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="1.5707963 0 0"/>
+      <geometry>
+        <cylinder radius="0.050" length="0.050"/>
+      </geometry>
+      <material name="black">
+        <color rgba="0.15 0.15 0.15 1.0"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="1.5707963 0 0"/>
+      <geometry>
+        <cylinder radius="0.050" length="0.050"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="0.4"/>
+      <inertia ixx="0.0003234" ixy="0" ixz="0" iyy="0.0003234" iyz="0" izz="0.0004901"/>
+    </inertial>
+  </link>
+  <joint name="front_left_wheel" type="continuous">
+    <origin xyz="0.285 0.2104 0.035145" rpy="0 0 0"/>
+    <parent link="chassis_link"/>
+    <child link="front_left_wheel_link"/>
+    <axis xyz="0 1 0"/>
+  </joint>
+
+  <!-- Front-right wheel -->
+  <link name="front_right_wheel_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="1.5707963 0 0"/>
+      <geometry>
+        <cylinder radius="0.050" length="0.050"/>
+      </geometry>
+      <material name="black">
+        <color rgba="0.15 0.15 0.15 1.0"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="1.5707963 0 0"/>
+      <geometry>
+        <cylinder radius="0.050" length="0.050"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="0.4"/>
+      <inertia ixx="0.0003234" ixy="0" ixz="0" iyy="0.0003234" iyz="0" izz="0.0004901"/>
+    </inertial>
+  </link>
+  <joint name="front_right_wheel" type="continuous">
+    <origin xyz="0.285 -0.2104 0.035145" rpy="0 0 0"/>
+    <parent link="chassis_link"/>
+    <child link="front_right_wheel_link"/>
+    <axis xyz="0 1 0"/>
+  </joint>
+
+  <!-- Rear-left wheel -->
+  <link name="rear_left_wheel_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="1.5707963 0 0"/>
+      <geometry>
+        <cylinder radius="0.050" length="0.050"/>
+      </geometry>
+      <material name="black">
+        <color rgba="0.15 0.15 0.15 1.0"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="1.5707963 0 0"/>
+      <geometry>
+        <cylinder radius="0.050" length="0.050"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="0.4"/>
+      <inertia ixx="0.0003234" ixy="0" ixz="0" iyy="0.0003234" iyz="0" izz="0.0004901"/>
+    </inertial>
+  </link>
+  <joint name="rear_left_wheel" type="continuous">
+    <origin xyz="-0.285 0.2104 0.035145" rpy="0 0 0"/>
+    <parent link="chassis_link"/>
+    <child link="rear_left_wheel_link"/>
+    <axis xyz="0 1 0"/>
+  </joint>
+
+  <!-- Rear-right wheel -->
+  <link name="rear_right_wheel_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="1.5707963 0 0"/>
+      <geometry>
+        <cylinder radius="0.050" length="0.050"/>
+      </geometry>
+      <material name="black">
+        <color rgba="0.15 0.15 0.15 1.0"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="1.5707963 0 0"/>
+      <geometry>
+        <cylinder radius="0.050" length="0.050"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="0.4"/>
+      <inertia ixx="0.0003234" ixy="0" ixz="0" iyy="0.0003234" iyz="0" izz="0.0004901"/>
+    </inertial>
+  </link>
+  <joint name="rear_right_wheel" type="continuous">
+    <origin xyz="-0.285 -0.2104 0.035145" rpy="0 0 0"/>
+    <parent link="chassis_link"/>
+    <child link="rear_right_wheel_link"/>
+    <axis xyz="0 1 0"/>
+  </joint>
 
   <!-- ═══════════════════════════════════════════════════════════════ -->
   <!-- Left arm mount (cylinder proxy, replaces 4.8MB mesh)          -->

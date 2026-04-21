@@ -13,4 +13,11 @@ control:
   action_type: joint_position       # 动作语义: joint_position (rad)
   arm_pd_stiffness: 1000.0          # PD 位置控制刚度 Kp
   arm_pd_damping: 100.0             # PD 位置控制阻尼 Kd
-  position_target_noise_std: 0.0    # 位置目标噪声标准差 (训练时)
+  position_target_noise_std: 0.01   # 位置目标噪声标准差 (训练时)
+  base_max_lin_vel_x: 0.6           # 底盘前向速度上限 (m/s)
+  base_max_lin_vel_y: 0.6           # 底盘侧移速度上限 (m/s)
+  base_max_ang_vel_z: 1.2           # 底盘旋转角速度上限 (rad/s)
+  wheel_radius: 0.05                # 轮子半径 (m)
+  wheel_base_half_length: 0.285     # 质心到前/后轮中心的半长度 (m)
+  wheel_base_half_width: 0.2104     # 质心到左/右轮中心的半宽度 (m)
+  wheel_velocity_limit: 40.0        # 轮速目标硬限幅 (rad/s)

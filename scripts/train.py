@@ -28,6 +28,10 @@ if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
 from affordance_guided_interaction.utils.runtime_env import resolve_headless_mode
+from affordance_guided_interaction.utils.rl_games_config import (
+    build_rl_games_wrapper_kwargs,
+    ensure_central_value_config,
+)
 from affordance_guided_interaction.utils.train_runtime_config import TrainRuntimeConfig, resolve_train_runtime_config
 
 DEFAULT_TASK_NAME = "Affordance-DoorPush-Direct-v0"
@@ -112,6 +116,20 @@ def build_env_cfg(
         env_cfg.arm_pd_damping = float(control_cfg["arm_pd_damping"])
     if "position_target_noise_std" in control_cfg:
         env_cfg.position_target_noise_std = float(control_cfg["position_target_noise_std"])
+    if "base_max_lin_vel_x" in control_cfg:
+        env_cfg.base_max_lin_vel_x = float(control_cfg["base_max_lin_vel_x"])
+    if "base_max_lin_vel_y" in control_cfg:
+        env_cfg.base_max_lin_vel_y = float(control_cfg["base_max_lin_vel_y"])
+    if "base_max_ang_vel_z" in control_cfg:
+        env_cfg.base_max_ang_vel_z = float(control_cfg["base_max_ang_vel_z"])
+    if "wheel_radius" in control_cfg:
+        env_cfg.wheel_radius = float(control_cfg["wheel_radius"])
+    if "wheel_base_half_length" in control_cfg:
+        env_cfg.wheel_base_half_length = float(control_cfg["wheel_base_half_length"])
+    if "wheel_base_half_width" in control_cfg:
+        env_cfg.wheel_base_half_width = float(control_cfg["wheel_base_half_width"])
+    if "wheel_velocity_limit" in control_cfg:
+        env_cfg.wheel_velocity_limit = float(control_cfg["wheel_velocity_limit"])
     _apply_arm_control_to_actuators(env_cfg)
 
     task_cfg = cfg.get("task", {})
@@ -202,9 +220,12 @@ def build_rl_games_agent_cfg(
         training_cfg.get("checkpoint_interval", config_section.get("save_frequency", 100))
     )
     config_section["save_best_after"] = min(config_section["save_frequency"], max_epochs)
+    config_section["use_diagnostics"] = bool(training_cfg.get("use_diagnostics", True))
 
     reward_shaper = config_section.setdefault("reward_shaper", {})
     reward_shaper["scale_value"] = float(training_cfg.get("reward_scale", reward_shaper.get("scale_value", 1.0)))
+
+    ensure_central_value_config(agent_cfg)
 
     resume_path = Path(checkpoint_path) if checkpoint_path is not None else runtime_cfg.resume
     params["load_checkpoint"] = resume_path is not None
@@ -236,7 +257,11 @@ _REWARD_PARAM_MAP: dict[str, dict[str, str]] = {
         "mu": "rew_mu",
         "beta_vel": "rew_beta_vel",
         "beta_target": "rew_beta_target",
+        "target_margin_ratio": "rew_target_margin_ratio",
         "w_drop": "rew_w_drop",
+        "mu_base": "rew_mu_base",
+        "beta_base_speed": "rew_beta_base_speed",
+        "beta_base_cmd": "rew_beta_base_cmd",
     },
 }
 
@@ -248,6 +273,7 @@ def _apply_arm_control_to_actuators(env_cfg: Any) -> None:
     robot_actuators = env_cfg.scene.robot.actuators
     shoulder = robot_actuators["shoulder_joints"]
     arm = robot_actuators["arm_joints"]
+    wheel = robot_actuators.get("wheel_joints")
 
     shoulder.stiffness = float(env_cfg.arm_pd_stiffness)
     shoulder.damping = float(env_cfg.arm_pd_damping)
@@ -263,6 +289,8 @@ def _apply_arm_control_to_actuators(env_cfg: Any) -> None:
             shoulder.effort_limit = float(max(shoulder_limits))
         if arm_limits:
             arm.effort_limit = float(max(arm_limits))
+    if wheel is not None:
+        wheel.velocity_limit = float(getattr(env_cfg, "wheel_velocity_limit", wheel.velocity_limit))
 
 
 def _inject_reward_params(env_cfg: Any, reward_cfg: dict[str, Any]) -> None:
@@ -322,9 +350,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         import gymnasium as gym
         from rl_games.common import env_configurations, vecenv
-        from rl_games.common.algo_observer import IsaacAlgoObserver
         from rl_games.torch_runner import Runner
 
+        from affordance_guided_interaction.utils.rl_games_observer import DoorPushTensorboardObserver
         from isaaclab.utils.io import dump_yaml
         from isaaclab_rl.rl_games import RlGamesGpuEnv, RlGamesVecEnvWrapper
 
@@ -360,7 +388,13 @@ def main(argv: list[str] | None = None) -> int:
             env = gym.wrappers.RecordVideo(env, **video_kwargs)
 
         start_time = time.time()
-        env = RlGamesVecEnvWrapper(env, rl_device, clip_obs, clip_actions)
+        env = RlGamesVecEnvWrapper(
+            env,
+            rl_device,
+            clip_obs,
+            clip_actions,
+            **build_rl_games_wrapper_kwargs(),
+        )
         vecenv.register(
             "IsaacRlgWrapper",
             lambda config_name, num_actors, **kwargs: RlGamesGpuEnv(config_name, num_actors, **kwargs),
@@ -369,7 +403,7 @@ def main(argv: list[str] | None = None) -> int:
 
         agent_cfg["params"]["config"]["num_actors"] = env.unwrapped.num_envs
 
-        runner = Runner(IsaacAlgoObserver())
+        runner = Runner(DoorPushTensorboardObserver())
         runner.load(agent_cfg)
         runner.reset()
 

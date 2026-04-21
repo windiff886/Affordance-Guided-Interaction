@@ -1,0 +1,20 @@
+runtime:
+  headless: true
+  device: cuda
+  seed: 42
+
+policy:
+  checkpoint: /root/Affordance-Guided-Interaction/runs/rl_games/door_push_direct/2026-04-20_17-29-12/nn/last_door_push_direct_ep_763_rew__-1479.5917_.pth
+  deterministic: true
+
+rollout:
+  task_name: Affordance-DoorPush-Direct-v0
+  modes: [empty, left, right, both]
+
+video:
+  output_root: runs/inference
+  folder_name: policy_rollouts
+  length: 900
+  camera:
+    eye: [5.7, 2.7, 2.6]
+    lookat: [3.2, 0.1, 0.8]

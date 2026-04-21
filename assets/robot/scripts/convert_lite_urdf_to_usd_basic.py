@@ -42,8 +42,10 @@ from affordance_guided_interaction.utils.runtime_env import (
 configure_omniverse_client_environment(os.environ)
 
 _Z1_MESH_DIR = PROJECT_ROOT / "assets/robot/meshes/z1"
+_DINGO_MESH_DIR = PROJECT_ROOT / "assets/robot/meshes/dingo"
 _ROS_OVERLAY_ROOT = PROJECT_ROOT / "assets/robot/.ros_pkg_overlay"
 _Z1_PACKAGE_NAME = "z1_description"
+_DINGO_PACKAGE_NAME = "dingo_description"
 
 
 def log(message: str) -> None:
@@ -90,15 +92,15 @@ def _write_minimal_package_xml(package_root: Path, *, package_name: str) -> None
     )
 
 
-def configure_lite_mesh_package(env: dict[str, str]) -> None:
-    if not _Z1_MESH_DIR.exists():
-        raise FileNotFoundError(f"Z1 mesh directory not found: {_Z1_MESH_DIR}")
+def _setup_package_overlay(mesh_dir: Path, package_name: str, env: dict[str, str]) -> None:
+    if not mesh_dir.exists():
+        raise FileNotFoundError(f"Mesh directory not found: {mesh_dir}")
 
-    package_root = _ROS_OVERLAY_ROOT / _Z1_PACKAGE_NAME
+    package_root = _ROS_OVERLAY_ROOT / package_name
     package_root.mkdir(parents=True, exist_ok=True)
 
     meshes_link = package_root / "meshes"
-    if meshes_link.is_symlink() and meshes_link.resolve() != _Z1_MESH_DIR.resolve():
+    if meshes_link.is_symlink() and meshes_link.resolve() != mesh_dir.resolve():
         meshes_link.unlink()
     elif meshes_link.exists() and not meshes_link.is_symlink():
         raise RuntimeError(
@@ -106,16 +108,21 @@ def configure_lite_mesh_package(env: dict[str, str]) -> None:
         )
 
     if not meshes_link.exists():
-        meshes_link.symlink_to(_Z1_MESH_DIR)
+        meshes_link.symlink_to(mesh_dir)
 
-    _write_minimal_package_xml(package_root, package_name=_Z1_PACKAGE_NAME)
+    _write_minimal_package_xml(package_root, package_name=package_name)
 
     overlay_entry = str(_ROS_OVERLAY_ROOT)
     existing = [entry for entry in env.get("ROS_PACKAGE_PATH", "").split(":") if entry]
     env["ROS_PACKAGE_PATH"] = ":".join([overlay_entry] + [entry for entry in existing if entry != overlay_entry])
 
 
-# lite 版本所有 actuated 关节（无轮子/云台）
+def configure_lite_mesh_package(env: dict[str, str]) -> None:
+    _setup_package_overlay(_Z1_MESH_DIR, _Z1_PACKAGE_NAME, env)
+    _setup_package_overlay(_DINGO_MESH_DIR, _DINGO_PACKAGE_NAME, env)
+
+
+# lite 版本所有 actuated 关节
 _LITE_ARM_JOINTS = [
     "left_joint1", "left_joint2", "left_joint3",
     "left_joint4", "left_joint5", "left_joint6", "left_jointGripper",
@@ -123,9 +130,17 @@ _LITE_ARM_JOINTS = [
     "right_joint4", "right_joint5", "right_joint6", "right_jointGripper",
 ]
 
+# Dingo-O 全向底盘轮子关节
+_WHEEL_JOINTS = [
+    "front_left_wheel",
+    "front_right_wheel",
+    "rear_left_wheel",
+    "rear_right_wheel",
+]
+
 
 def configure_joint_drives(stage, robot_prim_path: str) -> int:
-    """为所有 arm 关节配置力矩驱动 (PD position tracker)。"""
+    """配置关节驱动：臂用力矩驱动，轮子用速度驱动。"""
     from pxr import UsdPhysics
 
     drive_count = 0
@@ -136,13 +151,22 @@ def configure_joint_drives(stage, robot_prim_path: str) -> int:
         prim_path = str(prim.GetPath())
         if robot_prim_path not in prim_path:
             continue
-        if not any(joint_name in name for joint_name in _LITE_ARM_JOINTS):
-            continue
-        drive = UsdPhysics.DriveAPI.Apply(prim, "angular")
-        drive.CreateTypeAttr("force")
-        drive.CreateStiffnessAttr(1000.0)
-        drive.CreateDampingAttr(100.0)
-        drive_count += 1
+
+        is_wheel = any(wheel_name in name for wheel_name in _WHEEL_JOINTS)
+        is_arm = any(joint_name in name for joint_name in _LITE_ARM_JOINTS)
+
+        if is_wheel:
+            drive = UsdPhysics.DriveAPI.Apply(prim, "angular")
+            drive.CreateTypeAttr("velocity")
+            drive.CreateStiffnessAttr(0.0)
+            drive.CreateDampingAttr(1500.0)
+            drive_count += 1
+        elif is_arm:
+            drive = UsdPhysics.DriveAPI.Apply(prim, "angular")
+            drive.CreateTypeAttr("force")
+            drive.CreateStiffnessAttr(1000.0)
+            drive.CreateDampingAttr(100.0)
+            drive_count += 1
     return drive_count
 
 
@@ -230,7 +254,7 @@ def run_conversion(args: argparse.Namespace) -> int:
         log(f"✅ Lite URDF 已导入: {robot_prim_path}")
 
         drive_count = configure_joint_drives(stage, robot_prim_path)
-        log(f"✅ 已配置 {drive_count} 个臂关节驱动 (force, stiffness=1000, damping=100)")
+        log(f"✅ 已配置 {drive_count} 个关节驱动 (arms=force, wheels=velocity)")
 
         enable_self_collision(stage, robot_prim_path)
         log("✅ 已启用 Articulation 自碰撞检测")

@@ -242,7 +242,7 @@ def batch_pose_world_to_base(
 def sample_base_poses(
     n: int,
     *,
-    push_plate_center_xy: tuple[float, float] = (2.98, 0.27),
+    door_center_xy: tuple[float, float] = (2.95, 0.00),
     base_reference_xy: tuple[float, float] = (3.72, 0.27),
     base_height: float = 0.12,
     radius_range: tuple[float, float] = (0.45, 0.60),
@@ -263,10 +263,10 @@ def sample_base_poses(
     yaws : (n,)  弧度
     """
     dev = torch.device(device)
-    center = torch.tensor(push_plate_center_xy, dtype=torch.float32, device=dev)
+    center = torch.tensor(door_center_xy, dtype=torch.float32, device=dev)
     reference = torch.tensor(base_reference_xy, dtype=torch.float32, device=dev)
 
-    # 标称角度（从推板中心指向参考点）
+    # 标称角度（从门中心指向参考点）
     diff = reference - center
     nominal_angle = torch.atan2(diff[1], diff[0])
     sector_half = math.radians(sector_half_angle_deg)
@@ -284,7 +284,7 @@ def sample_base_poses(
     base_z = torch.full((n,), base_height, device=dev)
     positions = torch.stack([base_x, base_y, base_z], dim=-1)
 
-    # 采样 yaw：朝向推板中心 ± delta
+    # 采样 yaw：朝向门中心 ± delta
     yaw_delta = math.radians(yaw_delta_deg)
     nominal_yaws = torch.atan2(
         center[1] - base_y,
@@ -329,3 +329,30 @@ def batch_rotate_relative_by_yaw(
     y_world = x_local * sin_y + y_local * cos_y
 
     return torch.stack([x_world, y_world, z_local], dim=-1)
+
+
+def compute_relative_point_velocity_world(
+    *,
+    point_pos_w: Tensor,
+    point_lin_vel_w: Tensor,
+    base_pos_w: Tensor,
+    base_lin_vel_w: Tensor,
+    base_ang_vel_w: Tensor,
+) -> Tensor:
+    """Compute the point linear velocity relative to a moving base in world frame.
+
+    The base contribution includes translational motion and the rigid-body
+    rotational component ``omega_base x (p_point - p_base)``.
+    """
+    relative_pos_w = point_pos_w - base_pos_w
+    rigid_body_velocity_w = base_lin_vel_w + torch.linalg.cross(base_ang_vel_w, relative_pos_w, dim=-1)
+    return point_lin_vel_w - rigid_body_velocity_w
+
+
+def compute_relative_angular_velocity_world(
+    *,
+    point_ang_vel_w: Tensor,
+    base_ang_vel_w: Tensor,
+) -> Tensor:
+    """Compute the angular velocity of a point relative to the base in world frame."""
+    return point_ang_vel_w - base_ang_vel_w

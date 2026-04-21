@@ -29,6 +29,7 @@ from .door_push_env_cfg import (
     # 名称常量
     ARM_JOINT_NAMES,
     GRIPPER_JOINT_NAMES,
+    WHEEL_JOINT_NAMES,
     BASE_LINK_NAME,
     LEFT_EE_LINK_NAME,
     RIGHT_EE_LINK_NAME,
@@ -49,23 +50,30 @@ from .door_push_env_cfg import (
     TRAY_SIZE_XYZ,
 )
 from .batch_math import (
-    batch_quat_conjugate,
     batch_quat_from_yaw,
-    batch_quat_multiply,
-    batch_quat_normalize,
     batch_quat_to_rotation_matrix,
     batch_orientation_world_to_base,
     batch_pose_world_to_base,
     batch_rotate_relative_by_yaw,
     batch_vector_world_to_base,
-    batch_yaw_from_quat,
+    compute_relative_angular_velocity_world,
+    compute_relative_point_velocity_world,
     sample_base_poses,
+)
+from .base_control_math import (
+    clip_wheel_velocity_targets,
+    rescale_normalized_base_actions,
+    twist_to_wheel_angular_velocity_targets,
 )
 from .door_reward_math import (
     compute_normalized_approach_score,
     compute_point_to_panel_face_distance,
 )
 from .gripper_hold import build_gripper_hold_targets
+from .joint_target_math import (
+    compute_joint_limit_margin_penalty,
+    rescale_normalized_joint_actions,
+)
 from .physx_mass_ops import (
     build_articulation_mass_update,
     build_rigid_body_mass_update,
@@ -85,12 +93,39 @@ _DOOR_PANEL_FACE_CENTER_OFFSET_LOCAL = (0.04, 0.45, 1.0)
 _DOOR_NORMAL_LOCAL = (1.0, 0.0, 0.0)
 _DOOR_PANEL_HALF_EXTENT_Y = 0.45
 _DOOR_PANEL_HALF_EXTENT_Z = 1.0
+_EPISODE_REWARD_KEYS = (
+    "task",
+    "task/delta",
+    "task/open_bonus",
+    "task/approach",
+    "task/approach_raw",
+    "stab_left",
+    "stab_left/zero_acc",
+    "stab_left/zero_ang",
+    "stab_left/acc",
+    "stab_left/ang",
+    "stab_left/tilt",
+    "stab_right",
+    "stab_right/zero_acc",
+    "stab_right/zero_ang",
+    "stab_right/acc",
+    "stab_right/ang",
+    "stab_right/tilt",
+    "safe",
+    "safe/joint_vel",
+    "safe/target_limit",
+    "safe/joint_move",
+    "safe/cup_drop",
+    "safe/base_speed",
+    "safe/base_cmd_delta",
+    "total",
+)
 
 # 观测维度
-# actor: proprio(36) + ee(38) + context(2) + stability(2) + door_geometry(6) = 84
-# critic: actor_obs(84) + privileged(13) = 97
-_ACTOR_OBS_DIM = 84
-_CRITIC_OBS_DIM = 97
+# actor: proprio(36) + ee(38) + context(2) + stability(2) + door_geometry(6) + base_twist/cmd(6) = 90
+# critic: actor_obs(90) + privileged(13) = 103
+_ACTOR_OBS_DIM = 90
+_CRITIC_OBS_DIM = 103
 _DOOR_GEOMETRY_DIM = 6
 _PRIVILEGED_DIM = 13
 
@@ -123,9 +158,28 @@ class DoorPushEnv(DirectRLEnv):
 
         self._arm_joint_ids, _ = robot.find_joints(ARM_JOINT_NAMES)
         self._gripper_joint_ids, _ = robot.find_joints(GRIPPER_JOINT_NAMES)
+        self._wheel_joint_ids, _ = robot.find_joints(WHEEL_JOINT_NAMES)
         self._base_body_idx = robot.find_bodies([BASE_LINK_NAME])[0][0]
         self._left_ee_body_idx = robot.find_bodies([LEFT_EE_LINK_NAME])[0][0]
         self._right_ee_body_idx = robot.find_bodies([RIGHT_EE_LINK_NAME])[0][0]
+        self._left_grasp_joint_ids = [robot.find_joints([jname])[0][0] for jname in LEFT_ARM_GRASP_INIT_DEG]
+        self._right_grasp_joint_ids = [robot.find_joints([jname])[0][0] for jname in RIGHT_ARM_GRASP_INIT_DEG]
+        self._left_grasp_joint_targets = torch.tensor(
+            [math.radians(deg) for deg in LEFT_ARM_GRASP_INIT_DEG.values()],
+            device=self.device,
+            dtype=torch.float32,
+        )
+        self._right_grasp_joint_targets = torch.tensor(
+            [math.radians(deg) for deg in RIGHT_ARM_GRASP_INIT_DEG.values()],
+            device=self.device,
+            dtype=torch.float32,
+        )
+        self._gripper_close_targets = torch.full(
+            (len(self._gripper_joint_ids),),
+            math.radians(GRIPPER_CLOSE_DEG),
+            device=self.device,
+            dtype=torch.float32,
+        )
 
         # NOTE: 相机传感器已从默认场景配置移除。环境不再持有相机句柄。
 
@@ -138,6 +192,8 @@ class DoorPushEnv(DirectRLEnv):
         dev = self.device
 
         self._prev_joint_target = torch.zeros(N, 12, device=dev)
+        self._prev_arm_joint_pos = torch.zeros(N, 12, device=dev)
+        self._prev_base_cmd = torch.zeros(N, 3, device=dev)
         self._left_occupied = torch.zeros(N, dtype=torch.bool, device=dev)
         self._right_occupied = torch.zeros(N, dtype=torch.bool, device=dev)
         self._step_count = torch.zeros(N, dtype=torch.long, device=dev)
@@ -151,11 +207,11 @@ class DoorPushEnv(DirectRLEnv):
         self._base_pos = torch.zeros(N, 3, device=dev)
         self._base_yaw = torch.zeros(N, device=dev)
 
-        # 上一帧的 EE 线速度/角速度，用于计算加速度
-        self._prev_left_ee_lin_vel = torch.zeros(N, 3, device=dev)
-        self._prev_left_ee_ang_vel = torch.zeros(N, 3, device=dev)
-        self._prev_right_ee_lin_vel = torch.zeros(N, 3, device=dev)
-        self._prev_right_ee_ang_vel = torch.zeros(N, 3, device=dev)
+        # 上一帧的 EE 相对 base 的世界系线速度/角速度，用于稳定计算加速度
+        self._prev_left_ee_rel_lin_vel_w = torch.zeros(N, 3, device=dev)
+        self._prev_left_ee_rel_ang_vel_w = torch.zeros(N, 3, device=dev)
+        self._prev_right_ee_rel_lin_vel_w = torch.zeros(N, 3, device=dev)
+        self._prev_right_ee_rel_ang_vel_w = torch.zeros(N, 3, device=dev)
 
         self._episode_reset_fn = None
 
@@ -176,7 +232,6 @@ class DoorPushEnv(DirectRLEnv):
         self._cached_right_ee_aa = torch.zeros(N, 3, device=dev)
         self._cached_left_tilt_perp = torch.zeros(N, 2, device=dev)
         self._cached_right_tilt_perp = torch.zeros(N, 2, device=dev)
-        self._cached_raw_joint_target = torch.zeros(N, 12, device=dev)
         # L12: 每步在 _get_observations() 中缓存，供 _get_rewards/_get_dones 共用
         self._cached_cup_dropped = torch.zeros(N, dtype=torch.bool, device=dev)
         self._cached_left_ee_pos_base = torch.zeros(N, 3, device=dev)
@@ -184,7 +239,21 @@ class DoorPushEnv(DirectRLEnv):
         self._cached_door_panel_face_center_base = torch.zeros(N, 3, device=dev)
         self._cached_door_panel_face_rot_base = torch.eye(3, device=dev).unsqueeze(0).repeat(N, 1, 1)
         self._cached_approach_dist = torch.zeros(N, device=dev)
+        self._cached_base_cmd_delta = torch.zeros(N, 3, device=dev)
+        self._cached_wheel_saturation_ratio = torch.zeros(N, device=dev)
         self._initial_approach_dist = torch.full((N,), float("nan"), device=dev)
+        self._episode_reward_sums = {
+            key: torch.zeros(N, device=dev) for key in _EPISODE_REWARD_KEYS
+        }
+        self._door_center_offset_local = torch.tensor(_DOOR_CENTER_OFFSET_LOCAL, device=dev, dtype=torch.float32)
+        self._door_panel_face_center_offset_local = torch.tensor(
+            _DOOR_PANEL_FACE_CENTER_OFFSET_LOCAL,
+            device=dev,
+            dtype=torch.float32,
+        )
+        self._door_normal_local = torch.tensor(_DOOR_NORMAL_LOCAL, device=dev, dtype=torch.float32)
+        self._left_cup_relative_xyz = torch.tensor(LEFT_CUP_RELATIVE_XYZ, device=dev, dtype=torch.float32)
+        self._right_cup_relative_xyz = torch.tensor(RIGHT_CUP_RELATIVE_XYZ, device=dev, dtype=torch.float32)
 
 
     # ═══════════════════════════════════════════════════════════════════
@@ -261,24 +330,23 @@ class DoorPushEnv(DirectRLEnv):
     # ═══════════════════════════════════════════════════════════════════
 
     def _pre_physics_step(self, actions: Tensor) -> None:
-        """将策略输出的关节位置目标写入仿真 — 批量操作所有 env。
+        """将策略输出的 arm/base 命令写入仿真 — 批量操作所有 env。
 
         控制链路：
-            q_target_raw → joint limit clip → (optional) position noise → re-clip
-            → set_joint_position_target() → PD 生成 torque → effort limit 截断
+            arm: a_norm[-1,1] → joint limits → (optional) noise → position target
+            base: a_norm[-1,1] → [vx, vy, wz] → wheel velocity targets
         """
         robot: Articulation = self.scene["robot"]
+        arm_actions = actions[:, : len(self._arm_joint_ids)]
+        base_actions = actions[:, len(self._arm_joint_ids) :]
 
-        # 1. 缓存 policy 原始输出（clip 前），用于目标角越界惩罚
-        self._cached_raw_joint_target = actions.clone()
-
-        # 2. 按 joint limits 做位置限位
+        # 1. 将 arm 归一化动作映射到 joint limits
         joint_limits = robot.data.soft_joint_pos_limits[0, self._arm_joint_ids]  # (12, 2)
         q_min = joint_limits[:, 0]  # (12,)
         q_max = joint_limits[:, 1]  # (12,)
-        q_target_cmd = torch.clamp(actions, q_min.unsqueeze(0), q_max.unsqueeze(0))
+        q_target_cmd = rescale_normalized_joint_actions(arm_actions, q_min, q_max)
 
-        # 3. 可选：注入位置目标噪声
+        # 2. 可选：注入位置目标噪声
         noise_std = self.cfg.position_target_noise_std
         if noise_std > 0:
             noise = torch.randn_like(q_target_cmd) * noise_std
@@ -288,18 +356,41 @@ class DoorPushEnv(DirectRLEnv):
                 q_max.unsqueeze(0),
             )
 
-        # 4. 构造全关节位置目标向量（策略只控制 12 个臂关节）
-        targets = torch.zeros(
-            self.num_envs, robot.num_joints, device=self.device
+        # 3. 将底盘动作映射为 wheel velocity targets，并记录命令变化
+        base_cmd = rescale_normalized_base_actions(
+            base_actions,
+            max_lin_vel_x=self.cfg.base_max_lin_vel_x,
+            max_lin_vel_y=self.cfg.base_max_lin_vel_y,
+            max_ang_vel_z=self.cfg.base_max_ang_vel_z,
         )
-        targets[:, self._arm_joint_ids] = q_target_cmd
-        robot.set_joint_position_target(targets)
+        wheel_targets = twist_to_wheel_angular_velocity_targets(
+            base_cmd,
+            wheel_radius=self.cfg.wheel_radius,
+            half_length=self.cfg.wheel_base_half_length,
+            half_width=self.cfg.wheel_base_half_width,
+        )
+        wheel_targets, saturation_ratio = clip_wheel_velocity_targets(
+            wheel_targets,
+            velocity_limit=self.cfg.wheel_velocity_limit,
+        )
+        self._cached_base_cmd_delta = base_cmd - self._prev_base_cmd
+        self._cached_wheel_saturation_ratio = saturation_ratio
 
-        # 5. 保持 gripper hold targets
+        robot.set_joint_position_target(
+            q_target_cmd,
+            joint_ids=self._arm_joint_ids,
+        )
+        robot.set_joint_velocity_target(
+            wheel_targets,
+            joint_ids=self._wheel_joint_ids,
+        )
+
+        # 4. 保持 gripper hold targets
         self._set_gripper_hold_targets()
 
-        # 6. 缓存 clip 后的目标，供下一步 obs 使用
+        # 5. 缓存最终目标，供下一步 obs 和边界惩罚使用
         self._prev_joint_target = q_target_cmd.clone()
+        self._prev_base_cmd = base_cmd.clone()
 
     def _apply_action(self) -> None:
         """动作已在 `_pre_physics_step()` 中写入 articulation 缓冲，这里无需重复处理。"""
@@ -336,44 +427,88 @@ class DoorPushEnv(DirectRLEnv):
         base_lv = body_lin_vel_w[:, self._base_body_idx]   # (N, 3)
         base_av = body_ang_vel_w[:, self._base_body_idx]   # (N, 3)
 
-        # ── 左臂 EE（base_link 相对系）─────────────────────────
-        left_ee_pos_base, left_ee_quat_base, left_ee_lv_base, left_ee_av_base = \
-            self._ee_world_to_base(
-                body_pos_w[:, self._left_ee_body_idx],
-                body_quat_w[:, self._left_ee_body_idx],
-                body_lin_vel_w[:, self._left_ee_body_idx],
-                body_ang_vel_w[:, self._left_ee_body_idx],
-                base_pos, base_quat, base_lv, base_av,
-            )
+        left_ee_pos_w = body_pos_w[:, self._left_ee_body_idx]
+        left_ee_quat_w = body_quat_w[:, self._left_ee_body_idx]
+        left_ee_lv_w = body_lin_vel_w[:, self._left_ee_body_idx]
+        left_ee_av_w = body_ang_vel_w[:, self._left_ee_body_idx]
+        right_ee_pos_w = body_pos_w[:, self._right_ee_body_idx]
+        right_ee_quat_w = body_quat_w[:, self._right_ee_body_idx]
+        right_ee_lv_w = body_lin_vel_w[:, self._right_ee_body_idx]
+        right_ee_av_w = body_ang_vel_w[:, self._right_ee_body_idx]
 
-        # ── 右臂 EE（base_link 相对系）─────────────────────────
-        right_ee_pos_base, right_ee_quat_base, right_ee_lv_base, right_ee_av_base = \
-            self._ee_world_to_base(
-                body_pos_w[:, self._right_ee_body_idx],
-                body_quat_w[:, self._right_ee_body_idx],
-                body_lin_vel_w[:, self._right_ee_body_idx],
-                body_ang_vel_w[:, self._right_ee_body_idx],
-                base_pos, base_quat, base_lv, base_av,
-            )
+        # ── 左/右臂 EE（base_link 相对系）──────────────────────
+        left_ee_pos_base, left_ee_quat_base, left_ee_lv_base, left_ee_av_base = self._ee_world_to_base(
+            left_ee_pos_w,
+            left_ee_quat_w,
+            left_ee_lv_w,
+            left_ee_av_w,
+            base_pos,
+            base_quat,
+            base_lv,
+            base_av,
+        )
+        right_ee_pos_base, right_ee_quat_base, right_ee_lv_base, right_ee_av_base = self._ee_world_to_base(
+            right_ee_pos_w,
+            right_ee_quat_w,
+            right_ee_lv_w,
+            right_ee_av_w,
+            base_pos,
+            base_quat,
+            base_lv,
+            base_av,
+        )
 
-        # ── 数值微分计算加速度 ──────────────────────────────────
-        # 注：base_pos/yaw 仅在 episode reset 时更新，episode 内保持不变，
-        # 因此前后两帧速度均在同一 base frame 中，差分结果正确。
+        # ── 数值微分计算加速度（先在世界系相对速度上差分，再转到当前 base 系）──
+        left_ee_rel_lv_w = compute_relative_point_velocity_world(
+            point_pos_w=left_ee_pos_w,
+            point_lin_vel_w=left_ee_lv_w,
+            base_pos_w=base_pos,
+            base_lin_vel_w=base_lv,
+            base_ang_vel_w=base_av,
+        )
+        left_ee_rel_av_w = compute_relative_angular_velocity_world(
+            point_ang_vel_w=left_ee_av_w,
+            base_ang_vel_w=base_av,
+        )
+        right_ee_rel_lv_w = compute_relative_point_velocity_world(
+            point_pos_w=right_ee_pos_w,
+            point_lin_vel_w=right_ee_lv_w,
+            base_pos_w=base_pos,
+            base_lin_vel_w=base_lv,
+            base_ang_vel_w=base_av,
+        )
+        right_ee_rel_av_w = compute_relative_angular_velocity_world(
+            point_ang_vel_w=right_ee_av_w,
+            base_ang_vel_w=base_av,
+        )
+
         inv_dt = 1.0 / max(self._control_dt, 1e-6)
-        left_ee_la = (left_ee_lv_base - self._prev_left_ee_lin_vel) * inv_dt
-        left_ee_aa = (left_ee_av_base - self._prev_left_ee_ang_vel) * inv_dt
-        right_ee_la = (right_ee_lv_base - self._prev_right_ee_lin_vel) * inv_dt
-        right_ee_aa = (right_ee_av_base - self._prev_right_ee_ang_vel) * inv_dt
+        left_ee_la = batch_vector_world_to_base(
+            (left_ee_rel_lv_w - self._prev_left_ee_rel_lin_vel_w) * inv_dt,
+            base_quat,
+        )
+        left_ee_aa = batch_vector_world_to_base(
+            (left_ee_rel_av_w - self._prev_left_ee_rel_ang_vel_w) * inv_dt,
+            base_quat,
+        )
+        right_ee_la = batch_vector_world_to_base(
+            (right_ee_rel_lv_w - self._prev_right_ee_rel_lin_vel_w) * inv_dt,
+            base_quat,
+        )
+        right_ee_aa = batch_vector_world_to_base(
+            (right_ee_rel_av_w - self._prev_right_ee_rel_ang_vel_w) * inv_dt,
+            base_quat,
+        )
 
         # 更新速度缓存
-        self._prev_left_ee_lin_vel = left_ee_lv_base.clone()
-        self._prev_left_ee_ang_vel = left_ee_av_base.clone()
-        self._prev_right_ee_lin_vel = right_ee_lv_base.clone()
-        self._prev_right_ee_ang_vel = right_ee_av_base.clone()
+        self._prev_left_ee_rel_lin_vel_w = left_ee_rel_lv_w.clone()
+        self._prev_left_ee_rel_ang_vel_w = left_ee_rel_av_w.clone()
+        self._prev_right_ee_rel_lin_vel_w = right_ee_rel_lv_w.clone()
+        self._prev_right_ee_rel_ang_vel_w = right_ee_rel_av_w.clone()
 
         # ── 稳定性 proxy: tilt ──────────────────────────────────
-        left_tilt, left_tilt_perp = self._compute_tilt(left_ee_quat_base)   # (N, 1), (N, 2)
-        right_tilt, right_tilt_perp = self._compute_tilt(right_ee_quat_base)  # (N, 1), (N, 2)
+        left_tilt, left_tilt_perp = self._compute_tilt(left_ee_quat_w)   # (N, 1), (N, 2)
+        right_tilt, right_tilt_perp = self._compute_tilt(right_ee_quat_w)  # (N, 1), (N, 2)
 
         # ── 缓存 EE 位姿/加速度和 tilt_perp，供 _get_rewards 使用 ──
         self._cached_left_ee_pos_base = left_ee_pos_base.clone()
@@ -388,33 +523,33 @@ class DoorPushEnv(DirectRLEnv):
         # ── 上下文 ──────────────────────────────────────────────
         left_occ = self._left_occupied.float().unsqueeze(-1)   # (N, 1)
         right_occ = self._right_occupied.float().unsqueeze(-1)  # (N, 1)
+        base_lin_vel_base = batch_vector_world_to_base(base_lv, base_quat)
+        base_ang_vel_base = batch_vector_world_to_base(base_av, base_quat)
+        base_twist_cmd_obs = torch.cat(
+            [
+                base_lin_vel_base[:, :2],
+                base_ang_vel_base[:, 2:3],
+                self._prev_base_cmd,
+            ],
+            dim=-1,
+        )  # (N, 6)
 
         # ── 门几何观测（base_link 系）─────────────────────────────
         door_leaf_pos_w = door.data.body_pos_w[:, self._door_panel_body_idx]   # (N, 3)
         door_leaf_quat_w = door.data.body_quat_w[:, self._door_panel_body_idx]  # (N, 4)
 
-        center_offset_local = torch.tensor(
-            _DOOR_CENTER_OFFSET_LOCAL, device=self.device, dtype=torch.float32
-        )
-        panel_face_center_offset_local = torch.tensor(
-            _DOOR_PANEL_FACE_CENTER_OFFSET_LOCAL, device=self.device, dtype=torch.float32
-        )
-        normal_local = torch.tensor(
-            _DOOR_NORMAL_LOCAL, device=self.device, dtype=torch.float32
-        )
-
         R_world_from_leaf = batch_quat_to_rotation_matrix(door_leaf_quat_w)  # (N, 3, 3)
         door_center_w = door_leaf_pos_w + torch.bmm(
             R_world_from_leaf,
-            center_offset_local.view(1, 3, 1).expand(self.num_envs, -1, -1),
+            self._door_center_offset_local.view(1, 3, 1).expand(self.num_envs, -1, -1),
         ).squeeze(-1)  # (N, 3)
         door_panel_face_center_w = door_leaf_pos_w + torch.bmm(
             R_world_from_leaf,
-            panel_face_center_offset_local.view(1, 3, 1).expand(self.num_envs, -1, -1),
+            self._door_panel_face_center_offset_local.view(1, 3, 1).expand(self.num_envs, -1, -1),
         ).squeeze(-1)  # (N, 3)
         door_normal_w = torch.bmm(
             R_world_from_leaf,
-            normal_local.view(1, 3, 1).expand(self.num_envs, -1, -1),
+            self._door_normal_local.view(1, 3, 1).expand(self.num_envs, -1, -1),
         ).squeeze(-1)  # (N, 3)
 
         door_center_base = batch_vector_world_to_base(
@@ -467,7 +602,7 @@ class DoorPushEnv(DirectRLEnv):
             noisy_q = all_q + torch.randn_like(all_q) * self.cfg.obs_noise_std
             noisy_dq = all_dq + torch.randn_like(all_dq) * self.cfg.obs_noise_std
 
-        # actor: proprio(36) + ee(38) + context(2) + stability(2) + door_geometry(6) = 84
+        # actor: proprio(36) + ee(38) + context(2) + stability(2) + door_geometry(6) + base_twist/cmd(6) = 90
         actor_obs = torch.cat([
             # proprio: q(12) + dq(12) + prev_joint_target(12) = 36
             noisy_q, noisy_dq, self._prev_joint_target,
@@ -485,7 +620,9 @@ class DoorPushEnv(DirectRLEnv):
             left_tilt, right_tilt,
             # door_geometry: center(3) + normal(3) = 6
             door_geometry,
-        ], dim=-1)  # (N, 84)
+            # base_twist/cmd: v_xy(2) + wz(1) + prev_base_cmd(3) = 6
+            base_twist_cmd_obs,
+        ], dim=-1)  # (N, 90)
 
         # ── Critic obs (无噪声 + privileged) ───────────────────
         # 门状态 (base_link 系)
@@ -515,6 +652,8 @@ class DoorPushEnv(DirectRLEnv):
             left_occ, right_occ, left_tilt, right_tilt,
             # door_geometry（与 actor 相同）
             door_geometry,
+            # base_twist/cmd（与 actor 相同）
+            base_twist_cmd_obs,
             # privileged: door_pose(7) + door_joint(2) + domain_params(3) + cup_dropped(1) = 13
             door_pose_base,
             door_joint_pos, door_joint_vel,
@@ -522,7 +661,7 @@ class DoorPushEnv(DirectRLEnv):
             self._door_mass.unsqueeze(-1),
             self._door_damping.unsqueeze(-1),
             cup_dropped.float().unsqueeze(-1),
-        ], dim=-1)  # (N, 97)
+        ], dim=-1)  # (N, 103)
 
         return {"policy": actor_obs, "critic": critic_obs}
 
@@ -531,7 +670,7 @@ class DoorPushEnv(DirectRLEnv):
     # ═══════════════════════════════════════════════════════════════════
 
     def _get_rewards(self) -> Tensor:
-        """批量计算完整奖励，并缓存 TensorBoard 用分项信息。"""
+        """批量计算完整奖励，并在回合完成时输出聚合后的 TensorBoard 分项信息。"""
         robot: Articulation = self.scene["robot"]
         door: Articulation = self.scene["door"]
         theta = door.data.joint_pos[:, 0]   # (N,)
@@ -616,7 +755,7 @@ class DoorPushEnv(DirectRLEnv):
                 r_stab_right = r_stab_side
 
         # ══════════════════════════════════════════════════════════════
-        # §6 安全惩罚：3 子项（正惩罚量）
+        # §6 安全惩罚：arm + mobile-base 子项（正惩罚量）
         # ══════════════════════════════════════════════════════════════
         # 关节速度超限惩罚
         joint_vel = robot.data.joint_vel[:, self._arm_joint_ids]  # (N, 12)
@@ -631,42 +770,86 @@ class DoorPushEnv(DirectRLEnv):
         vel_excess = torch.clamp(torch.abs(joint_vel) - vel_threshold, min=0)
         r_safe_joint_vel = self.cfg.rew_beta_vel * (vel_excess ** 2).sum(-1)
 
-        # 目标角越界惩罚（基于 raw target，而非 clip 后的 target）
+        # 目标角边界带惩罚（基于最终执行目标，只在接近 limits 时激活）
         joint_limits = robot.data.soft_joint_pos_limits[0, self._arm_joint_ids]  # (12, 2)
         q_min = joint_limits[:, 0]  # (12,)
         q_max = joint_limits[:, 1]  # (12,)
-        target_excess_high = torch.clamp(
-            self._cached_raw_joint_target - q_max.unsqueeze(0), min=0
+        r_safe_target_limit = compute_joint_limit_margin_penalty(
+            q_target=self._prev_joint_target,
+            q_min=q_min,
+            q_max=q_max,
+            margin_ratio=self.cfg.rew_target_margin_ratio,
+            beta=self.cfg.rew_beta_target,
         )
-        target_excess_low = torch.clamp(
-            q_min.unsqueeze(0) - self._cached_raw_joint_target, min=0
-        )
-        target_excess = target_excess_high + target_excess_low
-        r_safe_target_limit = self.cfg.rew_beta_target * (target_excess ** 2).sum(-1)
 
         cup_dropped = self._cached_cup_dropped
         r_safe_cup_drop = cup_dropped.float() * self.cfg.rew_w_drop
+
+        # 关节移动惩罚：惩罚相邻步的关节角变化量
+        arm_joint_pos = robot.data.joint_pos[:, self._arm_joint_ids]  # (N, 12)
+        r_safe_joint_move = self.cfg.rew_beta_joint_move * ((arm_joint_pos - self._prev_arm_joint_pos) ** 2).sum(-1)
+        base_lv = batch_vector_world_to_base(
+            robot.data.body_lin_vel_w[:, self._base_body_idx],
+            robot.data.body_quat_w[:, self._base_body_idx],
+        )
+        base_av = batch_vector_world_to_base(
+            robot.data.body_ang_vel_w[:, self._base_body_idx],
+            robot.data.body_quat_w[:, self._base_body_idx],
+        )
+        base_speed_ratio = torch.stack(
+            [
+                torch.abs(base_lv[:, 0]) / max(self.cfg.base_max_lin_vel_x, 1.0e-6),
+                torch.abs(base_lv[:, 1]) / max(self.cfg.base_max_lin_vel_y, 1.0e-6),
+                torch.abs(base_av[:, 2]) / max(self.cfg.base_max_ang_vel_z, 1.0e-6),
+            ],
+            dim=-1,
+        )
+        base_speed_excess = torch.clamp(base_speed_ratio - self.cfg.rew_mu_base, min=0.0)
+        r_safe_base_speed = self.cfg.rew_beta_base_speed * torch.square(base_speed_excess).sum(dim=-1)
+        base_cmd_delta_norm = self._cached_base_cmd_delta.norm(dim=-1)
+        r_safe_base_cmd_delta = self.cfg.rew_beta_base_cmd * torch.square(base_cmd_delta_norm)
 
         r_safe = (
             r_safe_joint_vel
             + r_safe_target_limit
             + r_safe_cup_drop
+            + r_safe_joint_move
+            + r_safe_base_speed
+            + r_safe_base_cmd_delta
         )
 
         reward_info["safe"] = r_safe
         reward_info["safe/joint_vel"] = r_safe_joint_vel
         reward_info["safe/target_limit"] = r_safe_target_limit
         reward_info["safe/cup_drop"] = r_safe_cup_drop
+        reward_info["safe/joint_move"] = r_safe_joint_move
+        reward_info["safe/base_speed"] = r_safe_base_speed
+        reward_info["safe/base_cmd_delta"] = r_safe_base_cmd_delta
 
         r_total = r_task + r_stab_left + r_stab_right - r_safe
         reward_info["total"] = r_total
+        for key, value in reward_info.items():
+            self._episode_reward_sums[key] += value
 
-        self.extras["reward_info"] = {
-            key: value.clone() for key, value in reward_info.items()
-        }
+        angle_reached = theta >= self.cfg.door_angle_target
+        truncated = self._step_count >= self.max_episode_length
+        done_mask = cup_dropped | angle_reached | truncated
+        if done_mask.any():
+            done_env_ids = done_mask.nonzero(as_tuple=False).squeeze(-1)
+            self.extras["episode_reward_info"] = {
+                key: value[done_env_ids].clone() for key, value in self._episode_reward_sums.items()
+            }
+            self.extras["success"] = (angle_reached & ~cup_dropped)[done_env_ids].clone()
+            self.extras["episode_left_occupied"] = self._left_occupied[done_env_ids].clone()
+            self.extras["episode_right_occupied"] = self._right_occupied[done_env_ids].clone()
+            self.extras["door_angle"] = theta[done_env_ids].clone()
+            self.extras["fail_cup_drop"] = cup_dropped[done_env_ids].clone()
+            self.extras["fail_timeout"] = (truncated & ~cup_dropped)[done_env_ids].clone()
 
         # 更新门角度缓存
         self._prev_door_angle = theta.clone()
+        # 更新臂关节位置缓存
+        self._prev_arm_joint_pos = robot.data.joint_pos[:, self._arm_joint_ids].clone()
 
         return r_total
 
@@ -692,21 +875,6 @@ class DoorPushEnv(DirectRLEnv):
 
         terminated = cup_dropped | angle_reached
         truncated = self._step_count >= self.max_episode_length
-
-        # C3: 在 auto-reset 之前将 per-env success 写入 extras，
-        # 供训练侧在 reset 后仍能读取完成 episode 的成功标记。
-        self.extras["success"] = angle_reached & ~cup_dropped
-
-        # D7: 缓存 pre-reset occupancy，auto-reset 中 _episode_reset_fn 会覆写
-        # occupancy，adapter 需要读到完成 episode 的 occupancy 而非新 episode 的
-        self.extras["episode_left_occupied"] = self._left_occupied.clone()
-        self.extras["episode_right_occupied"] = self._right_occupied.clone()
-
-        # 暴露门角度和终止原因，供 rollout_demo 等下游消费
-        self.extras["door_angle"] = theta.clone()
-        self.extras["termination_reason"] = self._build_termination_reason(
-            terminated, truncated, cup_dropped, angle_reached,
-        )
 
         return terminated, truncated
 
@@ -736,7 +904,7 @@ class DoorPushEnv(DirectRLEnv):
 
         base_pos, base_yaw = sample_base_poses(
             n,
-            push_plate_center_xy=self.cfg.push_plate_center_xy,
+            door_center_xy=self.cfg.door_center_xy,
             base_reference_xy=self.cfg.base_reference_xy,
             base_height=self.cfg.base_height,
             radius_range=self.cfg.base_radius_range,
@@ -772,9 +940,9 @@ class DoorPushEnv(DirectRLEnv):
         zero_door_vel = torch.zeros(n, door.num_joints, device=self.device)
         door.write_joint_state_to_sim(zero_door_pos, zero_door_vel, None, env_ids)
 
-        # ── 4. occupancy 已由外部 set_occupancy() 设置 ──────────
-        # 不在此处重置 — 保留外部课程管理器注入的 occupancy。
-        # 注意：如果没有外部注入，occupancy 保持初始化时的 False。
+        # ── 4. occupancy 已由 reset 事件或外部接口设置 ──────────
+        # 不在此处重置，保留 Isaac Lab reset event 或手动脚本注入的 occupancy。
+        # 如果没有任何外部写入，occupancy 保持初始化时的 False。
 
         # ── 5. 杯体处理 ─────────────────────────────────────────
         # 将不需要的杯体 teleport 到远处
@@ -796,38 +964,20 @@ class DoorPushEnv(DirectRLEnv):
         self._step_count[env_ids] = 0
         self._prev_door_angle[env_ids] = 0.0
         self._prev_joint_target[env_ids] = 0.0
+        self._prev_arm_joint_pos[env_ids] = 0.0
+        self._prev_base_cmd[env_ids] = 0.0
         self._already_succeeded[env_ids] = False
-        self._prev_left_ee_lin_vel[env_ids] = 0.0
-        self._prev_left_ee_ang_vel[env_ids] = 0.0
-        self._prev_right_ee_lin_vel[env_ids] = 0.0
-        self._prev_right_ee_ang_vel[env_ids] = 0.0
+        self._prev_left_ee_rel_lin_vel_w[env_ids] = 0.0
+        self._prev_left_ee_rel_ang_vel_w[env_ids] = 0.0
+        self._prev_right_ee_rel_lin_vel_w[env_ids] = 0.0
+        self._prev_right_ee_rel_ang_vel_w[env_ids] = 0.0
         self._cached_cup_dropped[env_ids] = False
         self._cached_approach_dist[env_ids] = 0.0
+        self._cached_base_cmd_delta[env_ids] = 0.0
+        self._cached_wheel_saturation_ratio[env_ids] = 0.0
         self._initial_approach_dist[env_ids] = float("nan")
-
-    # ═══════════════════════════════════════════════════════════════════
-    # 终止原因构建
-    # ═══════════════════════════════════════════════════════════════════
-
-    def _build_termination_reason(
-        self,
-        terminated: Tensor,
-        truncated: Tensor,
-        cup_dropped: Tensor,
-        angle_reached: Tensor,
-    ) -> list[str]:
-        """为每个 env 构建终止原因字符串。"""
-        reasons: list[str] = []
-        for i in range(self.num_envs):
-            if bool(truncated[i]):
-                reasons.append("max_steps")
-            elif bool(cup_dropped[i]):
-                reasons.append("cup_dropped")
-            elif bool(angle_reached[i]):
-                reasons.append("door_opened")
-            else:
-                reasons.append("ongoing")
-        return reasons
+        for value in self._episode_reward_sums.values():
+            value[env_ids] = 0.0
 
     # ═══════════════════════════════════════════════════════════════════
     # 视口帧捕获
@@ -911,16 +1061,25 @@ class DoorPushEnv(DirectRLEnv):
         self,
         left_occupied: Tensor,
         right_occupied: Tensor,
+        env_ids: Tensor | None = None,
     ) -> None:
-        """外部课程管理器调用，设置所有 env 的持杯 occupancy。
+        """设置持杯 occupancy，支持整批或局部 env 更新。
 
         Parameters
         ----------
         left_occupied : (N,) bool
         right_occupied : (N,) bool
+        env_ids : (K,) long, optional
+            为 None 时覆盖所有 env；否则只覆盖给定 env_ids 对应的子集。
         """
-        self._left_occupied[:] = left_occupied
-        self._right_occupied[:] = right_occupied
+        if env_ids is None:
+            self._left_occupied[:] = left_occupied
+            self._right_occupied[:] = right_occupied
+            return
+
+        env_ids = torch.as_tensor(env_ids, dtype=torch.long, device=self.device)
+        self._left_occupied[env_ids] = left_occupied
+        self._right_occupied[env_ids] = right_occupied
 
     def get_debug_state(self) -> dict[str, Tensor]:
         """返回当前环境调试状态，供手动验证脚本读取。"""
@@ -929,6 +1088,16 @@ class DoorPushEnv(DirectRLEnv):
         cup_dropped = self._check_cup_dropped()
         door_angle = door.data.joint_pos[:, 0].clone()
         episode_success = (door_angle >= self.cfg.door_angle_target) & ~cup_dropped
+        base_pos = robot.data.body_pos_w[:, self._base_body_idx].clone()
+        base_quat = robot.data.body_quat_w[:, self._base_body_idx].clone()
+        base_lin_vel_base = batch_vector_world_to_base(
+            robot.data.body_lin_vel_w[:, self._base_body_idx],
+            robot.data.body_quat_w[:, self._base_body_idx],
+        )
+        base_ang_vel_base = batch_vector_world_to_base(
+            robot.data.body_ang_vel_w[:, self._base_body_idx],
+            robot.data.body_quat_w[:, self._base_body_idx],
+        )
 
         return {
             "left_occupied": self._left_occupied.clone(),
@@ -938,10 +1107,17 @@ class DoorPushEnv(DirectRLEnv):
             "episode_success": episode_success,
             "arm_joint_positions": robot.data.joint_pos[:, self._arm_joint_ids].clone(),
             "arm_joint_targets": self._prev_joint_target.clone(),
+            "base_pos_w": base_pos,
+            "base_quat_w": base_quat,
+            "base_lin_vel_base": base_lin_vel_base.clone(),
+            "base_ang_vel_base": base_ang_vel_base.clone(),
+            "base_cmd": self._prev_base_cmd.clone(),
+            "wheel_joint_velocities": robot.data.joint_vel[:, self._wheel_joint_ids].clone(),
+            "wheel_saturation_ratio": self._cached_wheel_saturation_ratio.clone(),
         }
 
     def set_episode_reset_fn(self, fn) -> None:
-        """注册 auto-reset 回调，在 `_reset_idx()` 中逐 env 调用。"""
+        """注册可选的 reset 覆写回调，保留给外部脚本或实验接口使用。"""
         self._episode_reset_fn = fn
 
     def set_domain_params_batch(
@@ -988,8 +1164,19 @@ class DoorPushEnv(DirectRLEnv):
         """将世界系 EE 状态变换到 base_link 相对系。"""
         pos_base = batch_vector_world_to_base(ee_pos_w - base_pos_w, base_quat_w)
         quat_base = batch_orientation_world_to_base(ee_quat_w, base_quat_w)
-        lv_base = batch_vector_world_to_base(ee_lv_w - base_lv_w, base_quat_w)
-        av_base = batch_vector_world_to_base(ee_av_w - base_av_w, base_quat_w)
+        rel_lv_w = compute_relative_point_velocity_world(
+            point_pos_w=ee_pos_w,
+            point_lin_vel_w=ee_lv_w,
+            base_pos_w=base_pos_w,
+            base_lin_vel_w=base_lv_w,
+            base_ang_vel_w=base_av_w,
+        )
+        rel_av_w = compute_relative_angular_velocity_world(
+            point_ang_vel_w=ee_av_w,
+            base_ang_vel_w=base_av_w,
+        )
+        lv_base = batch_vector_world_to_base(rel_lv_w, base_quat_w)
+        av_base = batch_vector_world_to_base(rel_av_w, base_quat_w)
         return pos_base, quat_base, lv_base, av_base
 
     def _has_pending_domain_overrides(self, env_ids: Tensor) -> Tensor:
@@ -1103,7 +1290,7 @@ class DoorPushEnv(DirectRLEnv):
         return None
 
     @staticmethod
-    def _compute_tilt(quat_base: Tensor) -> tuple[Tensor, Tensor]:
+    def _compute_tilt(quat_world: Tensor) -> tuple[Tensor, Tensor]:
         """计算 cup tilt-to-gravity proxy — 重力在 EE 局部系中偏离 Y 轴的投影。
 
         抓取姿态下 joint6 = ±90° (绕 X 轴) 使 gripperMover Y 轴对齐世界竖直方向，
@@ -1112,20 +1299,18 @@ class DoorPushEnv(DirectRLEnv):
 
         Parameters
         ----------
-        quat_base : (N, 4) wxyz
+        quat_world : (N, 4) wxyz
 
         Returns
         -------
         tilt_norm : (N, 1) tilt 标量范数
         tilt_perp : (N, 2) tilt 的 xz 分量（重力偏离 EE Y 轴的分量，用于奖励计算）
         """
-        R = batch_quat_to_rotation_matrix(quat_base)  # (N, 3, 3)
-        # 注：g_world 直接使用世界坐标系重力方向，隐含 base Z 轴与世界 Z 轴对齐。
-        # 对于平坦地面上的移动机器人（base 水平放置），此假设成立。
+        R = batch_quat_to_rotation_matrix(quat_world)  # (N, 3, 3)
         g_world = torch.tensor(
-            [0.0, 0.0, -9.81], device=quat_base.device
-        ).expand(quat_base.shape[0], 3)
-        # g_local = R^T @ g_world_in_base ≈ R^T @ g_world（base 水平时等价）
+            [0.0, 0.0, -9.81], device=quat_world.device
+        ).expand(quat_world.shape[0], 3)
+        # 直接使用 EE 在世界系下的姿态投影世界重力，不依赖 base 是否水平。
         g_local = torch.bmm(
             R.transpose(-1, -2),
             g_world.unsqueeze(-1),
@@ -1263,20 +1448,9 @@ class DoorPushEnv(DirectRLEnv):
         # ── 1. 设置臂关节到预设抓取姿态（直接到最终状态）──────────
         # 使用 default_joint_pos 作为基准（而非 stale 的 data.joint_pos）
         joint_pos = robot.data.default_joint_pos[env_ids].clone()  # (n, num_joints)
-        for jname, deg in LEFT_ARM_GRASP_INIT_DEG.items():
-            jids, _ = robot.find_joints([jname])
-            if jids is not None and len(jids) > 0:
-                joint_pos[:, jids[0]] = math.radians(deg)
-        for jname, deg in RIGHT_ARM_GRASP_INIT_DEG.items():
-            jids, _ = robot.find_joints([jname])
-            if jids is not None and len(jids) > 0:
-                joint_pos[:, jids[0]] = math.radians(deg)
-
-        # Gripper 直接设到关闭角度（跳过渐进关闭）
-        for gname in GRIPPER_JOINT_NAMES:
-            gids, _ = robot.find_joints([gname])
-            if gids is not None and len(gids) > 0:
-                joint_pos[:, gids[0]] = math.radians(GRIPPER_CLOSE_DEG)
+        joint_pos[:, self._left_grasp_joint_ids] = self._left_grasp_joint_targets
+        joint_pos[:, self._right_grasp_joint_ids] = self._right_grasp_joint_targets
+        joint_pos[:, self._gripper_joint_ids] = self._gripper_close_targets
 
         joint_vel = torch.zeros_like(joint_pos)  # (n, num_joints)
         robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
@@ -1287,20 +1461,18 @@ class DoorPushEnv(DirectRLEnv):
         right_cup_ids = env_ids[self._right_occupied[env_ids]]
 
         if len(left_cup_ids) > 0:
-            rel = torch.tensor(LEFT_CUP_RELATIVE_XYZ, device=self.device).float()
             local_yaw = self._base_yaw[left_cup_ids]
             base_p = self._base_pos[left_cup_ids] + self.scene.env_origins[left_cup_ids]
-            cup_world = base_p + batch_rotate_relative_by_yaw(rel, local_yaw)
+            cup_world = base_p + batch_rotate_relative_by_yaw(self._left_cup_relative_xyz, local_yaw)
             cup_state = torch.zeros(len(left_cup_ids), 13, device=self.device)
             cup_state[:, :3] = cup_world
             cup_state[:, 3] = 1.0  # quat w
             cup_left.write_root_state_to_sim(cup_state, left_cup_ids)
 
         if len(right_cup_ids) > 0:
-            rel = torch.tensor(RIGHT_CUP_RELATIVE_XYZ, device=self.device).float()
             local_yaw = self._base_yaw[right_cup_ids]
             base_p = self._base_pos[right_cup_ids] + self.scene.env_origins[right_cup_ids]
-            cup_world = base_p + batch_rotate_relative_by_yaw(rel, local_yaw)
+            cup_world = base_p + batch_rotate_relative_by_yaw(self._right_cup_relative_xyz, local_yaw)
             cup_state = torch.zeros(len(right_cup_ids), 13, device=self.device)
             cup_state[:, :3] = cup_world
             cup_state[:, 3] = 1.0

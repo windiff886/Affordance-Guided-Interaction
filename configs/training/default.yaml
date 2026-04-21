@@ -1,6 +1,6 @@
 runtime_defaults: &runtime_defaults
   headless: true
-  device: cuda
+  device: cuda:0
   seed: 42
   resume: null
   log_dir: runs
@@ -69,13 +69,25 @@ profiles:
   env_4096: &profile_env4096
     num_envs: 4096
     total_steps: 300_000_000
-    n_steps_per_rollout: 16
+    n_steps_per_rollout: 64
     checkpoint_interval: 20
     ppo:
       <<: *ppo_common
       actor_lr: 2.0e-4
       critic_lr: 2.0e-4
       num_mini_batches: 16
-      num_epochs: 3
+      num_epochs: 2
 
-<<: [*runtime_defaults, *profile_env4096]
+  env_6144: &profile_env6144
+    num_envs: 6144
+    total_steps: 300_000_000
+    n_steps_per_rollout: 64
+    checkpoint_interval: 20
+    ppo:
+      <<: *ppo_common
+      actor_lr: 2.0e-4
+      critic_lr: 2.0e-4
+      num_mini_batches: 24
+      num_epochs: 2
+
+<<: [*runtime_defaults, *profile_env6144]
