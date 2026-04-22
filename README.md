@@ -1,6 +1,6 @@
 # Affordance-Guided Interaction
 
-基于 **Isaac Lab** 仿真器与 **PPO** 强化学习算法，训练双臂机器人（Unitree Z1 × 2 + Dingo 底座）在持杯约束下完成推门任务。策略通过仿真 ground truth 计算的 `door_geometry`（6 维门几何信号）作为唯一门相关输入，并在当前的三阶段 push-only 课程中逐步引入持杯约束。
+基于 **Isaac Lab** 仿真器与 **PPO** 强化学习算法，训练双臂机器人（Unitree Z1 × 2 + Dingo 底座）在持杯约束下完成“推门并进门”任务。当前成功条件要求门角达到 `1.2 rad`、杯子不掉、且 `base_link` 穿过门洞。策略接收仿真 ground truth 计算的 `door_geometry`（6 维门板几何）以及 `door_frame_corners`（12 维门洞内沿四角）作为门相关输入。
 
 ---
 
@@ -236,7 +236,7 @@ Affordance-Guided-Interaction/
 - **无 Python 循环**：所有 per-env 状态为 `(num_envs, ...)` 形状的 torch tensor，观测 / 奖励 / 终止判定均为纯 tensor 操作
 - **Cloner 自动复制**：`DoorPushSceneCfg` 声明式定义场景（机器人、门、杯体、接触传感器），Isaac Lab Cloner 自动为 N 个并行环境复制完整场景子树
 - **自包含环境**：`DoorPushEnv` 内置 12 项奖励计算（任务进展 + 稳定性约束 + 安全惩罚）、非对称 Actor/Critic 观测构建、批量杯体抓取初始化，无需外部 Manager
-- **非对称观测**：Actor 含传感器噪声 + door_geometry(6D)；Critic 含无噪声物理状态 + 门关节角/速度/质量等 privileged 信息
+- **非对称观测**：Actor 含传感器噪声 + `door_geometry(6D)` + `door_frame_corners(12D)`；Critic 含无噪声物理状态 + 门关节角/速度/质量等 privileged 信息
 - **适配器桥接**：`DirectRLEnvAdapter` 将 tensor 接口转换为训练管线 (`RolloutCollector`) 期望的 `VecEnvProtocol`
 
 ---

@@ -29,11 +29,13 @@ from .door_push_env_cfg import (
     # 名称常量
     ARM_JOINT_NAMES,
     GRIPPER_JOINT_NAMES,
+    PLANAR_BASE_JOINT_NAMES,
     WHEEL_JOINT_NAMES,
     BASE_LINK_NAME,
     LEFT_EE_LINK_NAME,
     RIGHT_EE_LINK_NAME,
     DOOR_LEAF_BODY_NAME,
+    RESET_SETTLE_STEPS,
     # 持杯初始化常量
     LEFT_CUP_RELATIVE_XYZ,
     RIGHT_CUP_RELATIVE_XYZ,
@@ -52,25 +54,43 @@ from .door_push_env_cfg import (
 from .batch_math import (
     batch_quat_from_yaw,
     batch_quat_to_rotation_matrix,
+    batch_yaw_from_quat,
     batch_orientation_world_to_base,
     batch_pose_world_to_base,
     batch_rotate_relative_by_yaw,
     batch_vector_world_to_base,
-    compute_relative_angular_velocity_world,
-    compute_relative_point_velocity_world,
     sample_base_poses,
 )
 from .base_control_math import (
+    build_holonomic_wheel_target_matrix,
     clip_wheel_velocity_targets,
+    compute_root_force_torque_targets,
+    project_body_twist_to_planar_joint_targets,
+    resolve_holonomic_wheel_axis,
+    project_base_twist_to_wheel_targets,
     rescale_normalized_base_actions,
     twist_to_wheel_angular_velocity_targets,
 )
 from .door_reward_math import (
+    compute_base_approach_active_mask,
+    compute_door_traverse_success,
+    compute_inside_progress_delta,
     compute_normalized_approach_score,
     compute_point_to_panel_face_distance,
+    compute_point_to_segment_distance,
+    compute_signed_distance_to_plane,
+    update_crossing_latch,
+)
+from .doorway_geometry import (
+    DOORWAY_INNER_CORNERS_LOCAL,
+    DOORWAY_LOWER_EDGE_END_LOCAL,
+    DOORWAY_LOWER_EDGE_START_LOCAL,
+    transform_doorway_points_to_base,
+    transform_doorway_points_to_world,
 )
 from .gripper_hold import build_gripper_hold_targets
 from .joint_target_math import (
+    build_grasp_init_joint_positions,
     compute_joint_limit_margin_penalty,
     rescale_normalized_joint_actions,
 )
@@ -99,6 +119,8 @@ _EPISODE_REWARD_KEYS = (
     "task/open_bonus",
     "task/approach",
     "task/approach_raw",
+    "task/base_approach",
+    "task/base_cross",
     "stab_left",
     "stab_left/zero_acc",
     "stab_left/zero_ang",
@@ -123,11 +145,13 @@ _EPISODE_REWARD_KEYS = (
 )
 
 # 观测维度
-# actor: proprio(36) + ee(38) + context(2) + stability(2) + door_geometry(6) + base_twist/cmd(6) = 90
-# critic: actor_obs(90) + privileged(13) = 103
-_ACTOR_OBS_DIM = 90
-_CRITIC_OBS_DIM = 103
+# actor: proprio(36) + ee(38) + context(2) + stability(2) + door_geometry(6)
+#        + doorway_corners(12) + base_twist/cmd(6) = 102
+# critic: actor_obs(102) + privileged(13) = 115
+_ACTOR_OBS_DIM = 102
+_CRITIC_OBS_DIM = 115
 _DOOR_GEOMETRY_DIM = 6
+_DOOR_FRAME_CORNERS_DIM = 12
 _PRIVILEGED_DIM = 13
 
 
@@ -159,6 +183,7 @@ class DoorPushEnv(DirectRLEnv):
 
         self._arm_joint_ids, _ = robot.find_joints(ARM_JOINT_NAMES)
         self._gripper_joint_ids, _ = robot.find_joints(GRIPPER_JOINT_NAMES)
+        self._planar_joint_ids, _ = robot.find_joints(PLANAR_BASE_JOINT_NAMES)
         self._wheel_joint_ids, _ = robot.find_joints(WHEEL_JOINT_NAMES)
         self._base_body_idx = robot.find_bodies([BASE_LINK_NAME])[0][0]
         self._left_ee_body_idx = robot.find_bodies([LEFT_EE_LINK_NAME])[0][0]
@@ -208,11 +233,11 @@ class DoorPushEnv(DirectRLEnv):
         self._base_pos = torch.zeros(N, 3, device=dev)
         self._base_yaw = torch.zeros(N, device=dev)
 
-        # 上一帧的 EE 相对 base 的世界系线速度/角速度，用于稳定计算加速度
-        self._prev_left_ee_rel_lin_vel_w = torch.zeros(N, 3, device=dev)
-        self._prev_left_ee_rel_ang_vel_w = torch.zeros(N, 3, device=dev)
-        self._prev_right_ee_rel_lin_vel_w = torch.zeros(N, 3, device=dev)
-        self._prev_right_ee_rel_ang_vel_w = torch.zeros(N, 3, device=dev)
+        # 上一帧的 EE 世界系线速度/角速度，用于数值差分计算加速度
+        self._prev_left_ee_lin_vel_w = torch.zeros(N, 3, device=dev)
+        self._prev_left_ee_ang_vel_w = torch.zeros(N, 3, device=dev)
+        self._prev_right_ee_lin_vel_w = torch.zeros(N, 3, device=dev)
+        self._prev_right_ee_ang_vel_w = torch.zeros(N, 3, device=dev)
 
         self._episode_reset_fn = None
 
@@ -225,6 +250,13 @@ class DoorPushEnv(DirectRLEnv):
 
         # 预计算控制 dt
         self._control_dt = self.physics_dt * self.cfg.decimation
+        self._holonomic_wheel_target_matrix: Tensor | None = None
+        self._base_controller_backend = str(self.cfg.base_control_backend)
+        self._base_force_body_idx = self._base_body_idx
+        self._base_force_body_name = BASE_LINK_NAME
+        self._base_force_body_mass = torch.ones(N, device=dev)
+        self._base_force_body_inertia_zz = torch.ones(N, device=dev)
+        self._initialize_base_controller_backend()
 
         # ── 奖励计算用缓存（由 _get_observations 填充）───────────
         self._cached_left_ee_la = torch.zeros(N, 3, device=dev)
@@ -239,8 +271,19 @@ class DoorPushEnv(DirectRLEnv):
         self._cached_right_ee_pos_base = torch.zeros(N, 3, device=dev)
         self._cached_door_panel_face_center_base = torch.zeros(N, 3, device=dev)
         self._cached_door_panel_face_rot_base = torch.eye(3, device=dev).unsqueeze(0).repeat(N, 1, 1)
+        self._cached_doorway_corners_world = torch.zeros(N, 4, 3, device=dev)
+        self._cached_doorway_corners_base = torch.zeros(N, 4, 3, device=dev)
+        self._cached_base_signed_doorway_distance = torch.zeros(N, device=dev)
+        self._prev_base_signed_doorway_distance = torch.full((N,), float("nan"), device=dev)
+        self._cached_base_in_doorway_opening = torch.zeros(N, dtype=torch.bool, device=dev)
+        self._initial_base_doorway_dist = torch.full((N,), float("nan"), device=dev)
+        self._base_link_crossed = torch.zeros(N, dtype=torch.bool, device=dev)
+        self._cached_episode_success = torch.zeros(N, dtype=torch.bool, device=dev)
         self._cached_approach_dist = torch.zeros(N, device=dev)
         self._cached_base_cmd_delta = torch.zeros(N, 3, device=dev)
+        self._cached_base_force_cmd = torch.zeros(N, 3, device=dev)
+        self._cached_base_torque_cmd = torch.zeros(N, 3, device=dev)
+        self._cached_planar_joint_targets = torch.zeros(N, len(self._planar_joint_ids), device=dev)
         self._cached_wheel_saturation_ratio = torch.zeros(N, device=dev)
         self._initial_approach_dist = torch.full((N,), float("nan"), device=dev)
         self._episode_reward_sums = {
@@ -253,8 +296,153 @@ class DoorPushEnv(DirectRLEnv):
             dtype=torch.float32,
         )
         self._door_normal_local = torch.tensor(_DOOR_NORMAL_LOCAL, device=dev, dtype=torch.float32)
+        self._doorway_inner_corners_local = DOORWAY_INNER_CORNERS_LOCAL.to(device=dev)
+        self._doorway_lower_edge_start_local = DOORWAY_LOWER_EDGE_START_LOCAL.to(device=dev)
+        self._doorway_lower_edge_end_local = DOORWAY_LOWER_EDGE_END_LOCAL.to(device=dev)
+        self._doorway_plane_normal_local = torch.tensor([1.0, 0.0, 0.0], device=dev, dtype=torch.float32)
         self._left_cup_relative_xyz = torch.tensor(LEFT_CUP_RELATIVE_XYZ, device=dev, dtype=torch.float32)
         self._right_cup_relative_xyz = torch.tensor(RIGHT_CUP_RELATIVE_XYZ, device=dev, dtype=torch.float32)
+
+    def _initialize_base_controller_backend(self) -> None:
+        """Configure the selected mobile-base backend."""
+        backend = str(self.cfg.base_control_backend)
+        if backend == "planar_joint_velocity":
+            self._configure_planar_joint_velocity_backend()
+            self._base_controller_backend = backend
+            return
+        if backend == "root_force_torque":
+            self._configure_root_force_torque_backend()
+            self._base_controller_backend = backend
+            return
+        if backend == "analytic_mecanum_fallback":
+            self._holonomic_wheel_target_matrix = None
+            self._base_controller_backend = backend
+            return
+        if backend != "isaac_holonomic_controller":
+            raise ValueError(f"Unsupported base_control_backend: {backend}")
+        try:
+            self._holonomic_wheel_target_matrix = self._build_holonomic_wheel_target_matrix_from_usd()
+            self._base_controller_backend = "isaac_holonomic_controller"
+        except Exception as exc:  # pragma: no cover - exercised only inside live Isaac Sim sessions.
+            self._holonomic_wheel_target_matrix = None
+            self._base_controller_backend = "analytic_mecanum_fallback"
+            logger.warning("Falling back to analytic mecanum wheel mapping: %s", exc)
+
+    def _configure_planar_joint_velocity_backend(self) -> None:
+        """Disable wheel actuation so the mobile base is driven only by planar joints."""
+        robot: Articulation = self.scene["robot"]
+        if len(self._planar_joint_ids) != len(PLANAR_BASE_JOINT_NAMES):
+            raise RuntimeError(
+                "Planar base backend requires planar joints "
+                f"{PLANAR_BASE_JOINT_NAMES}, but only found {len(self._planar_joint_ids)}."
+            )
+        robot.write_joint_stiffness_to_sim(0.0, joint_ids=self._wheel_joint_ids)
+        robot.write_joint_damping_to_sim(0.0, joint_ids=self._wheel_joint_ids)
+        robot.write_joint_effort_limit_to_sim(0.0, joint_ids=self._wheel_joint_ids)
+        robot.set_joint_velocity_target(
+            torch.zeros((self.num_envs, len(self._wheel_joint_ids)), device=self.device),
+            joint_ids=self._wheel_joint_ids,
+        )
+
+    def _configure_root_force_torque_backend(self) -> None:
+        """Cache the driven body properties and disable wheel actuation feedback."""
+        robot: Articulation = self.scene["robot"]
+        force_body_name = self.cfg.base_force_body_name
+        if force_body_name not in robot.body_names:
+            logger.warning(
+                "Requested base_force_body_name '%s' was not found; falling back to '%s'.",
+                force_body_name,
+                BASE_LINK_NAME,
+            )
+            force_body_name = BASE_LINK_NAME
+        self._base_force_body_name = force_body_name
+        self._base_force_body_idx = robot.find_bodies([force_body_name])[0][0]
+        self._base_force_body_mass = robot.data.default_mass[:, self._base_force_body_idx].clone()
+        self._base_force_body_inertia_zz = robot.data.default_inertia[:, self._base_force_body_idx, 8].clone()
+
+        # Root-wrench control should not compete with implicit wheel velocity actuators.
+        robot.write_joint_stiffness_to_sim(0.0, joint_ids=self._wheel_joint_ids)
+        robot.write_joint_damping_to_sim(0.0, joint_ids=self._wheel_joint_ids)
+        robot.write_joint_effort_limit_to_sim(0.0, joint_ids=self._wheel_joint_ids)
+        robot.set_joint_velocity_target(
+            torch.zeros((self.num_envs, len(self._wheel_joint_ids)), device=self.device),
+            joint_ids=self._wheel_joint_ids,
+        )
+
+    def _build_holonomic_wheel_target_matrix_from_usd(self) -> Tensor:
+        """Read wheel metadata from the cloned robot USD and derive a batched wheel-target matrix."""
+        from isaacsim.robot.wheeled_robots.robots.holonomic_robot_usd_setup import HolonomicRobotUsdSetup
+
+        robot_prim_path = self.cfg.scene.robot.prim_path.replace("{ENV_REGEX_NS}", "/World/envs/env_0")
+        com_prim_path = f"{robot_prim_path}/{BASE_LINK_NAME}"
+        setup = HolonomicRobotUsdSetup(robot_prim_path=robot_prim_path, com_prim_path=com_prim_path)
+        if len(setup.wheel_dof_names) == 0:
+            raise RuntimeError(f"No holonomic wheel metadata found under {robot_prim_path}.")
+
+        matrix = build_holonomic_wheel_target_matrix(
+            wheel_radius=setup.wheel_radius,
+            wheel_positions=setup.wheel_positions,
+            wheel_orientations=setup.wheel_orientations,
+            mecanum_angles_deg=setup.mecanum_angles,
+            wheel_axis=resolve_holonomic_wheel_axis(
+                wheel_axis=setup.wheel_axis,
+                wheel_joint_names=WHEEL_JOINT_NAMES,
+            ),
+            up_axis=setup.up_axis,
+        )
+
+        name_to_row = {str(name): index for index, name in enumerate(setup.wheel_dof_names)}
+        try:
+            ordered_rows = [name_to_row[name] for name in WHEEL_JOINT_NAMES]
+        except KeyError as exc:
+            raise RuntimeError(
+                f"Holonomic metadata is missing wheel joint '{exc.args[0]}' in {robot_prim_path}."
+            ) from exc
+        return matrix[ordered_rows].to(device=self.device)
+
+    def _compute_wheel_targets(self, base_cmd: Tensor) -> Tensor:
+        """Project base twists to wheel velocity targets using the selected backend."""
+        if self._holonomic_wheel_target_matrix is not None:
+            return project_base_twist_to_wheel_targets(
+                base_cmd,
+                wheel_target_matrix=self._holonomic_wheel_target_matrix,
+            )
+        return twist_to_wheel_angular_velocity_targets(
+            base_cmd,
+            wheel_radius=self.cfg.wheel_radius,
+            half_length=self.cfg.wheel_base_half_length,
+            half_width=self.cfg.wheel_base_half_width,
+        )
+
+    def _compute_base_force_torque_targets(self, base_cmd: Tensor) -> tuple[Tensor, Tensor]:
+        """Track ``[vx, vy, wz]`` using local-frame wrench commands on the chosen base body."""
+        robot: Articulation = self.scene["robot"]
+        body_quat = robot.data.body_quat_w[:, self._base_force_body_idx]
+        base_lin_vel_base = batch_vector_world_to_base(
+            robot.data.body_lin_vel_w[:, self._base_force_body_idx],
+            body_quat,
+        )
+        base_ang_vel_base = batch_vector_world_to_base(
+            robot.data.body_ang_vel_w[:, self._base_force_body_idx],
+            body_quat,
+        )
+        return compute_root_force_torque_targets(
+            base_cmd,
+            base_lin_vel_base=base_lin_vel_base,
+            base_ang_vel_base=base_ang_vel_base,
+            base_mass=self._base_force_body_mass,
+            base_inertia_zz=self._base_force_body_inertia_zz,
+            lin_accel_gain_xy=self.cfg.base_lin_accel_gain_xy,
+            ang_accel_gain_z=self.cfg.base_ang_accel_gain_z,
+            force_limit_xy=self.cfg.base_force_limit_xy,
+            torque_limit_z=self.cfg.base_torque_limit_z,
+        )
+
+    def _compute_planar_joint_targets(self, base_cmd: Tensor) -> Tensor:
+        """Track body-frame ``[vx, vy, wz]`` with world-frame planar joint velocities."""
+        robot: Articulation = self.scene["robot"]
+        base_yaw = batch_yaw_from_quat(robot.data.body_quat_w[:, self._base_body_idx])
+        return project_body_twist_to_planar_joint_targets(base_cmd, base_yaw=base_yaw)
 
 
     # ═══════════════════════════════════════════════════════════════════
@@ -297,6 +485,63 @@ class DoorPushEnv(DirectRLEnv):
             eps=eps,
         )
 
+    def _compute_doorway_state(
+        self,
+        *,
+        base_pos_w: Tensor,
+        base_quat_w: Tensor,
+        door_root_pos_w: Tensor,
+        door_root_quat_w: Tensor,
+    ) -> dict[str, Tensor]:
+        """Compute doorway geometry in world, door-root, and base frames."""
+        doorway_corners_world = transform_doorway_points_to_world(
+            self._doorway_inner_corners_local.unsqueeze(0).expand(base_pos_w.shape[0], -1, -1),
+            door_root_pos_w,
+            door_root_quat_w,
+        )
+        doorway_corners_base = transform_doorway_points_to_base(
+            points_world=doorway_corners_world,
+            base_pos_w=base_pos_w,
+            base_quat_w=base_quat_w,
+        )
+        doorway_lower_start_w = doorway_corners_world[:, 0]
+        doorway_lower_end_w = doorway_corners_world[:, 1]
+
+        base_pos_ground_w = base_pos_w.clone()
+        base_pos_ground_w[:, 2] = 0.0
+        base_line_dist = compute_point_to_segment_distance(
+            points=base_pos_ground_w,
+            seg_start=doorway_lower_start_w,
+            seg_end=doorway_lower_end_w,
+        )
+
+        doorway_plane_normal_w = torch.bmm(
+            batch_quat_to_rotation_matrix(door_root_quat_w),
+            self._doorway_plane_normal_local.view(1, 3, 1).expand(base_pos_w.shape[0], -1, -1),
+        ).squeeze(-1)
+        base_pos_door = batch_vector_world_to_base(base_pos_w - door_root_pos_w, door_root_quat_w)
+        base_signed_distance = compute_signed_distance_to_plane(
+            points=base_pos_w,
+            plane_points=door_root_pos_w,
+            plane_normals=doorway_plane_normal_w,
+        )
+        base_in_opening = (
+            (base_pos_door[:, 1] >= float(self._doorway_lower_edge_start_local[1]))
+            & (base_pos_door[:, 1] <= float(self._doorway_lower_edge_end_local[1]))
+        )
+
+        return {
+            "doorway_corners_world": doorway_corners_world,
+            "doorway_corners_base": doorway_corners_base,
+            "doorway_lower_start_w": doorway_lower_start_w,
+            "doorway_lower_end_w": doorway_lower_end_w,
+            "doorway_plane_normal_w": doorway_plane_normal_w,
+            "base_pos_door": base_pos_door,
+            "base_line_dist": base_line_dist,
+            "base_signed_distance": base_signed_distance,
+            "base_in_opening": base_in_opening,
+        }
+
     def _set_gripper_hold_targets(self, env_ids: Tensor | None = None) -> None:
         """刷新夹爪保持目标。
 
@@ -335,7 +580,10 @@ class DoorPushEnv(DirectRLEnv):
 
         控制链路：
             arm: a_norm[-1,1] → joint limits → (optional) noise → position target
-            base: a_norm[-1,1] → [vx, vy, wz] → wheel velocity targets
+            base:
+                - ``planar_joint_velocity``: a_norm[-1,1] → [vx, vy, wz] → world-frame planar joint velocities
+                - ``root_force_torque``: a_norm[-1,1] → [vx, vy, wz] → local wrench
+                - wheel backends: a_norm[-1,1] → [vx, vy, wz] → wheel velocity targets
         """
         robot: Articulation = self.scene["robot"]
         arm_actions = actions[:, : len(self._arm_joint_ids)]
@@ -357,34 +605,55 @@ class DoorPushEnv(DirectRLEnv):
                 q_max.unsqueeze(0),
             )
 
-        # 3. 将底盘动作映射为 wheel velocity targets，并记录命令变化
+        # 3. 将底盘动作映射为驱动命令，并记录命令变化
         base_cmd = rescale_normalized_base_actions(
             base_actions,
             max_lin_vel_x=self.cfg.base_max_lin_vel_x,
             max_lin_vel_y=self.cfg.base_max_lin_vel_y,
             max_ang_vel_z=self.cfg.base_max_ang_vel_z,
         )
-        wheel_targets = twist_to_wheel_angular_velocity_targets(
-            base_cmd,
-            wheel_radius=self.cfg.wheel_radius,
-            half_length=self.cfg.wheel_base_half_length,
-            half_width=self.cfg.wheel_base_half_width,
-        )
-        wheel_targets, saturation_ratio = clip_wheel_velocity_targets(
-            wheel_targets,
-            velocity_limit=self.cfg.wheel_velocity_limit,
-        )
         self._cached_base_cmd_delta = base_cmd - self._prev_base_cmd
-        self._cached_wheel_saturation_ratio = saturation_ratio
+        if self._base_controller_backend == "planar_joint_velocity":
+            planar_joint_targets = self._compute_planar_joint_targets(base_cmd)
+            robot.set_joint_velocity_target(
+                planar_joint_targets,
+                joint_ids=self._planar_joint_ids,
+            )
+            robot.set_joint_velocity_target(
+                torch.zeros((self.num_envs, len(self._wheel_joint_ids)), device=self.device),
+                joint_ids=self._wheel_joint_ids,
+            )
+            self._cached_planar_joint_targets = planar_joint_targets
+            self._cached_base_force_cmd.zero_()
+            self._cached_base_torque_cmd.zero_()
+            self._cached_wheel_saturation_ratio.zero_()
+        elif self._base_controller_backend == "root_force_torque":
+            force_cmd, torque_cmd = self._compute_base_force_torque_targets(base_cmd)
+            wheel_targets = torch.zeros((self.num_envs, len(self._wheel_joint_ids)), device=self.device)
+            self._cached_base_force_cmd = force_cmd
+            self._cached_base_torque_cmd = torque_cmd
+            self._cached_planar_joint_targets.zero_()
+            self._cached_wheel_saturation_ratio.zero_()
+        else:
+            wheel_targets = self._compute_wheel_targets(base_cmd)
+            wheel_targets, saturation_ratio = clip_wheel_velocity_targets(
+                wheel_targets,
+                velocity_limit=self.cfg.wheel_velocity_limit,
+            )
+            self._cached_base_force_cmd.zero_()
+            self._cached_base_torque_cmd.zero_()
+            self._cached_planar_joint_targets.zero_()
+            self._cached_wheel_saturation_ratio = saturation_ratio
 
         robot.set_joint_position_target(
             q_target_cmd,
             joint_ids=self._arm_joint_ids,
         )
-        robot.set_joint_velocity_target(
-            wheel_targets,
-            joint_ids=self._wheel_joint_ids,
-        )
+        if self._base_controller_backend not in ("root_force_torque", "planar_joint_velocity"):
+            robot.set_joint_velocity_target(
+                wheel_targets,
+                joint_ids=self._wheel_joint_ids,
+            )
 
         # 4. 保持 gripper hold targets
         self._set_gripper_hold_targets()
@@ -394,7 +663,15 @@ class DoorPushEnv(DirectRLEnv):
         self._prev_base_cmd = base_cmd.clone()
 
     def _apply_action(self) -> None:
-        """动作已在 `_pre_physics_step()` 中写入 articulation 缓冲，这里无需重复处理。"""
+        """Write per-substep actions into articulation buffers before each simulator step."""
+        if self._base_controller_backend == "root_force_torque":
+            robot: Articulation = self.scene["robot"]
+            robot.instantaneous_wrench_composer.set_forces_and_torques(
+                forces=self._cached_base_force_cmd.unsqueeze(1),
+                torques=self._cached_base_torque_cmd.unsqueeze(1),
+                body_ids=[self._base_force_body_idx],
+                is_global=False,
+            )
         return
 
     # ═══════════════════════════════════════════════════════════════════
@@ -459,53 +736,30 @@ class DoorPushEnv(DirectRLEnv):
             base_av,
         )
 
-        # ── 数值微分计算加速度（先在世界系相对速度上差分，再转到当前 base 系）──
-        left_ee_rel_lv_w = compute_relative_point_velocity_world(
-            point_pos_w=left_ee_pos_w,
-            point_lin_vel_w=left_ee_lv_w,
-            base_pos_w=base_pos,
-            base_lin_vel_w=base_lv,
-            base_ang_vel_w=base_av,
-        )
-        left_ee_rel_av_w = compute_relative_angular_velocity_world(
-            point_ang_vel_w=left_ee_av_w,
-            base_ang_vel_w=base_av,
-        )
-        right_ee_rel_lv_w = compute_relative_point_velocity_world(
-            point_pos_w=right_ee_pos_w,
-            point_lin_vel_w=right_ee_lv_w,
-            base_pos_w=base_pos,
-            base_lin_vel_w=base_lv,
-            base_ang_vel_w=base_av,
-        )
-        right_ee_rel_av_w = compute_relative_angular_velocity_world(
-            point_ang_vel_w=right_ee_av_w,
-            base_ang_vel_w=base_av,
-        )
-
+        # ── 数值微分计算加速度（对世界系速度差分，再转到当前 base 系）──
         inv_dt = 1.0 / max(self._control_dt, 1e-6)
         left_ee_la = batch_vector_world_to_base(
-            (left_ee_rel_lv_w - self._prev_left_ee_rel_lin_vel_w) * inv_dt,
+            (left_ee_lv_w - self._prev_left_ee_lin_vel_w) * inv_dt,
             base_quat,
         )
         left_ee_aa = batch_vector_world_to_base(
-            (left_ee_rel_av_w - self._prev_left_ee_rel_ang_vel_w) * inv_dt,
+            (left_ee_av_w - self._prev_left_ee_ang_vel_w) * inv_dt,
             base_quat,
         )
         right_ee_la = batch_vector_world_to_base(
-            (right_ee_rel_lv_w - self._prev_right_ee_rel_lin_vel_w) * inv_dt,
+            (right_ee_lv_w - self._prev_right_ee_lin_vel_w) * inv_dt,
             base_quat,
         )
         right_ee_aa = batch_vector_world_to_base(
-            (right_ee_rel_av_w - self._prev_right_ee_rel_ang_vel_w) * inv_dt,
+            (right_ee_av_w - self._prev_right_ee_ang_vel_w) * inv_dt,
             base_quat,
         )
 
         # 更新速度缓存
-        self._prev_left_ee_rel_lin_vel_w = left_ee_rel_lv_w.clone()
-        self._prev_left_ee_rel_ang_vel_w = left_ee_rel_av_w.clone()
-        self._prev_right_ee_rel_lin_vel_w = right_ee_rel_lv_w.clone()
-        self._prev_right_ee_rel_ang_vel_w = right_ee_rel_av_w.clone()
+        self._prev_left_ee_lin_vel_w = left_ee_lv_w.clone()
+        self._prev_left_ee_ang_vel_w = left_ee_av_w.clone()
+        self._prev_right_ee_lin_vel_w = right_ee_lv_w.clone()
+        self._prev_right_ee_ang_vel_w = right_ee_av_w.clone()
 
         # ── 稳定性 proxy: tilt ──────────────────────────────────
         left_tilt, left_tilt_perp = self._compute_tilt(left_ee_quat_w)   # (N, 1), (N, 2)
@@ -536,6 +790,8 @@ class DoorPushEnv(DirectRLEnv):
         )  # (N, 6)
 
         # ── 门几何观测（base_link 系）─────────────────────────────
+        door_root_pos_w = door.data.root_pos_w    # (N, 3)
+        door_root_quat_w = door.data.root_quat_w  # (N, 4)
         door_leaf_pos_w = door.data.body_pos_w[:, self._door_panel_body_idx]   # (N, 3)
         door_leaf_quat_w = door.data.body_quat_w[:, self._door_panel_body_idx]  # (N, 4)
 
@@ -571,6 +827,28 @@ class DoorPushEnv(DirectRLEnv):
         self._cached_door_panel_face_center_base = door_panel_face_center_base.clone()
         self._cached_door_panel_face_rot_base = door_panel_face_rot_base.clone()
 
+        doorway_state = self._compute_doorway_state(
+            base_pos_w=base_pos,
+            base_quat_w=base_quat,
+            door_root_pos_w=door_root_pos_w,
+            door_root_quat_w=door_root_quat_w,
+        )
+        doorway_corners_base = doorway_state["doorway_corners_base"]
+        self._cached_doorway_corners_world = doorway_state["doorway_corners_world"].clone()
+        self._cached_doorway_corners_base = doorway_corners_base.clone()
+        self._cached_base_signed_doorway_distance = doorway_state["base_signed_distance"].clone()
+        self._cached_base_in_doorway_opening = doorway_state["base_in_opening"].clone()
+        self._prev_base_signed_doorway_distance = torch.where(
+            torch.isnan(self._prev_base_signed_doorway_distance),
+            doorway_state["base_signed_distance"],
+            self._prev_base_signed_doorway_distance,
+        )
+        self._initial_base_doorway_dist = torch.where(
+            torch.isnan(self._initial_base_doorway_dist),
+            doorway_state["base_line_dist"],
+            self._initial_base_doorway_dist,
+        )
+
         left_approach_dist = self._compute_point_to_panel_face_distance(
             points_base=left_ee_pos_base,
             face_center_base=door_panel_face_center_base,
@@ -595,6 +873,7 @@ class DoorPushEnv(DirectRLEnv):
         )
 
         door_geometry = torch.cat([door_center_base, door_normal_base], dim=-1)  # (N, 6)
+        doorway_frame_obs = doorway_corners_base.reshape(self.num_envs, -1)  # (N, 12)
 
         # ── Actor obs (含噪声) ──────────────────────────────────
         noisy_q = all_q
@@ -603,7 +882,8 @@ class DoorPushEnv(DirectRLEnv):
             noisy_q = all_q + torch.randn_like(all_q) * self.cfg.obs_noise_std
             noisy_dq = all_dq + torch.randn_like(all_dq) * self.cfg.obs_noise_std
 
-        # actor: proprio(36) + ee(38) + context(2) + stability(2) + door_geometry(6) + base_twist/cmd(6) = 90
+        # actor: proprio(36) + ee(38) + context(2) + stability(2) + door_geometry(6)
+        #        + doorway_frame(12) + base_twist/cmd(6) = 102
         actor_obs = torch.cat([
             # proprio: q(12) + dq(12) + prev_joint_target(12) = 36
             noisy_q, noisy_dq, self._prev_joint_target,
@@ -621,14 +901,14 @@ class DoorPushEnv(DirectRLEnv):
             left_tilt, right_tilt,
             # door_geometry: center(3) + normal(3) = 6
             door_geometry,
+            # doorway_frame: 4 inner-frame corners x xyz = 12
+            doorway_frame_obs,
             # base_twist/cmd: v_xy(2) + wz(1) + prev_base_cmd(3) = 6
             base_twist_cmd_obs,
-        ], dim=-1)  # (N, 90)
+        ], dim=-1)  # (N, 102)
 
         # ── Critic obs (无噪声 + privileged) ───────────────────
         # 门状态 (base_link 系)
-        door_root_pos_w = door.data.root_pos_w    # (N, 3)
-        door_root_quat_w = door.data.root_quat_w  # (N, 4)
         door_pose_base = batch_pose_world_to_base(
             door_root_pos_w, door_root_quat_w, base_pos, base_quat,
         )  # (N, 7)
@@ -653,6 +933,7 @@ class DoorPushEnv(DirectRLEnv):
             left_occ, right_occ, left_tilt, right_tilt,
             # door_geometry（与 actor 相同）
             door_geometry,
+            doorway_frame_obs,
             # base_twist/cmd（与 actor 相同）
             base_twist_cmd_obs,
             # privileged: door_pose(7) + door_joint(2) + domain_params(3) + cup_dropped(1) = 13
@@ -662,7 +943,7 @@ class DoorPushEnv(DirectRLEnv):
             self._door_mass.unsqueeze(-1),
             self._door_damping.unsqueeze(-1),
             cup_dropped.float().unsqueeze(-1),
-        ], dim=-1)  # (N, 103)
+        ], dim=-1)  # (N, 115)
 
         return {"policy": actor_obs, "critic": critic_obs}
 
@@ -684,7 +965,7 @@ class DoorPushEnv(DirectRLEnv):
         # ══════════════════════════════════════════════════════════════
         delta = theta - theta_prev
 
-        target = self.cfg.success_angle_threshold
+        target = self.cfg.door_angle_target
         w_below = torch.full_like(theta, self.cfg.rew_w_delta)
         w_above = self.cfg.rew_w_delta * torch.clamp(
             1.0 - self.cfg.rew_k_decay * (theta - target),
@@ -706,14 +987,89 @@ class DoorPushEnv(DirectRLEnv):
             * self.cfg.rew_w_approach
             * r_task_approach_raw
         )
-        r_task = r_task_delta + r_task_open_bonus + r_task_approach
         self._already_succeeded = self._already_succeeded | newly_succeeded
+
+        door_root_pos_w = door.data.root_pos_w
+        door_root_quat_w = door.data.root_quat_w
+        base_pos_w = robot.data.body_pos_w[:, self._base_body_idx]
+        base_quat_w = robot.data.body_quat_w[:, self._base_body_idx]
+        doorway_state = self._compute_doorway_state(
+            base_pos_w=base_pos_w,
+            base_quat_w=base_quat_w,
+            door_root_pos_w=door_root_pos_w,
+            door_root_quat_w=door_root_quat_w,
+        )
+        current_base_line_dist = doorway_state["base_line_dist"]
+        self._initial_base_doorway_dist = torch.where(
+            torch.isnan(self._initial_base_doorway_dist),
+            current_base_line_dist,
+            self._initial_base_doorway_dist,
+        )
+        base_approach_raw = self._compute_normalized_approach_score(
+            current_dist=current_base_line_dist,
+            initial_dist=self._initial_base_doorway_dist,
+            eps=self.cfg.rew_approach_eps,
+        )
+        base_approach_active = compute_base_approach_active_mask(
+            base_crossed=self._base_link_crossed,
+            current_signed_distance=doorway_state["base_signed_distance"],
+        )
+        r_task_base_approach = (
+            base_approach_active.float()
+            * (theta >= self.cfg.rew_base_approach_open_gate).float()
+            * self.cfg.rew_w_base_approach
+            * base_approach_raw
+        )
+
+        current_base_signed_distance = doorway_state["base_signed_distance"]
+        prev_base_signed_distance = torch.where(
+            torch.isnan(self._prev_base_signed_doorway_distance),
+            current_base_signed_distance,
+            self._prev_base_signed_doorway_distance,
+        )
+        r_task_base_cross = (
+            (theta >= self.cfg.rew_base_cross_open_gate).float()
+            * self.cfg.rew_w_base_cross
+            * compute_inside_progress_delta(
+                previous_signed_distance=prev_base_signed_distance,
+                current_signed_distance=current_base_signed_distance,
+                in_opening=doorway_state["base_in_opening"],
+            )
+        )
+        self._base_link_crossed = update_crossing_latch(
+            previous_crossed=self._base_link_crossed,
+            previous_signed_distance=prev_base_signed_distance,
+            current_signed_distance=current_base_signed_distance,
+            in_opening=doorway_state["base_in_opening"],
+        )
+        self._cached_base_signed_doorway_distance = current_base_signed_distance.clone()
+        self._cached_base_in_doorway_opening = doorway_state["base_in_opening"].clone()
+        self._prev_base_signed_doorway_distance = current_base_signed_distance.clone()
+
+        cup_dropped = self._cached_cup_dropped
+        success = compute_door_traverse_success(
+            door_angle=theta,
+            door_angle_target=self.cfg.door_angle_target,
+            cup_dropped=cup_dropped,
+            base_crossed=self._base_link_crossed,
+        )
+        self._cached_episode_success = success
+
+        r_task = (
+            r_task_delta
+            + r_task_open_bonus
+            + r_task_approach
+            + r_task_base_approach
+            + r_task_base_cross
+        )
 
         reward_info["task"] = r_task
         reward_info["task/delta"] = r_task_delta
         reward_info["task/open_bonus"] = r_task_open_bonus
         reward_info["task/approach"] = r_task_approach
         reward_info["task/approach_raw"] = r_task_approach_raw
+        reward_info["task/base_approach"] = r_task_base_approach
+        reward_info["task/base_cross"] = r_task_base_cross
 
         # ══════════════════════════════════════════════════════════════
         # §5 稳定性奖励：5 子项 × 双臂（使用缓存的加速度 + tilt_perp）
@@ -783,7 +1139,6 @@ class DoorPushEnv(DirectRLEnv):
             beta=self.cfg.rew_beta_target,
         )
 
-        cup_dropped = self._cached_cup_dropped
         r_safe_cup_drop = cup_dropped.float() * self.cfg.rew_w_drop
 
         # 关节移动惩罚：惩罚相邻步的关节角变化量
@@ -793,8 +1148,6 @@ class DoorPushEnv(DirectRLEnv):
         # 杯体-门板接近惩罚：只对持杯侧生效
         cup_left: RigidObject = self.scene["cup_left"]
         cup_right: RigidObject = self.scene["cup_right"]
-        base_pos_w = robot.data.body_pos_w[:, self._base_body_idx]
-        base_quat_w = robot.data.body_quat_w[:, self._base_body_idx]
         left_cup_base = batch_vector_world_to_base(
             cup_left.data.root_pos_w - base_pos_w, base_quat_w
         )
@@ -866,20 +1219,25 @@ class DoorPushEnv(DirectRLEnv):
         for key, value in reward_info.items():
             self._episode_reward_sums[key] += value
 
-        angle_reached = theta >= self.cfg.door_angle_target
-        truncated = self._step_count >= self.max_episode_length
-        done_mask = cup_dropped | angle_reached | truncated
+        door_open_met = theta >= self.cfg.door_angle_target
+        truncated = (self._step_count + 1) >= self.max_episode_length
+        done_mask = cup_dropped | success | truncated
         if done_mask.any():
             done_env_ids = done_mask.nonzero(as_tuple=False).squeeze(-1)
             self.extras["episode_reward_info"] = {
                 key: value[done_env_ids].clone() for key, value in self._episode_reward_sums.items()
             }
-            self.extras["success"] = (angle_reached & ~cup_dropped)[done_env_ids].clone()
+            self.extras["success"] = success[done_env_ids].clone()
             self.extras["episode_left_occupied"] = self._left_occupied[done_env_ids].clone()
             self.extras["episode_right_occupied"] = self._right_occupied[done_env_ids].clone()
             self.extras["door_angle"] = theta[done_env_ids].clone()
+            self.extras["base_crossed"] = self._base_link_crossed[done_env_ids].clone()
+            self.extras["door_open_met"] = door_open_met[done_env_ids].clone()
             self.extras["fail_cup_drop"] = cup_dropped[done_env_ids].clone()
-            self.extras["fail_timeout"] = (truncated & ~cup_dropped)[done_env_ids].clone()
+            self.extras["fail_timeout"] = (truncated & ~cup_dropped & ~success)[done_env_ids].clone()
+            self.extras["fail_not_crossed"] = (
+                truncated & ~cup_dropped & ~self._base_link_crossed
+            )[done_env_ids].clone()
 
         # 更新门角度缓存
         self._prev_door_angle = theta.clone()
@@ -906,9 +1264,9 @@ class DoorPushEnv(DirectRLEnv):
         theta = door.data.joint_pos[:, 0]
 
         cup_dropped = self._cached_cup_dropped  # L12: 复用 _get_observations 的缓存
-        angle_reached = theta >= self.cfg.door_angle_target
+        success = self._cached_episode_success
 
-        terminated = cup_dropped | angle_reached
+        terminated = cup_dropped | success
         truncated = self._step_count >= self.max_episode_length
 
         return terminated, truncated
@@ -954,19 +1312,23 @@ class DoorPushEnv(DirectRLEnv):
         self._apply_episode_reset_callback_overrides(
             env_ids, skip_mask=explicit_override_mask
         )
+        self._base_pos[env_ids, 2] = self.cfg.base_height
 
-        # ── 2. 写入机器人 base pose ─────────────────────────────
+        # ── 2. 写入机器人 root state 与 planar joint pose ──────
         robot: Articulation = self.scene["robot"]
         default_root = robot.data.default_root_state[env_ids].clone()
-        default_root[:, :3] = self._base_pos[env_ids] + self.scene.env_origins[env_ids]
-        base_quat = batch_quat_from_yaw(self._base_yaw[env_ids])
-        default_root[:, 3:7] = base_quat
+        default_root[:, :3] += self.scene.env_origins[env_ids]
         default_root[:, 7:] = 0.0  # 零速度
         robot.write_root_state_to_sim(default_root, env_ids)
 
-        # 重置关节到默认位置
-        default_jpos = robot.data.default_joint_pos[env_ids]
-        default_jvel = robot.data.default_joint_vel[env_ids]
+        # 重置关节到默认位置，并显式写入 planar base 关节
+        default_jpos = robot.data.default_joint_pos[env_ids].clone()
+        default_jvel = robot.data.default_joint_vel[env_ids].clone()
+        default_jpos[:, self._planar_joint_ids[0]] = self._base_pos[env_ids, 0]
+        default_jpos[:, self._planar_joint_ids[1]] = self._base_pos[env_ids, 1]
+        default_jpos[:, self._planar_joint_ids[2]] = self._base_yaw[env_ids]
+        default_jvel[:, self._planar_joint_ids] = 0.0
+        default_jvel[:, self._wheel_joint_ids] = 0.0
         robot.write_joint_state_to_sim(default_jpos, default_jvel, None, env_ids)
 
         # ── 3. 重置门关节角度 ────────────────────────────────────
@@ -974,6 +1336,36 @@ class DoorPushEnv(DirectRLEnv):
         zero_door_pos = torch.zeros(n, door.num_joints, device=self.device)
         zero_door_vel = torch.zeros(n, door.num_joints, device=self.device)
         door.write_joint_state_to_sim(zero_door_pos, zero_door_vel, None, env_ids)
+
+        # ── 3.5 物理 settle：刷新 arm PD / planar velocity target ─────
+        settle_target = default_jpos[:, self._arm_joint_ids]
+        zero_planar_vel = torch.zeros((n, len(self._planar_joint_ids)), device=self.device)
+        zero_wheel_vel = torch.zeros((n, len(self._wheel_joint_ids)), device=self.device)
+
+        self.scene.write_data_to_sim()
+        for _ in range(RESET_SETTLE_STEPS):
+            robot.set_joint_position_target(
+                settle_target,
+                joint_ids=self._arm_joint_ids,
+                env_ids=env_ids,
+            )
+            robot.set_joint_velocity_target(
+                zero_planar_vel,
+                joint_ids=self._planar_joint_ids,
+                env_ids=env_ids,
+            )
+            robot.set_joint_velocity_target(
+                zero_wheel_vel,
+                joint_ids=self._wheel_joint_ids,
+                env_ids=env_ids,
+            )
+            self.scene.write_data_to_sim()
+            self.sim.step(render=False)
+            self.scene.update(dt=self.physics_dt)
+
+        # 清零速度并重申目标 planar pose，避免 reset 后的关节残留漂移。
+        settled_jvel = torch.zeros_like(default_jvel)
+        robot.write_joint_state_to_sim(default_jpos, settled_jvel, None, env_ids)
 
         # ── 4. occupancy 已由 reset 事件或外部接口设置 ──────────
         # 不在此处重置，保留 Isaac Lab reset event 或手动脚本注入的 occupancy。
@@ -987,7 +1379,10 @@ class DoorPushEnv(DirectRLEnv):
         need_cup = self._left_occupied[env_ids] | self._right_occupied[env_ids]
         if need_cup.any():
             cup_env_ids = env_ids[need_cup]
-            self._batch_cup_grasp_init(cup_env_ids)
+            self._batch_cup_grasp_init(
+                cup_env_ids,
+                joint_pos_seed=default_jpos[need_cup],
+            )
 
         # 重置完成后立即刷新 gripper hold target，避免沿用上一回合目标。
         self._set_gripper_hold_targets(env_ids)
@@ -1002,17 +1397,30 @@ class DoorPushEnv(DirectRLEnv):
         self._prev_arm_joint_pos[env_ids] = 0.0
         self._prev_base_cmd[env_ids] = 0.0
         self._already_succeeded[env_ids] = False
-        self._prev_left_ee_rel_lin_vel_w[env_ids] = 0.0
-        self._prev_left_ee_rel_ang_vel_w[env_ids] = 0.0
-        self._prev_right_ee_rel_lin_vel_w[env_ids] = 0.0
-        self._prev_right_ee_rel_ang_vel_w[env_ids] = 0.0
+        self._prev_left_ee_lin_vel_w[env_ids] = 0.0
+        self._prev_left_ee_ang_vel_w[env_ids] = 0.0
+        self._prev_right_ee_lin_vel_w[env_ids] = 0.0
+        self._prev_right_ee_ang_vel_w[env_ids] = 0.0
         self._cached_cup_dropped[env_ids] = False
+        self._cached_doorway_corners_world[env_ids] = 0.0
+        self._cached_doorway_corners_base[env_ids] = 0.0
+        self._cached_base_signed_doorway_distance[env_ids] = 0.0
+        self._prev_base_signed_doorway_distance[env_ids] = float("nan")
+        self._cached_base_in_doorway_opening[env_ids] = False
+        self._initial_base_doorway_dist[env_ids] = float("nan")
+        self._base_link_crossed[env_ids] = False
+        self._cached_episode_success[env_ids] = False
         self._cached_approach_dist[env_ids] = 0.0
         self._cached_base_cmd_delta[env_ids] = 0.0
+        self._cached_base_force_cmd[env_ids] = 0.0
+        self._cached_base_torque_cmd[env_ids] = 0.0
+        self._cached_planar_joint_targets[env_ids] = 0.0
         self._cached_wheel_saturation_ratio[env_ids] = 0.0
         self._initial_approach_dist[env_ids] = float("nan")
         for value in self._episode_reward_sums.values():
             value[env_ids] = 0.0
+
+        robot.instantaneous_wrench_composer.reset(env_ids)
 
     # ═══════════════════════════════════════════════════════════════════
     # 视口帧捕获
@@ -1122,7 +1530,8 @@ class DoorPushEnv(DirectRLEnv):
         door: Articulation = self.scene["door"]
         cup_dropped = self._check_cup_dropped()
         door_angle = door.data.joint_pos[:, 0].clone()
-        episode_success = (door_angle >= self.cfg.door_angle_target) & ~cup_dropped
+        door_open_met = door_angle >= self.cfg.door_angle_target
+        episode_success = door_open_met & ~cup_dropped & self._base_link_crossed
         base_pos = robot.data.body_pos_w[:, self._base_body_idx].clone()
         base_quat = robot.data.body_quat_w[:, self._base_body_idx].clone()
         base_lin_vel_base = batch_vector_world_to_base(
@@ -1138,7 +1547,9 @@ class DoorPushEnv(DirectRLEnv):
             "left_occupied": self._left_occupied.clone(),
             "right_occupied": self._right_occupied.clone(),
             "door_angle": door_angle,
+            "door_open_met": door_open_met,
             "cup_dropped": cup_dropped,
+            "base_crossed": self._base_link_crossed.clone(),
             "episode_success": episode_success,
             "arm_joint_positions": robot.data.joint_pos[:, self._arm_joint_ids].clone(),
             "arm_joint_targets": self._prev_joint_target.clone(),
@@ -1147,6 +1558,13 @@ class DoorPushEnv(DirectRLEnv):
             "base_lin_vel_base": base_lin_vel_base.clone(),
             "base_ang_vel_base": base_ang_vel_base.clone(),
             "base_cmd": self._prev_base_cmd.clone(),
+            "base_controller_backend": self._base_controller_backend,
+            "base_force_body_name": self._base_force_body_name,
+            "base_force_cmd": self._cached_base_force_cmd.clone(),
+            "base_torque_cmd": self._cached_base_torque_cmd.clone(),
+            "planar_joint_positions": robot.data.joint_pos[:, self._planar_joint_ids].clone(),
+            "planar_joint_velocities": robot.data.joint_vel[:, self._planar_joint_ids].clone(),
+            "planar_joint_targets": self._cached_planar_joint_targets.clone(),
             "wheel_joint_velocities": robot.data.joint_vel[:, self._wheel_joint_ids].clone(),
             "wheel_saturation_ratio": self._cached_wheel_saturation_ratio.clone(),
         }
@@ -1196,22 +1614,14 @@ class DoorPushEnv(DirectRLEnv):
         base_lv_w: Tensor,
         base_av_w: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        """将世界系 EE 状态变换到 base_link 相对系。"""
+        """将世界系 EE 状态变换到 base_link 相对系。
+
+        位置和姿态变换到 base_link 相对系；速度直接旋转到 base_link 系表达（世界系速度）。
+        """
         pos_base = batch_vector_world_to_base(ee_pos_w - base_pos_w, base_quat_w)
         quat_base = batch_orientation_world_to_base(ee_quat_w, base_quat_w)
-        rel_lv_w = compute_relative_point_velocity_world(
-            point_pos_w=ee_pos_w,
-            point_lin_vel_w=ee_lv_w,
-            base_pos_w=base_pos_w,
-            base_lin_vel_w=base_lv_w,
-            base_ang_vel_w=base_av_w,
-        )
-        rel_av_w = compute_relative_angular_velocity_world(
-            point_ang_vel_w=ee_av_w,
-            base_ang_vel_w=base_av_w,
-        )
-        lv_base = batch_vector_world_to_base(rel_lv_w, base_quat_w)
-        av_base = batch_vector_world_to_base(rel_av_w, base_quat_w)
+        lv_base = batch_vector_world_to_base(ee_lv_w, base_quat_w)
+        av_base = batch_vector_world_to_base(ee_av_w, base_quat_w)
         return pos_base, quat_base, lv_base, av_base
 
     def _has_pending_domain_overrides(self, env_ids: Tensor) -> Tensor:
@@ -1463,7 +1873,7 @@ class DoorPushEnv(DirectRLEnv):
                     target_env_ids_r.cpu(),
                 )
 
-    def _batch_cup_grasp_init(self, env_ids: Tensor) -> None:
+    def _batch_cup_grasp_init(self, env_ids: Tensor, *, joint_pos_seed: Tensor | None = None) -> None:
         """批量持杯初始化 — 纯 teleport 方式，不调用 sim.step()。
 
         直接将臂关节设到关闭抓取姿态，并将杯体 teleport 到夹爪位置。
@@ -1481,11 +1891,18 @@ class DoorPushEnv(DirectRLEnv):
         n = len(env_ids)
 
         # ── 1. 设置臂关节到预设抓取姿态（直接到最终状态）──────────
-        # 使用 default_joint_pos 作为基准（而非 stale 的 data.joint_pos）
-        joint_pos = robot.data.default_joint_pos[env_ids].clone()  # (n, num_joints)
-        joint_pos[:, self._left_grasp_joint_ids] = self._left_grasp_joint_targets
-        joint_pos[:, self._right_grasp_joint_ids] = self._right_grasp_joint_targets
-        joint_pos[:, self._gripper_joint_ids] = self._gripper_close_targets
+        # 从 reset 已写好的 joint seed 开始，保留 planar base pose，不要回退到底层默认关节状态。
+        if joint_pos_seed is None:
+            joint_pos_seed = robot.data.default_joint_pos[env_ids]
+        joint_pos = build_grasp_init_joint_positions(
+            joint_seed=joint_pos_seed,
+            left_grasp_joint_ids=self._left_grasp_joint_ids,
+            left_grasp_joint_targets=self._left_grasp_joint_targets,
+            right_grasp_joint_ids=self._right_grasp_joint_ids,
+            right_grasp_joint_targets=self._right_grasp_joint_targets,
+            gripper_joint_ids=self._gripper_joint_ids,
+            gripper_joint_targets=self._gripper_close_targets,
+        )
 
         joint_vel = torch.zeros_like(joint_pos)  # (n, num_joints)
         robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)

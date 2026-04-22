@@ -48,6 +48,8 @@ class DoorPushTensorboardObserver(IsaacAlgoObserver):
             self._door_angle_count += int(door_angle.numel())
 
         success = self._select_done_values(infos.get("success"), done_env_ids, cast_float=False)
+        base_crossed = self._select_done_values(infos.get("base_crossed"), done_env_ids, cast_float=False)
+        door_open_met = self._select_done_values(infos.get("door_open_met"), done_env_ids, cast_float=False)
         left_occupied = self._select_done_values(
             infos.get("episode_left_occupied"),
             done_env_ids,
@@ -62,6 +64,14 @@ class DoorPushTensorboardObserver(IsaacAlgoObserver):
             return
 
         success = success.to(dtype=torch.bool)
+        if base_crossed is not None:
+            base_crossed = base_crossed.to(dtype=torch.bool)
+            self._task_state_counts["base_crossed"] += int(base_crossed.sum().item())
+            self._task_state_totals["base_crossed"] += int(base_crossed.numel())
+        if door_open_met is not None:
+            door_open_met = door_open_met.to(dtype=torch.bool)
+            self._task_state_counts["door_open_met"] += int(door_open_met.sum().item())
+            self._task_state_totals["door_open_met"] += int(door_open_met.numel())
         left_occupied = left_occupied.to(dtype=torch.bool)
         right_occupied = right_occupied.to(dtype=torch.bool)
 
@@ -73,6 +83,7 @@ class DoorPushTensorboardObserver(IsaacAlgoObserver):
 
         cup_drop = self._select_done_values(infos.get("fail_cup_drop"), done_env_ids, cast_float=False)
         timeout = self._select_done_values(infos.get("fail_timeout"), done_env_ids, cast_float=False)
+        not_crossed = self._select_done_values(infos.get("fail_not_crossed"), done_env_ids, cast_float=False)
         if cup_drop is not None:
             cup_drop = cup_drop.to(dtype=torch.bool)
             self._fail_counts["cup_drop"] += int(cup_drop.sum().item())
@@ -81,6 +92,10 @@ class DoorPushTensorboardObserver(IsaacAlgoObserver):
             timeout = timeout.to(dtype=torch.bool)
             self._fail_counts["timeout"] += int(timeout.sum().item())
             self._fail_totals["timeout"] += int(timeout.numel())
+        if not_crossed is not None:
+            not_crossed = not_crossed.to(dtype=torch.bool)
+            self._fail_counts["not_crossed"] += int(not_crossed.sum().item())
+            self._fail_totals["not_crossed"] += int(not_crossed.numel())
 
     def after_print_stats(self, frame, epoch_num, total_time):
         super().after_print_stats(frame, epoch_num, total_time)
@@ -103,6 +118,11 @@ class DoorPushTensorboardObserver(IsaacAlgoObserver):
                 self._door_angle_sum / self._door_angle_count,
                 frame,
             )
+        for key in ("base_crossed", "door_open_met"):
+            total = self._task_state_totals.get(key, 0)
+            if total > 0:
+                rate = self._task_state_counts[key] / total
+                self.writer.add_scalar(f"task_state/{key}_rate", rate, frame)
 
         for mode in _SUCCESS_MODES:
             if self._success_totals[mode] <= 0:
@@ -110,7 +130,7 @@ class DoorPushTensorboardObserver(IsaacAlgoObserver):
             success_rate = self._success_counts[mode] / self._success_totals[mode]
             self.writer.add_scalar(f"success/{mode}", success_rate, frame)
 
-        for reason in ("cup_drop", "timeout"):
+        for reason in ("cup_drop", "timeout", "not_crossed"):
             total = self._fail_totals.get(reason, 0)
             if total > 0:
                 fail_rate = self._fail_counts[reason] / total
@@ -123,6 +143,8 @@ class DoorPushTensorboardObserver(IsaacAlgoObserver):
         self._reward_counts: defaultdict[str, int] = defaultdict(int)
         self._success_counts: defaultdict[str, int] = defaultdict(int)
         self._success_totals: defaultdict[str, int] = defaultdict(int)
+        self._task_state_counts: defaultdict[str, int] = defaultdict(int)
+        self._task_state_totals: defaultdict[str, int] = defaultdict(int)
         self._fail_counts: defaultdict[str, int] = defaultdict(int)
         self._fail_totals: defaultdict[str, int] = defaultdict(int)
         self._door_angle_sum = 0.0
@@ -172,4 +194,3 @@ class DoorPushTensorboardObserver(IsaacAlgoObserver):
         if count <= 0:
             return None
         return self._reward_sums[key] / count
-

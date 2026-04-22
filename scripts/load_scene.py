@@ -11,6 +11,7 @@ The only difference is that the policy output is replaced by a persistent
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import shutil
 import subprocess
@@ -63,6 +64,46 @@ def build_action_tensor(action_values: Sequence[float], *, device: str | torch.d
     return torch.tensor([list(action_values)], dtype=torch.float32, device=device)
 
 
+def _normalized_actions_to_joint_targets(actions: torch.Tensor, q_min: torch.Tensor, q_max: torch.Tensor) -> torch.Tensor:
+    """Map normalized arm actions back to physical joint targets."""
+    bounded_actions = torch.clamp(actions, -1.0, 1.0)
+    half_range = 0.5 * (q_max - q_min)
+    center = 0.5 * (q_max + q_min)
+    while half_range.ndim < bounded_actions.ndim:
+        half_range = half_range.unsqueeze(0)
+        center = center.unsqueeze(0)
+    return center + bounded_actions * half_range
+
+
+def _joint_targets_to_normalized_actions(q_target: torch.Tensor, q_min: torch.Tensor, q_max: torch.Tensor) -> torch.Tensor:
+    """Map physical joint targets to the environment's normalized arm-action contract."""
+    half_range = 0.5 * (q_max - q_min)
+    center = 0.5 * (q_max + q_min)
+    safe_half_range = torch.where(half_range.abs() > 1.0e-6, half_range, torch.ones_like(half_range))
+    while safe_half_range.ndim < q_target.ndim:
+        safe_half_range = safe_half_range.unsqueeze(0)
+        center = center.unsqueeze(0)
+    return torch.clamp((q_target - center) / safe_half_range, -1.0, 1.0)
+
+
+def _base_twist_to_normalized_actions(
+    base_twist: torch.Tensor,
+    *,
+    max_lin_vel_x: float,
+    max_lin_vel_y: float,
+    max_ang_vel_z: float,
+) -> torch.Tensor:
+    """Map physical base twist commands to the environment's normalized action space."""
+    scale = torch.tensor(
+        [float(max_lin_vel_x), float(max_lin_vel_y), float(max_ang_vel_z)],
+        dtype=base_twist.dtype,
+        device=base_twist.device,
+    )
+    while scale.ndim < base_twist.ndim:
+        scale = scale.unsqueeze(0)
+    return torch.clamp(base_twist / scale, -1.0, 1.0)
+
+
 class UiJointTargetDevice:
     """UI-backed manual device that mirrors IsaacLab teleop device semantics."""
 
@@ -104,6 +145,7 @@ class ManualDoorPushController:
         self.paused = False
         self.pending_reset_mode: str | None = None
         self.last_step_info: dict[str, Any] = {}
+        self.last_env_action = torch.zeros(ACTION_DIM, dtype=torch.float32)
 
     def request_reset(self, mode: str) -> None:
         resolve_occupancy_mode(mode)
@@ -126,9 +168,10 @@ class ManualDoorPushController:
             self.refresh_debug_state()
             return
 
-        action = self.device.advance().unsqueeze(0)
+        action = self._build_env_action()
         _, _, _, _, info = self.env.step(action)
         self.last_step_info = info if isinstance(info, dict) else {}
+        self.last_env_action = action.squeeze(0).detach().clone()
         self.refresh_debug_state()
 
     def initialize(self) -> None:
@@ -156,6 +199,28 @@ class ManualDoorPushController:
     def _sync_device_actions_to_current_pose(self) -> None:
         state = self.base_env.get_debug_state()
         self.device.set_action_values(_extract_manual_action_values(state))
+
+    def _build_env_action(self) -> torch.Tensor:
+        """Translate UI-space physical commands into the env's normalized action space."""
+        ui_action = self.device.advance()
+        robot = self.base_env.scene["robot"]
+        joint_limits = robot.data.soft_joint_pos_limits[0, self.base_env._arm_joint_ids]
+
+        arm_joint_targets = ui_action[:ARM_ACTION_DIM]
+        base_twist = ui_action[ARM_ACTION_DIM:]
+
+        arm_actions = _joint_targets_to_normalized_actions(
+            arm_joint_targets,
+            joint_limits[:, 0],
+            joint_limits[:, 1],
+        )
+        base_actions = _base_twist_to_normalized_actions(
+            base_twist,
+            max_lin_vel_x=self.base_env.cfg.base_max_lin_vel_x,
+            max_lin_vel_y=self.base_env.cfg.base_max_lin_vel_y,
+            max_ang_vel_z=self.base_env.cfg.base_max_ang_vel_z,
+        )
+        return torch.cat([arm_actions, base_actions], dim=0).unsqueeze(0)
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -226,6 +291,13 @@ def _format_status_text(controller: ManualDoorPushController) -> str:
     base_lin_vel = state["base_lin_vel_base"][0].detach().cpu().tolist()
     base_ang_vel = state["base_ang_vel_base"][0].detach().cpu().tolist()
     base_cmd = state["base_cmd"][0].detach().cpu().tolist()
+    base_controller_backend = str(state.get("base_controller_backend", "unknown"))
+    base_force_body_name = str(state.get("base_force_body_name", "unknown"))
+    base_force_cmd = state.get("base_force_cmd", torch.zeros((1, 3), dtype=torch.float32))[0].detach().cpu().tolist()
+    base_torque_cmd = state.get("base_torque_cmd", torch.zeros((1, 3), dtype=torch.float32))[0].detach().cpu().tolist()
+    planar_joint_pos = state.get("planar_joint_positions", torch.zeros((1, 3), dtype=torch.float32))[0].detach().cpu().tolist()
+    planar_joint_vel = state.get("planar_joint_velocities", torch.zeros((1, 3), dtype=torch.float32))[0].detach().cpu().tolist()
+    planar_joint_targets = state.get("planar_joint_targets", torch.zeros((1, 3), dtype=torch.float32))[0].detach().cpu().tolist()
     wheel_vel = state["wheel_joint_velocities"][0].detach().cpu().tolist()
     wheel_saturation_ratio = float(state["wheel_saturation_ratio"][0].item())
     tracking_lines = format_joint_tracking_lines(
@@ -243,7 +315,14 @@ def _format_status_text(controller: ManualDoorPushController) -> str:
         f"base_pos_w: ({base_pos[0]:+.3f}, {base_pos[1]:+.3f}, {base_pos[2]:+.3f})",
         f"base_lin_vel_base: ({base_lin_vel[0]:+.3f}, {base_lin_vel[1]:+.3f}, {base_lin_vel[2]:+.3f})",
         f"base_ang_vel_base: ({base_ang_vel[0]:+.3f}, {base_ang_vel[1]:+.3f}, {base_ang_vel[2]:+.3f})",
+        f"base_backend: {base_controller_backend}",
+        f"base_force_body: {base_force_body_name}",
         f"base_cmd: ({base_cmd[0]:+.3f}, {base_cmd[1]:+.3f}, {base_cmd[2]:+.3f})",
+        f"base_force_cmd: ({base_force_cmd[0]:+.3f}, {base_force_cmd[1]:+.3f}, {base_force_cmd[2]:+.3f})",
+        f"base_torque_cmd: ({base_torque_cmd[0]:+.3f}, {base_torque_cmd[1]:+.3f}, {base_torque_cmd[2]:+.3f})",
+        f"planar_joint_pos: ({planar_joint_pos[0]:+.3f}, {planar_joint_pos[1]:+.3f}, {planar_joint_pos[2]:+.3f})",
+        f"planar_joint_vel: ({planar_joint_vel[0]:+.3f}, {planar_joint_vel[1]:+.3f}, {planar_joint_vel[2]:+.3f})",
+        f"planar_joint_targets: ({planar_joint_targets[0]:+.3f}, {planar_joint_targets[1]:+.3f}, {planar_joint_targets[2]:+.3f})",
         f"wheel_vel: {', '.join(f'{value:+.3f}' for value in wheel_vel)}",
         f"wheel_saturation_ratio: {wheel_saturation_ratio:.2f}",
         "",
@@ -275,7 +354,7 @@ def _manual_window_kwargs() -> dict[str, Any]:
 
 
 def _extract_manual_action_values(state: dict[str, Any]) -> list[float]:
-    """Convert the single-env debug state into arm targets + base command for the UI device."""
+    """Convert the single-env debug state into UI-space arm targets + base command."""
     arm_joint_positions = torch.as_tensor(state["arm_joint_positions"], dtype=torch.float32)
     if arm_joint_positions.ndim != 2 or arm_joint_positions.shape[1] != ARM_ACTION_DIM:
         raise ValueError(
@@ -452,6 +531,7 @@ def _configure_visual_app_launcher_args(args_cli: argparse.Namespace, *, device:
 def _configure_env_cfg_for_manual_ui(env_cfg: Any) -> None:
     """Disable IsaacLab's default environment window for this standalone manual UI."""
     env_cfg.ui_window_class_type = None
+    env_cfg.events = None
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -90,4 +90,4 @@ profiles:
       num_mini_batches: 24
       num_epochs: 2
 
-<<: [*runtime_defaults, *profile_env6144]
+<<: [*runtime_defaults, *profile_env256]

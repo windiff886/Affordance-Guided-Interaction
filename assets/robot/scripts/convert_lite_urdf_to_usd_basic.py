@@ -16,8 +16,7 @@ URDFCreateImportConfig + URDFParseAndImportFile 导入，不做任何额外
 
 已加入：
     - convex decomposition (凸分解)
-    - 关节驱动配置 (force drive, stiffness=1000, damping=100)
-    - 自碰撞启用
+    - 关节驱动配置 (arms=force, planar base=velocity)
 
 用法:
     python assets/robot/scripts/convert_lite_urdf_to_usd_basic.py
@@ -38,6 +37,7 @@ if str(SRC_ROOT) not in sys.path:
 from affordance_guided_interaction.utils.runtime_env import (
     configure_omniverse_client_environment,
 )
+from affordance_guided_interaction.envs.base_control_math import default_dingo_mecanum_angles_deg
 
 configure_omniverse_client_environment(os.environ)
 
@@ -130,17 +130,25 @@ _LITE_ARM_JOINTS = [
     "right_joint4", "right_joint5", "right_joint6", "right_jointGripper",
 ]
 
-# Dingo-O 全向底盘轮子关节
+# Dingo-O 轮子关节（planar base 模式下仅保留为被动视觉/接触件）
 _WHEEL_JOINTS = [
     "front_left_wheel",
     "front_right_wheel",
     "rear_left_wheel",
     "rear_right_wheel",
 ]
+_PLANAR_TRANSLATION_JOINTS = [
+    "base_x_joint",
+    "base_y_joint",
+]
+_PLANAR_ROTATION_JOINTS = [
+    "base_yaw_joint",
+]
+_DEFAULT_WHEEL_RADIUS_METERS = 0.05
 
 
 def configure_joint_drives(stage, robot_prim_path: str) -> int:
-    """配置关节驱动：臂用力矩驱动，轮子用速度驱动。"""
+    """配置关节驱动：臂用力矩驱动，平面底盘用速度驱动，轮子保持被动。"""
     from pxr import UsdPhysics
 
     drive_count = 0
@@ -154,13 +162,23 @@ def configure_joint_drives(stage, robot_prim_path: str) -> int:
 
         is_wheel = any(wheel_name in name for wheel_name in _WHEEL_JOINTS)
         is_arm = any(joint_name in name for joint_name in _LITE_ARM_JOINTS)
+        is_planar_translation = name in _PLANAR_TRANSLATION_JOINTS
+        is_planar_rotation = name in _PLANAR_ROTATION_JOINTS
 
-        if is_wheel:
+        if is_planar_translation:
+            drive = UsdPhysics.DriveAPI.Apply(prim, "linear")
+            drive.CreateTypeAttr("velocity")
+            drive.CreateStiffnessAttr(0.0)
+            drive.CreateDampingAttr(100000.0)
+            drive_count += 1
+        elif is_planar_rotation:
             drive = UsdPhysics.DriveAPI.Apply(prim, "angular")
             drive.CreateTypeAttr("velocity")
             drive.CreateStiffnessAttr(0.0)
-            drive.CreateDampingAttr(1500.0)
+            drive.CreateDampingAttr(100000.0)
             drive_count += 1
+        elif is_wheel:
+            continue
         elif is_arm:
             drive = UsdPhysics.DriveAPI.Apply(prim, "angular")
             drive.CreateTypeAttr("force")
@@ -168,6 +186,39 @@ def configure_joint_drives(stage, robot_prim_path: str) -> int:
             drive.CreateDampingAttr(100.0)
             drive_count += 1
     return drive_count
+
+
+def configure_wheel_holonomic_metadata(
+    stage,
+    robot_prim_path: str,
+    *,
+    wheel_radius: float,
+) -> int:
+    """Annotate Dingo wheel joints with Isaac Sim holonomic metadata."""
+    from pxr import Sdf, UsdPhysics
+
+    mecanum_angles = dict(zip(_WHEEL_JOINTS, default_dingo_mecanum_angles_deg(_WHEEL_JOINTS), strict=True))
+    metadata_count = 0
+    for prim in stage.Traverse():
+        if not prim.IsA(UsdPhysics.RevoluteJoint):
+            continue
+        if robot_prim_path not in str(prim.GetPath()):
+            continue
+        joint_name = prim.GetName()
+        if joint_name not in mecanum_angles:
+            continue
+
+        radius_attr = prim.GetAttribute("isaacmecanumwheel:radius")
+        if not radius_attr.IsValid():
+            radius_attr = prim.CreateAttribute("isaacmecanumwheel:radius", Sdf.ValueTypeNames.Float, True)
+        radius_attr.Set(float(wheel_radius))
+
+        angle_attr = prim.GetAttribute("isaacmecanumwheel:angle")
+        if not angle_attr.IsValid():
+            angle_attr = prim.CreateAttribute("isaacmecanumwheel:angle", Sdf.ValueTypeNames.Float, True)
+        angle_attr.Set(float(mecanum_angles[joint_name]))
+        metadata_count += 1
+    return metadata_count
 
 
 def enable_self_collision(stage, robot_prim_path: str) -> None:
@@ -231,7 +282,7 @@ def run_conversion(args: argparse.Namespace) -> int:
 
         import_config.merge_fixed_joints = False
         import_config.convex_decomp = True
-        import_config.fix_base = False
+        import_config.fix_base = True
         import_config.make_default_prim = True
         import_config.import_inertia_tensor = True
         import_config.create_physics_scene = False
@@ -254,10 +305,7 @@ def run_conversion(args: argparse.Namespace) -> int:
         log(f"✅ Lite URDF 已导入: {robot_prim_path}")
 
         drive_count = configure_joint_drives(stage, robot_prim_path)
-        log(f"✅ 已配置 {drive_count} 个关节驱动 (arms=force, wheels=velocity)")
-
-        enable_self_collision(stage, robot_prim_path)
-        log("✅ 已启用 Articulation 自碰撞检测")
+        log(f"✅ 已配置 {drive_count} 个关节驱动 (arms=force, planar_base=velocity)")
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
         stage.GetRootLayer().Export(str(output_path))

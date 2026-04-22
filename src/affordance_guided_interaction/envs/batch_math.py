@@ -243,7 +243,7 @@ def sample_base_poses(
     n: int,
     *,
     door_center_xy: tuple[float, float] = (2.95, 0.00),
-    base_reference_xy: tuple[float, float] = (3.72, 0.27),
+    base_reference_xy: tuple[float, float] = (3.72, 0.00),
     base_height: float = 0.12,
     radius_range: tuple[float, float] = (0.45, 0.60),
     sector_half_angle_deg: float = 20.0,

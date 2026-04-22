@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import gymnasium as gym
@@ -74,6 +75,13 @@ WHEEL_JOINT_NAMES: list[str] = [
     "rear_right_wheel",
 ]
 
+# 平面底盘关节（世界系 x/y 平移 + z 轴偏航）
+PLANAR_BASE_JOINT_NAMES: list[str] = [
+    "base_x_joint",
+    "base_y_joint",
+    "base_yaw_joint",
+]
+
 # 云台关节（相机姿态；不进入策略动作空间）
 PAN_TILT_JOINT_NAMES: list[str] = [
     "pan_tilt_yaw_joint",
@@ -85,9 +93,22 @@ BASE_LINK_NAME: str = "base_link"
 LEFT_EE_LINK_NAME: str = "left_gripperMover"
 RIGHT_EE_LINK_NAME: str = "right_gripperMover"
 
-# 移动底盘静止落地时的 base_link 高度：
-# wheel axis z (0.035145 m) + wheel radius (0.050 m) = 0.085145 m
-BASE_LINK_SPAWN_HEIGHT: float = 0.085145
+# 平面底盘抽象下，planar root 固定在地面 z=0，机器人本体通过 yaw 关节的
+# 固定竖直偏移放到正确视觉高度。该高度满足 wheel joint center z (0.035145 m)
+# 减去轮半径 (0.050 m) 后，轮底刚好接触地面：
+#     base_link_height = wheel_radius - wheel_axis_z = 0.014855 m
+BASE_LINK_SPAWN_HEIGHT: float = 0.014855
+
+DOOR_CENTER_XY: tuple[float, float] = (2.95, 0.00)
+BASE_REFERENCE_XY: tuple[float, float] = (3.72, 0.00)
+BASE_REFERENCE_YAW: float = math.atan2(
+    DOOR_CENTER_XY[1] - BASE_REFERENCE_XY[1],
+    DOOR_CENTER_XY[0] - BASE_REFERENCE_XY[0],
+)
+
+# reset 时物理 settle 步数：写入机器人位姿后，运行若干物理步让碰撞解析完成，
+# 消除 depenetration 造成的弹跳和坠落。
+RESET_SETTLE_STEPS: int = 60
 
 # 门板 body 名称
 DOOR_LEAF_BODY_NAME: str = "DoorLeaf"
@@ -222,17 +243,21 @@ class DoorPushSceneCfg(InteractiveSceneCfg):
                 max_depenetration_velocity=1.0,
             ),
             articulation_props=sim_utils.ArticulationRootPropertiesCfg(
-                fix_root_link=False,
-                enabled_self_collisions=True,
+                fix_root_link=True,
+                enabled_self_collisions=False,
                 solver_position_iteration_count=8,
                 solver_velocity_iteration_count=4,
             ),
         ),
         init_state=ArticulationCfg.InitialStateCfg(
-            # 标称初始位置：推板正前方，在采样范围中心
-            pos=(3.72, 0.27, BASE_LINK_SPAWN_HEIGHT),
-            rot=(0.0, 0.0, 0.0, 1.0),  # wxyz 180° yaw — 匹配 scene_factory
+            # 平面底盘根节点固定在每个 env 地面原点，机器人本体高度由资产里的
+            # base_yaw_joint 固定竖直偏移提供。
+            pos=(0.0, 0.0, 0.0),
+            rot=(1.0, 0.0, 0.0, 0.0),  # wxyz identity；朝向由 base_yaw_joint 单独控制
             joint_pos={
+                "base_x_joint": BASE_REFERENCE_XY[0],
+                "base_y_joint": BASE_REFERENCE_XY[1],
+                "base_yaw_joint": BASE_REFERENCE_YAW,
                 "left_joint.*": 0.0,
                 "right_joint.*": 0.0,
             },
@@ -266,12 +291,12 @@ class DoorPushSceneCfg(InteractiveSceneCfg):
                 stiffness=400.0,
                 damping=40.0,
             ),
-            "wheel_joints": ImplicitActuatorCfg(
-                joint_names_expr=WHEEL_JOINT_NAMES,
-                effort_limit=120.0,
-                velocity_limit=40.0,
+            "planar_base_joints": ImplicitActuatorCfg(
+                joint_names_expr=PLANAR_BASE_JOINT_NAMES,
+                effort_limit=1.0e6,
+                velocity_limit=10.0,
                 stiffness=0.0,
-                damping=1500.0,
+                damping=1.0e5,
             ),
         },
     )
@@ -391,21 +416,19 @@ class DoorPushEnvCfg(DirectRLEnvCfg):
 
     # ── 观测空间 ────────────────────────────────────────────────────
     # Actor obs: proprio(36) + ee(38) + context(2) + stability(2) +
-    #            door_geometry(6) + base_twist/cmd(6) = 90
-    num_observations: int = 90
-    observation_space: int = 90
+    #            door_geometry(6) + door_frame_corners(12) + base_twist/cmd(6) = 102
+    num_observations: int = 102
+    observation_space: int = 102
 
-    # Critic obs (privileged): actor_obs(90) + door_pose(7) +
+    # Critic obs (privileged): actor_obs(102) + door_pose(7) +
     #     door_joint_pos(1) + door_joint_vel(1) + cup_mass(1) +
-    #     door_mass(1) + door_damping(1) + cup_dropped(1) = 103
-    num_states: int = 103
-    state_space: int = 103
+    #     door_mass(1) + door_damping(1) + cup_dropped(1) = 115
+    num_states: int = 115
+    state_space: int = 115
 
     # ── 任务判定阈值 ────────────────────────────────────────────────
-    # 门角度到达 target → terminated(success)
-    door_angle_target: float = 1.57
-    # 一次性成功 bonus 的角度阈值 (< door_angle_target)
-    success_angle_threshold: float = 1.2
+    # 门角度达到 1.2rad 后才允许 episode success（仍需杯体未掉落且 base_link 过门）
+    door_angle_target: float = 1.2
     # 杯体脱落距离检测阈值 (m)
     cup_drop_threshold: float = 0.15
 
@@ -423,9 +446,15 @@ class DoorPushEnvCfg(DirectRLEnvCfg):
     arm_pd_stiffness: float = 1000.0
     arm_pd_damping: float = 100.0
     position_target_noise_std: float = 0.01
+    base_control_backend: str = "planar_joint_velocity"
+    base_force_body_name: str = "chassis_link"
     base_max_lin_vel_x: float = 0.6
     base_max_lin_vel_y: float = 0.6
     base_max_ang_vel_z: float = 1.2
+    base_lin_accel_gain_xy: tuple[float, float] = (20.0, 20.0)
+    base_ang_accel_gain_z: float = 20.0
+    base_force_limit_xy: tuple[float, float] = (600.0, 600.0)
+    base_torque_limit_z: float = 200.0
     wheel_radius: float = 0.05
     wheel_base_half_length: float = 0.285
     wheel_base_half_width: float = 0.2104
@@ -439,8 +468,8 @@ class DoorPushEnvCfg(DirectRLEnvCfg):
     # 基座采样几何（门外侧扇形环）
     # Z1 臂有效水平可达 ≈ 0.95m（肩偏移 0.15m + 臂链 0.80m），
     # 半径需留 ≥ 0.10m 安全余量。
-    door_center_xy: tuple[float, float] = (2.95, 0.00)
-    base_reference_xy: tuple[float, float] = (3.72, 0.27)
+    door_center_xy: tuple[float, float] = DOOR_CENTER_XY
+    base_reference_xy: tuple[float, float] = BASE_REFERENCE_XY
     base_height: float = BASE_LINK_SPAWN_HEIGHT
     base_radius_range: tuple[float, float] = (0.45, 0.60)
     base_sector_half_angle_deg: float = 20.0
@@ -462,6 +491,10 @@ class DoorPushEnvCfg(DirectRLEnvCfg):
     rew_w_approach: float = 200.0
     rew_approach_eps: float = 1.0e-6
     rew_approach_stop_angle: float = 0.10
+    rew_w_base_approach: float = 2.0
+    rew_base_approach_open_gate: float = 0.3
+    rew_w_base_cross: float = 5.0
+    rew_base_cross_open_gate: float = 1.2
 
     # 稳定性奖励 (§5)
     rew_w_zero_acc: float = 1.0
@@ -487,4 +520,5 @@ class DoorPushEnvCfg(DirectRLEnvCfg):
 
     # ── 门几何观测 ────────────────────────────────────────────────────
     door_geometry_dim: int = 6  # center(3) + normal(3)
+    door_frame_corner_dim: int = 12  # 4 inner-frame corners in base_link frame
     visual_refresh_interval: int = 4  # deprecated, kept for config compat

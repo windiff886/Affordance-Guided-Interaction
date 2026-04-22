@@ -9,7 +9,51 @@
 <robot name="uni_dingo_lite">
 
   <!-- ═══════════════════════════════════════════════════════════════ -->
-  <!-- Root: base_link (visual-only placeholder keeps minimal USD import clean) -->
+  <!-- Planar mobile base abstraction                                 -->
+  <!-- world(fixed root) -> x prismatic -> y prismatic -> yaw joint   -->
+  <!-- ═══════════════════════════════════════════════════════════════ -->
+  <link name="planar_base_root_link">
+    <inertial>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <mass value="0.001"/>
+      <inertia ixx="1e-6" ixy="0" ixz="0" iyy="1e-6" iyz="0" izz="1e-6"/>
+    </inertial>
+  </link>
+
+  <link name="base_x_link">
+    <inertial>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <mass value="0.001"/>
+      <inertia ixx="1e-6" ixy="0" ixz="0" iyy="1e-6" iyz="0" izz="1e-6"/>
+    </inertial>
+  </link>
+
+  <joint name="base_x_joint" type="prismatic">
+    <origin rpy="0 0 0" xyz="0 0 0"/>
+    <parent link="planar_base_root_link"/>
+    <child link="base_x_link"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="-20.0" upper="20.0" effort="1000000.0" velocity="10.0"/>
+  </joint>
+
+  <link name="base_y_link">
+    <inertial>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <mass value="0.001"/>
+      <inertia ixx="1e-6" ixy="0" ixz="0" iyy="1e-6" iyz="0" izz="1e-6"/>
+    </inertial>
+  </link>
+
+  <joint name="base_y_joint" type="prismatic">
+    <origin rpy="0 0 0" xyz="0 0 0"/>
+    <parent link="base_x_link"/>
+    <child link="base_y_link"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-20.0" upper="20.0" effort="1000000.0" velocity="10.0"/>
+  </joint>
+
+  <!-- ═══════════════════════════════════════════════════════════════ -->
+  <!-- Robot body anchor: base_link stays the env/global reference    -->
   <!-- ═══════════════════════════════════════════════════════════════ -->
   <link name="base_link">
     <visual>
@@ -22,6 +66,13 @@
       </material>
     </visual>
   </link>
+
+  <joint name="base_yaw_joint" type="continuous">
+    <origin rpy="0 0 0" xyz="0 0 0.014855"/>
+    <parent link="base_y_link"/>
+    <child link="base_link"/>
+    <axis xyz="0 0 1"/>
+  </joint>
 
   <!-- ═══════════════════════════════════════════════════════════════ -->
   <!-- Chassis: real Dingo-O omni-chassis mesh                       -->

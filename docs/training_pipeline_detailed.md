@@ -116,7 +116,10 @@ $$
 
 - 成功判定：
   $$
-  \theta_t \ge \theta_{\text{target}},\qquad \theta_{\text{target}}=1.57\ \text{rad}.
+  \theta_t \ge \theta_{\text{target}},\qquad
+  \theta_{\text{target}}=1.2\ \text{rad},\qquad
+  \text{base\_link\_crossed}_t = 1,\qquad
+  \text{cup\_dropped}_t = 0.
   $$
 - 失败事件：
   $$
@@ -127,18 +130,22 @@ $$
   t\ge 900.
   $$
 
-当前代码里，episode 的 success 标记不是“达到 1.2 rad”，而是：
+当前代码里，episode 的 success 标记要求三件事同时成立：
 
 $$
 \text{success}_t=
-\mathbf 1[\theta_t\ge 1.57]\cdot \mathbf 1[\text{cup\_dropped}_t=0].
+\mathbf 1[\theta_t\ge 1.2]\cdot
+\mathbf 1[\text{cup\_dropped}_t=0]\cdot
+\mathbf 1[\text{base\_link\_crossed}_t=1].
 $$
 
-因此有两点必须区分：
+其中 `base_link_crossed` 表示机器人 `base_link` 从门外侧穿过门洞下沿所在的门洞平面，且穿越时横向位置仍落在门洞内沿宽度范围内。该量在环境里是一个回合级 latch，一旦过门成功便保持为 1。
 
-- $\theta_{\text{succ}}=1.2$ rad 只是奖励中的一次性 bonus 阈值，不是 success 阈值。
-- 如果门只推到 $1.2$ rad，随后因为超时或掉杯结束，当前代码下仍然不算成功。
-- 即使某一步同时满足“门角达到 $1.57$ rad”和“杯子脱落”，当前代码也不会把该回合记为成功。
+因此需要注意：
+
+- 仅把门推到 $1.2$ rad 而没有让 `base_link` 过门，不算成功。
+- 即使 `base_link` 先穿过门洞，只要门角尚未达到 $1.2$ rad，当前代码也不会把该回合记为成功。
+- 即使门角达到阈值且底盘过门，只要杯子掉落，该回合仍然不算成功。
 
 其中掉杯事件由杯体与对应末端执行器距离是否超过阈值决定：
 
@@ -359,7 +366,7 @@ $$
 参考基座点记为：
 
 $$
-c_{\text{ref}}=(3.72,\ 0.27).
+c_{\text{ref}}=(3.72,\ 0.00).
 $$
 
 先计算标称方位角：
@@ -479,39 +486,34 @@ o_t^k=
 \big[
 p_t^{\text{ee},k,B},
 q_t^{\text{ee},k,B},
-v_t^{\text{ee},k,B},
-\omega_t^{\text{ee},k,B},
-a_t^{\text{ee},k,B},
-\alpha_t^{\text{ee},k,B}
+v_t^{\text{ee},k,W\to B},
+\omega_t^{\text{ee},k,W\to B},
+a_t^{\text{ee},k,W\to B},
+\alpha_t^{\text{ee},k,W\to B}
 \big]\in\mathbb R^{19}.
 $$
 
-其中线加速度和角加速度不是简单在固定 `base_link` 系下跨帧差分。当前实现先在世界系中计算 EE 相对移动底盘的速度：
+其中位置和姿态在 `base_link` 坐标系下表示，而线速度、角速度为世界系下的速度旋转到当前 `base_link` 坐标系表达：
 
 $$
-v_{t,\text{rel}}^{\text{ee},k,W}
-=
-v_t^{\text{ee},k,W}
--\Big(v_t^{\text{base},W}+\omega_t^{\text{base},W}\times (p_t^{\text{ee},k,W}-p_t^{\text{base},W})\Big),
+v_t^{\text{ee},k,W\to B}=\operatorname{Rot}(W\rightarrow B_t)\,v_t^{\text{ee},k,W},
 $$
 
 $$
-\omega_{t,\text{rel}}^{\text{ee},k,W}
-=
-\omega_t^{\text{ee},k,W}-\omega_t^{\text{base},W},
+\omega_t^{\text{ee},k,W\to B}=\operatorname{Rot}(W\rightarrow B_t)\,\omega_t^{\text{ee},k,W},
 $$
 
-然后再对世界系相对速度做差分，并旋回当前 base 坐标系：
+线加速度和角加速度由世界系速度做数值差分后旋转到 base 系：
 
 $$
-a_t^{\text{ee},k,B}=
+a_t^{\text{ee},k,W\to B}=
 \operatorname{Rot}(W\rightarrow B_t)\,
-\frac{v_{t,\text{rel}}^{\text{ee},k,W}-v_{t-1,\text{rel}}^{\text{ee},k,W}}{\Delta t},
+\frac{v_t^{\text{ee},k,W}-v_{t-1}^{\text{ee},k,W}}{\Delta t},
 $$
 $$
-\alpha_t^{\text{ee},k,B}=
+\alpha_t^{\text{ee},k,W\to B}=
 \operatorname{Rot}(W\rightarrow B_t)\,
-\frac{\omega_{t,\text{rel}}^{\text{ee},k,W}-\omega_{t-1,\text{rel}}^{\text{ee},k,W}}{\Delta t}.
+\frac{\omega_t^{\text{ee},k,W}-\omega_{t-1}^{\text{ee},k,W}}{\Delta t}.
 $$
 
 #### 3.1.3 上下文项
@@ -581,6 +583,26 @@ $$
 
 也就是说，策略能直接知道“门板中心在基座系下的位置”和“可推门面法向量在基座系下的方向”。
 
+除此之外，策略现在还接收门洞内沿四角在 `base_link` 系下的坐标：
+
+$$
+o_t^{\text{frame}}=
+\big[
+p_t^{\text{LL},B},
+p_t^{\text{LR},B},
+p_t^{\text{UL},B},
+p_t^{\text{UR},B}
+\big]\in\mathbb R^{12},
+$$
+
+其中四个点分别对应门洞内沿的左下、右下、左上、右上角点。当前资产对应的门洞局部常量为：
+
+$$
+(0,-0.51,0),\ (0,0.51,0),\ (0,-0.51,2.05),\ (0,0.51,2.05).
+$$
+
+这组 12 维量直接把可通行门洞的几何开口暴露给策略，而不再只给门板几何。
+
 #### 3.1.6 底盘本体项
 
 移动底盘版本还会给策略一个 6 维底盘块：
@@ -588,13 +610,21 @@ $$
 $$
 o_t^{\text{base}}=
 \big[
-v_{x,t}^{B},\ v_{y,t}^{B},\ \omega_{z,t}^{B},\ u_t^{\text{base}}
+v_{x,t}^{W\to B},\ v_{y,t}^{W\to B},\ \omega_{z,t}^{W\to B},\ u_t^{\text{base}}
 \big]\in\mathbb R^6.
 $$
 
-其中前三维是当前底盘在 `base_link` 系下的真实速度，后三维是最近一次写入执行器的底盘速度命令。policy 控制的是这 3 维底盘速度命令；环境内部再把它们映射成四个轮子的速度目标。
+其中前三维是底盘在世界系下的线速度和角速度，旋转到 `base_link` 坐标系下表达：
 
-### 3.2 Critic 观测 $o_t^V\in\mathbb R^{103}$
+$$
+v^{W\to B}=\operatorname{Rot}(W\rightarrow B_t)\,v^{\text{base},W},
+\quad
+\omega^{W\to B}=\operatorname{Rot}(W\rightarrow B_t)\,\omega^{\text{base},W}.
+$$
+
+后三维是最近一次写入执行器的底盘速度命令。policy 控制的是这 3 维底盘速度命令；环境内部再把它们映射成四个轮子的速度目标。
+
+### 3.2 Critic 观测 $o_t^V\in\mathbb R^{115}$
 
 critic 使用非对称特权观测：
 
@@ -703,17 +733,9 @@ k_{\text{decay}}=0.5,\qquad
 \alpha=0.3.
 $$
 
-#### 3.4.2 一次性开门成功 bonus
+#### 3.4.2 一次性开门 bonus
 
 当门角第一次超过 $\theta_{\text{succ}}=1.2$ rad 时，给予一次性 bonus：
-
-这里的“success”只是奖励设计里的命名，它表示“达到 bonus 阈值”，不表示环境层面的 episode success。当前代码里 episode success 仍然要求：
-
-$$
-\theta_t \ge 1.57\ \text{rad}
-\quad\text{且}\quad
-\text{cup\_dropped}_t=0.
-$$
 
 $$
 r_t^{\text{open}}=
@@ -792,6 +814,17 @@ w_{\text{approach}}=2.
 $$
 
 这意味着训练初期，策略首先被鼓励“把至少一只手靠近门的可推面”，当门角超过 $0.10$ rad 以后，这个 shaping 就关闭，优化重点转向继续开门。
+
+#### 3.4.4 底盘接近门洞与穿门奖励
+
+在移动底盘版本中，还额外引入两项与门洞几何相关的 reward：
+
+- `task/base_approach`：当 `base_link` 仍位于门外侧时，奖励其接近门洞下沿在地面上的投影线段。
+- `task/base_cross`：当门角已经达到允许穿门的阈值后，奖励 `base_link` 穿过门洞平面并继续向室内推进。
+
+`task/base_approach` 使用 `base_link` 在地面上的投影点到门洞下沿线段的距离做归一化 shaping，只在 `base_link` 还未过门且门角大于 `base_approach_open_gate` 时激活。
+
+`task/base_cross` 不再看无符号距离，而是看 `base_link` 在门洞内侧半空间中的推进量，只在门角大于 `base_cross_open_gate` 时激活。这样 reward 会把策略从“靠近门洞”推进到“真正穿门并继续向内走”。
 
 ### 3.5 稳定性奖励：只在持杯侧激活
 
@@ -1773,7 +1806,7 @@ $$
 
 以下指标全部由 `DoorPushTensorboardObserver` 按已完成 episode 聚合后写入，横轴为累计环境步数（frame）。
 
-环境在 episode 结束时会把 `episode_reward_info`、`door_angle`、`success`、`episode_left_occupied`、`episode_right_occupied`、`fail_cup_drop`、`fail_timeout` 放进 `infos`，observer 正是基于这些 extras 做窗口聚合。
+环境在 episode 结束时会把 `episode_reward_info`、`door_angle`、`success`、`episode_left_occupied`、`episode_right_occupied`、`base_crossed`、`door_open_met`、`fail_cup_drop`、`fail_timeout`、`fail_not_crossed` 放进 `infos`，observer 正是基于这些 extras 做窗口聚合。
 
 #### `reward/*`
 
@@ -1803,6 +1836,8 @@ $$
 | `reward_detail/task/open_bonus` | 一次性开门奖励 |
 | `reward_detail/task/approach` | 接近门板 shaping |
 | `reward_detail/task/approach_raw` | 接近原始距离 |
+| `reward_detail/task/base_approach` | 底盘接近门洞下沿线奖励 |
+| `reward_detail/task/base_cross` | 底盘穿门并向内推进奖励 |
 | `reward_detail/stab_left/zero_acc` | 左加速度归零奖励 |
 | `reward_detail/stab_left/zero_ang` | 左角速度归零奖励 |
 | `reward_detail/stab_left/acc` | 左加速度惩罚 |
@@ -1828,6 +1863,14 @@ $$
 $$
 
 它不是 reward 分项，但属于任务进展最直接的状态量，因此单独记录。
+
+#### `task_state/base_crossed_rate`
+
+完成 episode 中，`base_link` 最终成功越过门洞平面的比例。
+
+#### `task_state/door_open_met_rate`
+
+完成 episode 中，门角最终达到 `1.2 rad` 阈值的比例。
 
 ### 6.7 成功率指标（自定义 observer）
 
@@ -1860,7 +1903,7 @@ $$
 
 ### 6.8 失败原因指标（自定义 observer）
 
-记录当前统计窗口内已完成 episode 中各类失败原因的发生率。两个失败原因互斥：
+记录当前统计窗口内已完成 episode 中各类失败原因的发生率。当前代码会单独记录“杯子掉落”“超时”以及“超时但仍未过门”。
 
 #### `fail_reason/cup_drop`
 
@@ -1883,6 +1926,10 @@ $$
 $$
 \text{success/all} + \text{fail\_reason/cup\_drop} + \text{fail\_reason/timeout} = 1.
 $$
+
+#### `fail_reason/not_crossed`
+
+超时结束、杯子未掉、但 `base_link` 仍未穿过门洞的比例。这个指标与 `timeout` 高度相关，但更直接指向“门已打开却还没进门”这一失败模式。
 
 ### 6.9 rl_games 常规回报指标（rl_games 内置）
 
