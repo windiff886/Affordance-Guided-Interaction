@@ -2,8 +2,8 @@
 URDF -> USD 轻量版极简转换脚本。
 
 目标：尽量直接照抄 assets/Z1_ISAACSIM 的导入链路，只做最朴素的
-URDFCreateImportConfig + URDFParseAndImportFile 导入，不做任何额外
-资产后处理。
+URDFCreateImportConfig + URDFParseAndImportFile 导入，再补最小后处理，
+直接导出训练/调试共用的轻量版 USD。
 
 这个脚本会把 uni_dingo_lite.urdf 直接导出为：
     assets/robot/usd/uni_dingo_lite.usd
@@ -17,6 +17,7 @@ URDFCreateImportConfig + URDFParseAndImportFile 导入，不做任何额外
 已加入：
     - convex decomposition (凸分解)
     - 关节驱动配置 (arms=force, planar base=velocity)
+    - wheel collision deactivation（保留 wheel visual，禁用 wheel-ground contact）
 
 用法:
     python assets/robot/scripts/convert_lite_urdf_to_usd_basic.py
@@ -145,6 +146,16 @@ _PLANAR_ROTATION_JOINTS = [
     "base_yaw_joint",
 ]
 _DEFAULT_WHEEL_RADIUS_METERS = 0.05
+_TRAINING_DISABLED_WHEEL_PRIMS = (
+    "/uni_dingo_lite/front_left_wheel_link/collisions",
+    "/uni_dingo_lite/front_right_wheel_link/collisions",
+    "/uni_dingo_lite/rear_left_wheel_link/collisions",
+    "/uni_dingo_lite/rear_right_wheel_link/collisions",
+    "/colliders/front_left_wheel_link",
+    "/colliders/front_right_wheel_link",
+    "/colliders/rear_left_wheel_link",
+    "/colliders/rear_right_wheel_link",
+)
 
 
 def configure_joint_drives(stage, robot_prim_path: str) -> int:
@@ -219,6 +230,54 @@ def configure_wheel_holonomic_metadata(
         angle_attr.Set(float(mecanum_angles[joint_name]))
         metadata_count += 1
     return metadata_count
+
+
+def get_applied_references(prim) -> list:
+    refs = prim.GetMetadata("references")
+    if not refs:
+        return []
+    return list(refs.GetAppliedItems())
+
+
+def clear_invalid_internal_references(stage) -> int:
+    """Drop unresolved internal references authored by the URDF importer."""
+    cleared = 0
+    for prim in stage.Traverse():
+        applied_refs = get_applied_references(prim)
+        if not applied_refs:
+            continue
+        valid_refs = []
+        changed = False
+        for ref in applied_refs:
+            if ref.assetPath or not ref.primPath:
+                valid_refs.append(ref)
+                continue
+            target_prim = stage.GetPrimAtPath(ref.primPath)
+            if target_prim and target_prim.IsValid():
+                valid_refs.append(ref)
+            else:
+                changed = True
+        if not changed:
+            continue
+        references = prim.GetReferences()
+        if valid_refs:
+            references.SetReferences(valid_refs)
+        else:
+            references.ClearReferences()
+        cleared += 1
+    return cleared
+
+
+def deactivate_wheel_collision_prims(stage) -> int:
+    """Disable wheel collision prims while keeping wheel visuals and joints intact."""
+    deactivated = 0
+    for prim_path in _TRAINING_DISABLED_WHEEL_PRIMS:
+        prim = stage.GetPrimAtPath(prim_path)
+        if not prim or not prim.IsValid() or not prim.IsActive():
+            continue
+        prim.SetActive(False)
+        deactivated += 1
+    return deactivated
 
 
 def enable_self_collision(stage, robot_prim_path: str) -> None:
@@ -306,6 +365,12 @@ def run_conversion(args: argparse.Namespace) -> int:
 
         drive_count = configure_joint_drives(stage, robot_prim_path)
         log(f"✅ 已配置 {drive_count} 个关节驱动 (arms=force, planar_base=velocity)")
+
+        deactivated_wheel_prims = deactivate_wheel_collision_prims(stage)
+        log(f"✅ 已停用 {deactivated_wheel_prims} 个 wheel collision prim")
+
+        cleared_refs = clear_invalid_internal_references(stage)
+        log(f"✅ 已清理 {cleared_refs} 个悬空内部引用")
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
         stage.GetRootLayer().Export(str(output_path))

@@ -106,10 +106,6 @@ BASE_REFERENCE_YAW: float = math.atan2(
     DOOR_CENTER_XY[0] - BASE_REFERENCE_XY[0],
 )
 
-# reset 时物理 settle 步数：写入机器人位姿后，运行若干物理步让碰撞解析完成，
-# 消除 depenetration 造成的弹跳和坠落。
-RESET_SETTLE_STEPS: int = 60
-
 # 门板 body 名称
 DOOR_LEAF_BODY_NAME: str = "DoorLeaf"
 
@@ -447,6 +443,8 @@ class DoorPushEnvCfg(DirectRLEnvCfg):
     arm_pd_damping: float = 100.0
     position_target_noise_std: float = 0.01
     base_control_backend: str = "planar_joint_velocity"
+    training_planar_base_only: bool = False
+    emit_wheel_debug_state: bool = True
     base_force_body_name: str = "chassis_link"
     base_max_lin_vel_x: float = 0.6
     base_max_lin_vel_y: float = 0.6

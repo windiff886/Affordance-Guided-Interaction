@@ -35,7 +35,6 @@ from .door_push_env_cfg import (
     LEFT_EE_LINK_NAME,
     RIGHT_EE_LINK_NAME,
     DOOR_LEAF_BODY_NAME,
-    RESET_SETTLE_STEPS,
     # 持杯初始化常量
     LEFT_CUP_RELATIVE_XYZ,
     RIGHT_CUP_RELATIVE_XYZ,
@@ -252,6 +251,8 @@ class DoorPushEnv(DirectRLEnv):
         self._control_dt = self.physics_dt * self.cfg.decimation
         self._holonomic_wheel_target_matrix: Tensor | None = None
         self._base_controller_backend = str(self.cfg.base_control_backend)
+        self._training_planar_base_only = bool(getattr(self.cfg, "training_planar_base_only", False))
+        self._emit_wheel_debug_state = bool(getattr(self.cfg, "emit_wheel_debug_state", True))
         self._base_force_body_idx = self._base_body_idx
         self._base_force_body_name = BASE_LINK_NAME
         self._base_force_body_mass = torch.ones(N, device=dev)
@@ -619,10 +620,11 @@ class DoorPushEnv(DirectRLEnv):
                 planar_joint_targets,
                 joint_ids=self._planar_joint_ids,
             )
-            robot.set_joint_velocity_target(
-                torch.zeros((self.num_envs, len(self._wheel_joint_ids)), device=self.device),
-                joint_ids=self._wheel_joint_ids,
-            )
+            if not self._training_planar_base_only:
+                robot.set_joint_velocity_target(
+                    torch.zeros((self.num_envs, len(self._wheel_joint_ids)), device=self.device),
+                    joint_ids=self._wheel_joint_ids,
+                )
             self._cached_planar_joint_targets = planar_joint_targets
             self._cached_base_force_cmd.zero_()
             self._cached_base_torque_cmd.zero_()
@@ -1337,35 +1339,27 @@ class DoorPushEnv(DirectRLEnv):
         zero_door_vel = torch.zeros(n, door.num_joints, device=self.device)
         door.write_joint_state_to_sim(zero_door_pos, zero_door_vel, None, env_ids)
 
-        # ── 3.5 物理 settle：刷新 arm PD / planar velocity target ─────
-        settle_target = default_jpos[:, self._arm_joint_ids]
+        # ── 3.5 初始化控制目标（不再额外推进物理步）─────────────────
+        arm_target = default_jpos[:, self._arm_joint_ids]
         zero_planar_vel = torch.zeros((n, len(self._planar_joint_ids)), device=self.device)
         zero_wheel_vel = torch.zeros((n, len(self._wheel_joint_ids)), device=self.device)
-
-        self.scene.write_data_to_sim()
-        for _ in range(RESET_SETTLE_STEPS):
-            robot.set_joint_position_target(
-                settle_target,
-                joint_ids=self._arm_joint_ids,
-                env_ids=env_ids,
-            )
-            robot.set_joint_velocity_target(
-                zero_planar_vel,
-                joint_ids=self._planar_joint_ids,
-                env_ids=env_ids,
-            )
+        robot.set_joint_position_target(
+            arm_target,
+            joint_ids=self._arm_joint_ids,
+            env_ids=env_ids,
+        )
+        robot.set_joint_velocity_target(
+            zero_planar_vel,
+            joint_ids=self._planar_joint_ids,
+            env_ids=env_ids,
+        )
+        if not self._training_planar_base_only:
             robot.set_joint_velocity_target(
                 zero_wheel_vel,
                 joint_ids=self._wheel_joint_ids,
                 env_ids=env_ids,
             )
-            self.scene.write_data_to_sim()
-            self.sim.step(render=False)
-            self.scene.update(dt=self.physics_dt)
-
-        # 清零速度并重申目标 planar pose，避免 reset 后的关节残留漂移。
-        settled_jvel = torch.zeros_like(default_jvel)
-        robot.write_joint_state_to_sim(default_jpos, settled_jvel, None, env_ids)
+        self.scene.write_data_to_sim()
 
         # ── 4. occupancy 已由 reset 事件或外部接口设置 ──────────
         # 不在此处重置，保留 Isaac Lab reset event 或手动脚本注入的 occupancy。
@@ -1543,7 +1537,7 @@ class DoorPushEnv(DirectRLEnv):
             robot.data.body_quat_w[:, self._base_body_idx],
         )
 
-        return {
+        state = {
             "left_occupied": self._left_occupied.clone(),
             "right_occupied": self._right_occupied.clone(),
             "door_angle": door_angle,
@@ -1565,9 +1559,11 @@ class DoorPushEnv(DirectRLEnv):
             "planar_joint_positions": robot.data.joint_pos[:, self._planar_joint_ids].clone(),
             "planar_joint_velocities": robot.data.joint_vel[:, self._planar_joint_ids].clone(),
             "planar_joint_targets": self._cached_planar_joint_targets.clone(),
-            "wheel_joint_velocities": robot.data.joint_vel[:, self._wheel_joint_ids].clone(),
-            "wheel_saturation_ratio": self._cached_wheel_saturation_ratio.clone(),
         }
+        if self._emit_wheel_debug_state:
+            state["wheel_joint_velocities"] = robot.data.joint_vel[:, self._wheel_joint_ids].clone()
+            state["wheel_saturation_ratio"] = self._cached_wheel_saturation_ratio.clone()
+        return state
 
     def set_episode_reset_fn(self, fn) -> None:
         """注册可选的 reset 覆写回调，保留给外部脚本或实验接口使用。"""

@@ -83,6 +83,7 @@ def build_env_cfg(
     seed: int | None = None,
     enable_cameras: bool = True,
     task_name: str | None = None,
+    for_training: bool = False,
 ):
     """Build DoorPushEnvCfg from the registered default config plus YAML overrides."""
     del enable_cameras
@@ -139,6 +140,8 @@ def build_env_cfg(
         env_cfg.cup_drop_threshold = float(task_cfg["cup_drop_threshold"])
 
     _inject_reward_params(env_cfg, cfg.get("reward", {}))
+    if for_training:
+        _apply_training_env_simplifications(env_cfg)
     return env_cfg
 
 
@@ -296,6 +299,12 @@ def _apply_arm_control_to_actuators(env_cfg: Any) -> None:
         wheel.velocity_limit = float(getattr(env_cfg, "wheel_velocity_limit", wheel.velocity_limit))
 
 
+def _apply_training_env_simplifications(env_cfg: Any) -> None:
+    env_cfg.base_control_backend = "planar_joint_velocity"
+    env_cfg.training_planar_base_only = True
+    env_cfg.emit_wheel_debug_state = False
+
+
 def _inject_reward_params(env_cfg: Any, reward_cfg: dict[str, Any]) -> None:
     for section, mapping in _REWARD_PARAM_MAP.items():
         section_cfg = reward_cfg.get(section, {})
@@ -333,7 +342,14 @@ def main(argv: list[str] | None = None) -> int:
     app_launcher = AppLauncher(args_cli)
     simulation_app = app_launcher.app
 
-    env_cfg = build_env_cfg(cfg, n_envs=num_envs, device=device, seed=seed, task_name=task_name)
+    env_cfg = build_env_cfg(
+        cfg,
+        n_envs=num_envs,
+        device=device,
+        seed=seed,
+        task_name=task_name,
+        for_training=True,
+    )
     runtime_cfg = TrainRuntimeConfig(
         headless=args_cli.headless,
         device=device,
