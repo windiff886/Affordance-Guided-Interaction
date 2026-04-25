@@ -489,8 +489,14 @@ class DoorPushEnvCfg(DirectRLEnvCfg):
     rew_w_approach: float = 0.5
     rew_approach_eps: float = 1.0e-6
     rew_approach_stop_angle: float = 0.70
-    rew_w_base_approach: float = 1.0
-    rew_base_approach_open_gate: float = 0.3
+    rew_w_base_align: float = 0.005
+    rew_w_base_forward: float = 25.0
+    rew_w_base_centerline: float = 0.03
+    rew_base_align_mid_angle_deg: float = 35.0
+    rew_base_align_temperature_deg: float = 5.0
+    rew_base_near_sigma: float = 0.8
+    rew_base_range_tau: float = 0.05
+    rew_base_centerline_sigma: float = 0.25
     rew_w_base_cross: float = 50.0
     rew_base_cross_open_gate: float = 1.2
 
@@ -512,13 +518,12 @@ class DoorPushEnvCfg(DirectRLEnvCfg):
     rew_beta_cup_door_prox: float = 10000.0
     rew_cup_door_prox_threshold: float = 0.20
     rew_w_drop: float = 25.0
-    rew_w_base_zero_speed: float = 0.12
+    rew_w_base_zero_speed: float = 0.02
     rew_lambda_base_speed: float = 10.0
     rew_w_base_speed: float = 1.0
     rew_beta_base_cmd: float = 2.0
     rew_beta_base_heading: float = 2.0
     rew_beta_base_corridor: float = 1500.0
-    rew_base_align_tolerance_deg: float = 25.0
 
     # ── 门几何观测 ────────────────────────────────────────────────────
     door_geometry_dim: int = 6  # center(3) + normal(3)

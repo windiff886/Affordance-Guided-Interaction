@@ -867,34 +867,34 @@ w_{\text{approach}}
 s_t^{\text{approach}}.
 $$
 
-4. `task/base_approach`
+4. 底盘通用平滑因子
 
-底盘相关的任务奖励不再对所有“门附近状态”开放，而是只在底盘满足“正对门洞、且矩形 footprint 没有跑到门侧边”时才激活。为此先定义两个几何门控。
+底盘相关任务奖励不再使用硬 `base_align_gate` 和硬 `base_corridor_gate` 作为主要学习信号。先定义推门方向：
 
-记底盘前向在地面上的单位方向为 $f_t^{\text{base}}$，门洞平面的固定法向为 $n^{\text{doorway}}$，则底盘前向与门洞法向的夹角为：
+$$
+d^{\text{push}}=-n^{\text{doorway}}.
+$$
+
+记底盘前向在地面上的单位方向为 $f_t^{\text{base}}$，则底盘前向与推门方向的夹角为：
 
 $$
 \theta_t^{\text{align}}
 =
-\arccos\!\bigl(f_t^{\text{base}}\cdot n^{\text{doorway}}\bigr).
+\arccos\!\bigl(
+\operatorname{clip}(f_t^{\text{base}}\cdot d^{\text{push}},-1,1)
+\bigr).
 $$
 
-朝向门控定义为：
+朝向平滑因子为：
 
 $$
 g_t^{\text{align}}
 =
-\mathbf 1\!\left[\theta_t^{\text{align}}\le \phi_{\text{align}}\right],
+\sigma\left(
+\frac{\phi_{\text{mid}}-\theta_t^{\text{align}}}{\tau_{\text{align}}}
+\right),
 \qquad
-\phi_{\text{align}}=25^\circ.
-$$
-
-等价地，也可写成：
-
-$$
-g_t^{\text{align}}
-=
-\mathbf 1\!\left[f_t^{\text{base}}\cdot n^{\text{doorway}}\ge \cos 25^\circ\right].
+\phi_{\text{mid}}=35^\circ,\quad \tau_{\text{align}}=5^\circ.
 $$
 
 再记底盘矩形 footprint 的 4 个角点在门洞坐标系中的横向坐标为
@@ -911,69 +911,131 @@ e_t^{\text{corridor}}
 \right).
 $$
 
-于是走廊门控为：
+范围平滑因子为：
 
 $$
-g_t^{\text{corridor}}
+g_t^{\text{range}}
 =
-\mathbf 1\!\left[e_t^{\text{corridor}}=0\right].
+\exp\left[
+-\frac{1}{2}
+\left(
+\frac{e_t^{\text{corridor}}}{\tau_{\text{range}}}
+\right)^2
+\right],
+\qquad
+\tau_{\text{range}}=0.05\text{ m}.
 $$
 
-只有当这两个门控同时成立时，`task/base_approach` 和 `task/base_cross` 才会生效。  
+当 footprint 没有越界时 $e_t^{\text{corridor}}=0$，因此 $g_t^{\text{range}}=1$；越界后该因子连续衰减。
 
-在此基础上，`task/base_approach` 奖励底盘在门外侧时逐渐接近门洞下沿在地面上的投影线段。记 `base_link` 地面投影点到门洞下沿线段的当前距离为 $d_t^{\text{base}}$，回合内第一次观测到的距离为 $d_0^{\text{base}}$，则归一化接近度定义为：
+5. `task/base_align`
+
+新增弱朝向 shaping，鼓励底盘在门附近朝向推门方向。记底盘中心到门洞下沿线段的地面距离为 $d_t^{\text{line}}$：
 
 $$
-s_t^{\text{base\_approach}}
+g_t^{\text{near}}
 =
-\max\left(
-1-\frac{(d_t^{\text{base}})^2}{(d_0^{\text{base}})^2+\varepsilon_{\text{app}}},
-0
-\right).
+\exp\left[
+-\frac{1}{2}
+\left(
+\frac{d_t^{\text{line}}}{\sigma_{\text{near}}}
+\right)^2
+\right],
+\qquad
+\sigma_{\text{near}}=0.8\text{ m}.
 $$
 
-再定义 `base_link` 相对门洞平面的有符号距离为 $\delta_t^{\text{plane}}$，并记 $\mathbf 1[\text{crossed}_t]$ 为回合级过门 latch，则：
+则：
 
 $$
-r_t^{\text{base\_approach}}
+r_t^{\text{base\_align}}
 =
-\;g_t^{\text{align}}
+w_{\text{base\_align}}
 \cdot
-g_t^{\text{corridor}}
+g_t^{\text{near}}
 \cdot
-\mathbf 1[\neg \text{crossed}_t]
+g_t^{\text{range}}
 \cdot
-\mathbf 1[\delta_t^{\text{plane}} > 0]
-\cdot
-\mathbf 1[\theta_t \ge \theta_{\text{base-app}}]
-\cdot
-w_{\text{base\_approach}}
-\cdot
-s_t^{\text{base\_approach}}.
+g_t^{\text{align}}.
 $$
 
-5. `task/base_cross`
+当前默认 $w_{\text{base\_align}}=0.005$，只作为姿态引导，不承担任务主奖励。
 
-这项奖励底盘在门洞内侧半空间中的有效推进量。定义
+6. `task/base_forward`
+
+定义 `base_link` 相对门洞平面的有符号距离为 $\delta_t^{\text{plane}}$，并约定机器人沿推门方向前进时该距离减小。底盘前进量为：
 
 $$
-p_t^{\text{inside}}=\max(-\delta_t^{\text{plane}}, 0),
+\Delta_t^{\text{base\_forward}}
+=
+\max(\delta_{t-1}^{\text{plane}}-\delta_t^{\text{plane}},0).
 $$
 
-并记 $\mathbf 1[\text{in\_opening}_t]$ 为 `base_link` 当前横向位置仍位于门洞宽度内，则：
+对应奖励为：
+
+$$
+r_t^{\text{base\_forward}}
+=
+w_{\text{base\_forward}}
+\cdot
+g_t^{\text{align}}
+\cdot
+g_t^{\text{range}}
+\cdot
+\Delta_t^{\text{base\_forward}}.
+$$
+
+7. `task/base_centerline`
+
+记底盘中心在门洞坐标系中的横向偏移为 $y_t^{\text{base}}$，中线得分为：
+
+$$
+s_t^{\text{center}}
+=
+\exp\left[
+-\frac{1}{2}
+\left(
+\frac{y_t^{\text{base}}}{\sigma_{\text{center}}}
+\right)^2
+\right],
+\qquad
+\sigma_{\text{center}}=0.25\text{ m}.
+$$
+
+对应奖励为：
+
+$$
+r_t^{\text{base\_centerline}}
+=
+w_{\text{base\_centerline}}
+\cdot
+g_t^{\text{align}}
+\cdot
+g_t^{\text{range}}
+\cdot
+s_t^{\text{center}}.
+$$
+
+8. `task/base_cross`
+
+这项奖励底盘在门洞内侧半空间中的有效推进量。定义：
+
+$$
+p_t^{\text{inside}}=\max(-\delta_t^{\text{plane}}, 0).
+$$
+
+对应奖励为：
 
 $$
 r_t^{\text{base\_cross}}
 =
-\;g_t^{\text{align}}
+g_t^{\text{align}}
 \cdot
-g_t^{\text{corridor}}
+g_t^{\text{range}}
 \cdot
 \mathbf 1[\theta_t \ge \theta_{\text{base-cross}}]
 \cdot
 w_{\text{base\_cross}}
-\cdot
-\mathbf 1[\text{in\_opening}_t]
 \cdot
 \max\big(p_t^{\text{inside}} - p_{t-1}^{\text{inside}}, 0\big).
 $$
@@ -990,7 +1052,7 @@ $$
 \;\land\;
 \delta_t^{\text{plane}} \le 0
 \;\land\;
-\text{in\_opening}_t
+e_t^{\text{corridor}}=0
 \Big).
 $$
 
@@ -1159,7 +1221,7 @@ w_{\text{base-zero-speed}}
 \exp\!\bigl(-\lambda_{\text{base-speed}}\,s_t^{\text{base-speed}}\bigr).
 $$
 
-这项在底盘速度接近 0 时接近上界，随着速度变大而指数衰减。它的意义是把“尽量静稳地移动底盘”明确写成一个正向偏好。
+这项在底盘速度接近 0 时接近上界，随着速度变大而指数衰减。当前它只保留为弱正则，默认权重从旧方案的 `0.12` 下调为 `0.02`，避免低速生存奖励在长 episode 中压过真正的底盘推进与穿门奖励。
 
 6. `safe/base_speed`
 
@@ -1323,20 +1385,22 @@ $$
 | `task/delta` | 参考一次有效开门增量累计 $\Delta\theta_{\text{ref}}\approx 1.2\ \text{rad}$。 | 由 $R\approx w_{\delta}\Delta\theta_{\text{ref}}$ 得 $w_{\delta}^\star\approx 10/1.2\approx 8.3$。 | 主尺度系数建议 `w_delta≈8~10`。`k_decay` 与 `alpha` 主要控制超过目标角后还保留多少残余梯度，它们应服务于“成功后仍有弱梯度，但不能继续刷太多 reward”这一目标，而不是用来放大主尺度。 |
 | `task/open_bonus` | 门首次达到打开阈值时触发 1 次。 | 若希望 milestone 本身也是 `O(10)`，则直接取 $w_{\text{open}}^\star\approx 10$；若希望它略高于普通 dense shaping，也通常不应超过 `20`。 | 建议 `w_open≈10~20`。它应当是“阶段达成”的强化信号，但不应强到压过整段 dense shaping。 |
 | `task/approach` | 参考在 `40` 步内激活，平均 $s_t^{\text{approach}}\approx 0.5$。 | 有 $R\approx w_{\text{approach}}\cdot 40\cdot 0.5=20w_{\text{approach}}$，故 $w_{\text{approach}}^\star\approx 0.5$。 | 建议 `w_approach≈0.4~0.6`。`approach_stop_angle` 负责控制它覆盖到开门的哪个阶段，但不应通过增大 `w_approach` 去承担任务主奖励的角色。 |
-| `task/base_approach` | 参考在对准门洞且未越界的有效窗口中激活 `25` 步，平均 $s_t^{\text{base\_approach}}\approx 0.4$。 | 有 $R\approx w_{\text{base\_approach}}\cdot 25\cdot 0.4=10w_{\text{base\_approach}}$，故 $w_{\text{base\_approach}}^\star\approx 1.0$。 | 建议 `w_base_approach≈1.0`。这一项只应做“把底盘引到门前”的前置 shaping，不应承担真正的穿门奖励。 |
+| `task/base_align` | 参考底盘在门附近对齐 `900` 步，平均平滑因子乘积约 `1.0`。 | 若希望它只是弱 shaping，则 $R\approx900w_{\text{base\_align}}$ 控制在 `5~10`，故 $w_{\text{base\_align}}\approx0.005~0.01$。 | 当前默认 `w_base_align=0.005`。它只帮助底盘转向推门方向，不应压过推进奖励。 |
+| `task/base_forward` | 参考底盘沿推门方向有效推进 `0.4 m`。 | 有 $R\approx w_{\text{base\_forward}}\cdot0.4$，故 $w_{\text{base\_forward}}^\star\approx25$。 | 当前默认 `w_base_forward=25`。这一项替代旧 `base_approach`，作为持续推进 shaping。 |
+| `task/base_centerline` | 参考底盘在中线附近保持 `900` 步，平均平滑因子乘积约 `1.0`。 | 有 $R\approx900w_{\text{base\_centerline}}$，若取 `0.03` 理论最大约 `27`，实际会被朝向和范围因子衰减。 | 当前默认 `w_base_centerline=0.03`。若出现站中线不动，应降到 `0.01`。 |
 | `task/base_cross` | 参考底盘在门洞内有效向前推进 `0.20 m`。 | 有 $R\approx w_{\text{base\_cross}}\cdot 0.20$，故 $w_{\text{base\_cross}}^\star\approx 50$。 | 建议 `w_base_cross≈40~60`。这一项应该代表“真正的穿门进度”，但在 `O(10)` 标尺下不需要到 `10^3` 量级。 |
-| `stab/zero_acc` | 持杯侧在 `300` 步内保持较稳，参考 $\|a_t\|\approx 0.35$，则 $e^{-2\|a\|^2}\approx e^{-0.245}\approx 0.783$。 | 有 $R\approx 300\cdot w_{\text{zero-acc}}\cdot 0.783$，故 $w_{\text{zero-acc}}^\star\approx 10/(300\cdot 0.783)\approx 0.043$。 | 建议 `w_zero_acc≈0.04~0.05`。若希望在 $\|a\|\approx 0.35$ 处奖励仍保留约 `0.6~0.8` 倍，则 `lambda_acc` 更适合放在 `2~4`。 |
-| `stab/zero_ang` | 参考持杯侧在 `300` 步内保持较小角加速度，令 $\|\alpha_t\|\approx 0.7$，则 $e^{-\|\alpha\|^2}\approx e^{-0.49}\approx 0.613$。 | 有 $R\approx 300\cdot w_{\text{zero-ang}}\cdot 0.613$，故 $w_{\text{zero-ang}}^\star\approx 10/(300\cdot 0.613)\approx 0.054$。 | 若启用，建议 `w_zero_ang≈0.05~0.06`。若希望在 $\|\alpha\|\approx 0.7$ 时仍保留约 `0.5~0.6` 的奖励系数，则 `lambda_ang` 更适合放在 `1.0~1.5`。 |
-| `stab/acc` | 参考持杯侧在 `300` 步内有中等线加速度，令 $\|a_t\|^2\approx 2.25$。 | 有 $R\approx 300\cdot w_{\text{acc}}\cdot 2.25$，故 $w_{\text{acc}}^\star\approx 10/675\approx 0.0148$。 | 建议 `w_acc≈0.012~0.018`。它负责对持续晃动给出线性增长的成本，应与 `zero_acc` 配成一正一负的稳定性通道。 |
-| `stab/ang` | 参考持杯侧在 `300` 步内有明显角加速度，令 $\|\alpha_t\|^2\approx 64$。 | 有 $R\approx 300\cdot w_{\text{ang}}\cdot 64$，故 $w_{\text{ang}}^\star\approx 10/19200\approx 5.2\times10^{-4}$。 | 建议 `w_ang≈(4~6)\times10^{-4}`。它通常应比 `w_acc` 小一个量级以上，但不能小到对角向抖动几乎没有约束。 |
+| `stab/zero_acc` | 持杯侧在 `300` 步内保持较稳，参考 $\|a_t\|\approx 0.25$，并希望该处仍保留约 `0.6` 倍零加速度奖励；取 $\lambda_{\text{acc}}=8$ 时，$e^{-8\cdot0.25^2}=e^{-0.5}\approx0.607$。 | 有 $R\approx 300\cdot w_{\text{zero-acc}}\cdot 0.607$，故 $w_{\text{zero-acc}}^\star\approx 10/(300\cdot0.607)\approx0.055$。 | 建议 `w_zero_acc≈0.055`、`lambda_acc≈8`。相比旧参考 $\|a\|\approx0.35$，现在更早衰减零加速度奖励。 |
+| `stab/zero_ang` | 参考持杯侧在 `300` 步内保持较小角加速度，令 $\|\alpha_t\|\approx 0.45$，并希望该处保留约 `0.5~0.6` 倍零角加速度奖励；取 $\lambda_{\text{ang}}=3$ 时，$e^{-3\cdot0.45^2}\approx0.545$。 | 有 $R\approx 300\cdot w_{\text{zero-ang}}\cdot 0.545$，故 $w_{\text{zero-ang}}^\star\approx 10/(300\cdot0.545)\approx0.061$。 | 建议 `w_zero_ang≈0.06`、`lambda_ang≈3`。相比旧参考 $\|\alpha\|\approx0.7$，现在更严格地压制角加速度。 |
+| `stab/acc` | 参考持杯侧在 `300` 步内有中等线加速度，降低期望后令 $\|a_t\|\approx0.9$，即 $\|a_t\|^2\approx0.81$。 | 有 $R\approx 300\cdot w_{\text{acc}}\cdot0.81$，故 $w_{\text{acc}}^\star\approx 10/(300\cdot0.81)\approx0.041$。 | 建议 `w_acc≈0.04`。它比旧值更强，是降低线加速度期望后的主惩罚项。 |
+| `stab/ang` | 参考持杯侧在 `300` 步内有明显角加速度，降低期望后令 $\|\alpha_t\|\approx4.5$，即 $\|\alpha_t\|^2\approx20.25$。 | 有 $R\approx 300\cdot w_{\text{ang}}\cdot20.25$，故 $w_{\text{ang}}^\star\approx 10/(300\cdot20.25)\approx1.65\times10^{-3}$。 | 建议 `w_ang≈1.6e-3`。它仍小于线加速度惩罚，但比旧值更能压制角向抖动。 |
 | `stab/tilt` | 参考持杯侧在 `300` 步内平均 tilt proxy 为 $\|u_t\|\approx 0.10$。 | 有 $R\approx 300\cdot w_{\text{tilt}}\cdot 0.01$，故 $w_{\text{tilt}}^\star\approx 3.33$。 | 建议 `w_tilt≈3.0~3.5`。这一项直接约束杯体姿态，通常应是稳定性模块里最强的单项之一。 |
-| `safe/joint_vel` | 参考 `100` 步内有 `3` 个关节持续明显超限，平均超限量各为 `0.6`，则 $\sum_j(e_{t,j}^{\text{vel}})^2\approx 3\times 0.6^2=1.08$。 | 有 $R\approx 100\cdot \beta_{\text{vel}}\cdot 1.08$，故 $\beta_{\text{vel}}^\star\approx 0.093$。 | 建议 `beta_vel≈0.08~0.10`。`mu` 负责决定从多早开始罚，主尺度仍应由 `beta_vel` 来定。 |
+| `safe/joint_vel` | 参考 `100` 步内有 `3` 个关节持续明显超限，降低速度期望后令平均超限量各为 `0.4`，则 $\sum_j(e_{t,j}^{\text{vel}})^2\approx3\times0.4^2=0.48$。 | 有 $R\approx100\cdot\beta_{\text{vel}}\cdot0.48$，故 $\beta_{\text{vel}}^\star\approx10/48\approx0.208$。 | 建议 `mu≈0.75`、`beta_vel≈0.20`。`mu` 让惩罚从更低速度比例开始，`beta_vel` 让同样的超限更痛。 |
 | `safe/target_limit` | 参考 `100` 步内有 `4` 个关节进入边界带一半深度，即 $\left(e_{t,j}^{\text{target}}/m_j\right)^2\approx 0.25$，总和约 `1.0`。 | 有 $R\approx 100\cdot \beta_{\text{target}}\cdot 1.0$，故 $\beta_{\text{target}}^\star\approx 0.1$。 | 建议 `beta_target≈0.08~0.12`。`target_margin_ratio` 负责定义边界带宽度，`beta_target` 决定进入边界带后的实际成本。 |
-| `safe/joint_move` | 参考 `300` 步内，`12` 个关节平均每步变化量约 `0.02 rad`，则 $\sum_j(\Delta q_j)^2\approx 12\times 0.02^2=0.0048$。 | 有 $R\approx 300\cdot \beta_{\text{joint\_move}}\cdot 0.0048$，故 $\beta_{\text{joint\_move}}^\star\approx 6.94$。 | 建议 `beta_joint_move≈6~8`。这一项负责压制高频抽动，应保持在比较稳定的中高强度。 |
+| `safe/joint_move` | 参考 `300` 步内，`12` 个关节平均每步变化量从 `0.02 rad` 降到 `0.015 rad`，则 $\sum_j(\Delta q_j)^2\approx12\times0.015^2=0.0027$。 | 有 $R\approx300\cdot\beta_{\text{joint\_move}}\cdot0.0027$，故 $\beta_{\text{joint\_move}}^\star\approx10/0.81\approx12.35$。 | 建议 `beta_joint_move≈12`。这一项用于压制高频关节抽动，降低期望步进后需要显著提高。 |
 | `safe/cup_door_prox` | 参考杯体对门板侵入 `1 cm`，并持续 `10` 步，则每步侵入平方为 `0.01^2=10^{-4}`。 | 有 $R\approx 10\cdot \beta_{\text{cup\_door\_prox}}\cdot 10^{-4}$，故 $\beta_{\text{cup\_door\_prox}}^\star\approx 10^4$。 | 建议 `beta_cup_door_prox≈10^4`。若希望 `2 cm` 侵入就明显更痛，可以维持阈值不变而把系数提升到 `1.5×10^4` 左右。 |
-| `safe/base_zero_speed` | 参考底盘在 `100` 步内维持低速静稳，令 $s_t^{\text{base-speed}}\approx 0.02$。若取 $\lambda_{\text{base-speed}}=10$，则 $e^{-10\cdot 0.02}\approx 0.819$。 | 有 $R\approx 100\cdot w_{\text{base-zero-speed}}\cdot 0.819$，故 $w_{\text{base-zero-speed}}^\star\approx 0.12$。 | 建议 `w_base_zero_speed≈0.10~0.15`，`lambda_base_speed≈8~12`。这项只负责表达“低速静稳是偏好的”，不应独自承担强惩罚功能。 |
-| `safe/base_speed` | 参考底盘在 `100` 步内维持“明显偏快但未失控”的速度，令 $s_t^{\text{base-speed}}\approx 0.10$。 | 有 $R\approx 100\cdot w_{\text{base-speed}}\cdot 0.10$，故 $w_{\text{base-speed}}^\star\approx 1.0$。 | 建议 `w_base_speed≈0.8~1.2`。这是底盘速度的主惩罚项，保留它后就不需要再单独增加重复的 `base_motion` 速度惩罚。 |
-| `safe/base_cmd_delta` | 参考底盘命令在 `100` 步内存在中等抖动，令 $\|\Delta u_t^{\text{base}}\|_2^2\approx 0.05$。 | 有 $R\approx 100\cdot \beta_{\text{base\_cmd}}\cdot 0.05$，故 $\beta_{\text{base\_cmd}}^\star\approx 2.0$。 | 建议 `beta_base_cmd≈1~3`。这一项主要用于抑制命令抖动，通常放在 `base_speed` 之后微调。 |
+| `safe/base_zero_speed` | 参考整段 episode 低速静稳时可能持续激活；希望在 $s_t^{\text{base-speed}}\approx0.025$ 附近仍保留约 `0.6` 倍零速度奖励。 | 由 $e^{-\lambda_{\text{base-speed}}\cdot0.025}\approx0.64$ 得 $\lambda_{\text{base-speed}}\approx18$。`w_base_zero_speed` 仍保持弱正则 `0.02`，避免低速生存奖励压过任务进展。 | 建议 `w_base_zero_speed=0.02`、`lambda_base_speed≈18`。这会让零速度奖励比旧配置更快衰减。 |
+| `safe/base_speed` | 参考底盘在 `100` 步内维持“明显偏快但未失控”的速度，降低速度期望后令 $s_t^{\text{base-speed}}\approx0.0625$。 | 有 $R\approx100\cdot w_{\text{base-speed}}\cdot0.0625$，故 $w_{\text{base-speed}}^\star\approx10/6.25=1.6$。 | 建议 `w_base_speed≈1.6`。这是底盘速度的主惩罚项，降低速度预估后需要提高系数。 |
+| `safe/base_cmd_delta` | 参考底盘命令在 `100` 步内存在中等抖动，降低期望后令 $\|\Delta u_t^{\text{base}}\|_2^2\approx0.02$。 | 有 $R\approx100\cdot\beta_{\text{base\_cmd}}\cdot0.02$，故 $\beta_{\text{base\_cmd}}^\star\approx5.0$。 | 建议 `beta_base_cmd≈5`。这一项相当于压制底盘速度命令的快速变化。 |
 | `safe/drop` | 掉杯时触发 1 次。 | 若坚持与其他子项同量级，则应取 $w_{\text{drop}}^\star\approx 10$；若希望它比一般 shaping 更像“硬安全事件”，也通常只需要 `20~30`。 | 建议 `w_drop≈20~30`。它可以比普通 dense shaping 更强，但不需要高到远离整体量级体系。 |
 | `safe/base_heading` | 参考底盘在 `20` 步内持续以 `30^\circ` 偏向门框横向方向，则 $(f_t^{\text{base}}\cdot t^{\text{doorway}})^2=\sin^2 30^\circ=0.25$。 | 有 $R\approx 20\cdot \beta_{\text{base\_heading}}\cdot 0.25$，故 $\beta_{\text{base\_heading}}^\star\approx 2.0$。 | 建议 `beta_base_heading≈2.0`。它应让 `15^\circ` 偏航只是轻罚，`30^\circ` 以上偏航开始明显不划算。 |
 | `safe/base_corridor` | 参考底盘矩形 footprint 持续 `10` 步越界 `3 cm`，则 $(e_t^{\text{corridor}})^2=0.03^2=9\times 10^{-4}$。 | 有 $R\approx 10\cdot \beta_{\text{base\_corridor}}\cdot 9\times 10^{-4}$，故 $\beta_{\text{base\_corridor}}^\star\approx 1111$。若把参考越界改成 `2 cm`，则会得到约 `2500`。 | 建议 `beta_base_corridor≈1000~2500`，中间值可取 `1500~2000`。这项是阻止“擦门框绕过去”的几何主约束，合理量级天然就在 `10^3`。 |
@@ -1348,15 +1412,15 @@ $$
    这三项共同定义“打开门并真正穿过去”。
 
 2. 再固定前置引导项：
-   `w_approach≈0.4~0.6`、`w_base_approach≈1.0`。
-   它们只负责把手和底盘引到正确位置，不应压过主任务项。
+   `w_approach≈0.4~0.6`、`w_base_align≈0.005~0.01`、`w_base_forward≈25`、`w_base_centerline≈0.01~0.03`。
+   它们只负责把手和底盘引到正确位置并维持正确通道，不应压过主任务项。
 
 3. 然后固定持杯稳定项：
-   `w_zero_acc≈0.04~0.05`、`w_zero_ang≈0.05~0.06`、`w_acc≈0.012~0.018`、`w_ang≈(4~6)\times10^{-4}`、`w_tilt≈3.0~3.5`。
+   `w_zero_acc≈0.055`、`lambda_acc≈8`、`w_zero_ang≈0.06`、`lambda_ang≈3`、`w_acc≈0.04`、`w_ang≈1.6e-3`、`w_tilt≈3.0~3.5`。
    目标是让“持续稳定持杯”的总成本也在 `O(10)`。
 
 4. 最后固定安全约束：
-   `beta_vel≈0.08~0.10`、`beta_target≈0.08~0.12`、`beta_joint_move≈6~8`、`beta_cup_door_prox≈10^4`、`w_base_speed≈0.8~1.2`、`beta_base_cmd≈1~3`、`w_drop≈20~30`、`beta_base_heading≈2.0`、`beta_base_corridor≈1000~2500`。
+   `mu≈0.75`、`beta_vel≈0.20`、`beta_target≈0.08~0.12`、`beta_joint_move≈12`、`beta_cup_door_prox≈10^4`、`lambda_base_speed≈18`、`w_base_speed≈1.6`、`beta_base_cmd≈5`、`w_drop≈20~30`、`beta_base_heading≈2.0`、`beta_base_corridor≈1000~2500`。
    这些项的目标不是让 reward 变大，而是让明显危险或 exploit 行为在 episode 级累计上“至少不比完成任务更划算”。
 
 ### 3.5 当前默认训练下奖励的实际激活情况
@@ -2144,10 +2208,12 @@ $$
 | `reward_detail/task/open_bonus` | 第一次达到开门阈值的一次性 bonus | $\displaystyle \frac{1}{K_e}\sum_{k\in\mathcal K_e}\sum_t w_{\text{open}}\mathbf 1[\theta_{k,t}\ge\theta_{\text{succ}}]\mathbf 1[\text{first-crossing}_{k,t}]$ |
 | `reward_detail/task/approach` | 手部接近门板的加权 shaping | $\displaystyle \frac{1}{K_e}\sum_{k\in\mathcal K_e}\sum_t \mathbf 1[\theta_{k,t}<\theta_{\text{stop}}]w_{\text{approach}}s_{k,t}^{\text{approach}}$ |
 | `reward_detail/task/approach_raw` | 未乘权重和 stop gate 的归一化接近度 | $\displaystyle \frac{1}{K_e}\sum_{k\in\mathcal K_e}\sum_t s_{k,t}^{\text{approach}}$ |
-| `reward_detail/task/base_approach` | 底盘在门外侧接近门洞下沿线段的奖励 | $\displaystyle \frac{1}{K_e}\sum_{k\in\mathcal K_e}\sum_t g_{k,t}^{\text{align}}g_{k,t}^{\text{corridor}}\mathbf 1[\neg\text{crossed}_{k,t}]\mathbf 1[\delta_{k,t}^{\text{plane}}>0]\mathbf 1[\theta_{k,t}\ge\theta_{\text{base-app}}]w_{\text{base\_approach}}s_{k,t}^{\text{base\_approach}}$ |
-| `reward_detail/task/base_cross` | 底盘穿门后在内侧半空间的推进奖励 | $\displaystyle \frac{1}{K_e}\sum_{k\in\mathcal K_e}\sum_t g_{k,t}^{\text{align}}g_{k,t}^{\text{corridor}}\mathbf 1[\theta_{k,t}\ge\theta_{\text{base-cross}}]w_{\text{base\_cross}}\mathbf 1[\text{in\_opening}_{k,t}]\max(p_{k,t}^{\text{inside}}-p_{k,t-1}^{\text{inside}},0)$ |
+| `reward_detail/task/base_align` | 底盘朝推门方向对齐的弱 shaping | $\displaystyle \frac{1}{K_e}\sum_{k\in\mathcal K_e}\sum_t w_{\text{base\_align}}g_{k,t}^{\text{near}}g_{k,t}^{\text{range}}g_{k,t}^{\text{align}}$ |
+| `reward_detail/task/base_forward` | 底盘沿推门方向的连续推进奖励 | $\displaystyle \frac{1}{K_e}\sum_{k\in\mathcal K_e}\sum_t w_{\text{base\_forward}}g_{k,t}^{\text{align}}g_{k,t}^{\text{range}}\max(\delta_{k,t-1}^{\text{plane}}-\delta_{k,t}^{\text{plane}},0)$ |
+| `reward_detail/task/base_centerline` | 底盘靠近门洞中线的弱 shaping | $\displaystyle \frac{1}{K_e}\sum_{k\in\mathcal K_e}\sum_t w_{\text{base\_centerline}}g_{k,t}^{\text{align}}g_{k,t}^{\text{range}}s_{k,t}^{\text{center}}$ |
+| `reward_detail/task/base_cross` | 底盘穿门后在内侧半空间的推进奖励 | $\displaystyle \frac{1}{K_e}\sum_{k\in\mathcal K_e}\sum_t g_{k,t}^{\text{align}}g_{k,t}^{\text{range}}\mathbf 1[\theta_{k,t}\ge\theta_{\text{base-cross}}]w_{\text{base\_cross}}\max(p_{k,t}^{\text{inside}}-p_{k,t-1}^{\text{inside}},0)$ |
 
-这里的 $s_t^{\text{approach}}$、$s_t^{\text{base\_approach}}$、$g_t^{\text{align}}$、$g_t^{\text{corridor}}$ 和 $p_t^{\text{inside}}$ 的定义见第 3.4.2 节。
+这里的 $s_t^{\text{approach}}$、$g_t^{\text{align}}$、$g_t^{\text{range}}$、$g_t^{\text{near}}$、$s_t^{\text{center}}$ 和 $p_t^{\text{inside}}$ 的定义见第 3.4.2 节。
 
 ### 6.8 稳定性 reward 细项（自定义 observer）
 
@@ -2271,4 +2337,4 @@ $$
 <a id="sec-7"></a>
 ## 7. 一句话总结
 
-当前项目默认训练的数学本质是：在随机基座站位、随机门动力学、随机 occupancy、观测噪声和位置目标噪声下，使用一个以 $90$ 维低维观测为输入、输出“12 维双臂归一化 joint command + 3 维底盘速度命令”的高斯策略，通过带特权 critic 的 PPO 最大化“开门增量 + 一次性开门成功 + 近门 shaping + 底盘接近门洞与穿门 shaping + 持杯稳定性奖励 + 底盘零速度奖励 - 速度越界 - 目标边界带惩罚 - 关节移动惩罚 - 杯体贴门惩罚 - 底盘速度惩罚 - 底盘命令跳变惩罚 - 掉杯失败”的条件期望回报。
+当前项目默认训练的数学本质是：在随机基座站位、随机门动力学、随机 occupancy、观测噪声和位置目标噪声下，使用一个以 $90$ 维低维观测为输入、输出“12 维双臂归一化 joint command + 3 维底盘速度命令”的高斯策略，通过带特权 critic 的 PPO 最大化“开门增量 + 一次性开门成功 + 近门 shaping + 底盘朝向对齐 + 底盘沿推门方向推进 + 底盘靠近门洞中线 + 底盘穿门进展 + 持杯稳定性奖励 + 弱底盘零速度奖励 - 速度越界 - 目标边界带惩罚 - 关节移动惩罚 - 杯体贴门惩罚 - 底盘速度惩罚 - 底盘命令跳变惩罚 - 掉杯失败”的条件期望回报。

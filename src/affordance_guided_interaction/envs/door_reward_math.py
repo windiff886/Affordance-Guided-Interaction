@@ -80,26 +80,35 @@ def compute_signed_distance_to_plane(
     return ((points - plane_points) * plane_normals).sum(dim=-1)
 
 
-def compute_base_approach_active_mask(
-    *,
-    base_crossed: Tensor,
-    current_signed_distance: Tensor,
-) -> Tensor:
-    """Keep approach shaping active only while base_link is still outside the doorway plane."""
-    return (~base_crossed) & (current_signed_distance > 0.0)
-
-
 def compute_base_alignment_gate(
     *,
     base_forward_world: Tensor,
     doorway_normal_world: Tensor,
     max_angle_deg: float,
 ) -> Tensor:
-    """Gate base rewards by the angle to the fixed doorway normal."""
+    """Gate base rewards by the angle to the push direction."""
     base_forward_unit = _normalize_vectors(base_forward_world)
     doorway_normal_unit = _normalize_vectors(doorway_normal_world)
+    push_direction_unit = -doorway_normal_unit
     cos_threshold = math.cos(math.radians(float(max_angle_deg)))
-    return (base_forward_unit * doorway_normal_unit).sum(dim=-1) >= cos_threshold
+    return (base_forward_unit * push_direction_unit).sum(dim=-1) >= cos_threshold
+
+
+def compute_base_alignment_score(
+    *,
+    base_forward_world: Tensor,
+    doorway_normal_world: Tensor,
+    mid_angle_deg: float,
+    temperature_deg: float,
+) -> Tensor:
+    """Smoothly score how well the base faces the push direction."""
+    base_forward_unit = _normalize_vectors(base_forward_world)
+    push_direction_unit = -_normalize_vectors(doorway_normal_world)
+    cosine = torch.clamp((base_forward_unit * push_direction_unit).sum(dim=-1), -1.0, 1.0)
+    angle = torch.acos(cosine)
+    mid = math.radians(float(mid_angle_deg))
+    temperature = max(math.radians(float(temperature_deg)), 1.0e-6)
+    return torch.sigmoid((mid - angle) / temperature)
 
 
 def compute_base_footprint_corners_door_frame(
@@ -142,6 +151,47 @@ def compute_base_corridor_excess(
 ) -> Tensor:
     """Measure how far the base footprint extends outside the doorway corridor."""
     return torch.clamp(corner_y.abs().amax(dim=-1) - float(corridor_half_width), min=0.0)
+
+
+def compute_base_range_score(
+    *,
+    corridor_excess: Tensor,
+    tau: float,
+) -> Tensor:
+    """Keep full reward inside the doorway corridor and smoothly decay outside."""
+    tau_value = max(float(tau), 1.0e-6)
+    excess = torch.clamp(corridor_excess, min=0.0)
+    return torch.exp(-0.5 * torch.square(excess / tau_value))
+
+
+def compute_near_line_score(
+    *,
+    base_line_dist: Tensor,
+    sigma: float,
+) -> Tensor:
+    """Score proximity to the doorway lower edge line segment."""
+    sigma_value = max(float(sigma), 1.0e-6)
+    return torch.exp(-0.5 * torch.square(base_line_dist / sigma_value))
+
+
+def compute_forward_progress_delta(
+    *,
+    previous_signed_distance: Tensor,
+    current_signed_distance: Tensor,
+) -> Tensor:
+    """Reward positive progress along the push direction in signed-distance space."""
+    return torch.clamp(previous_signed_distance - current_signed_distance, min=0.0)
+
+
+def compute_base_align_reward(
+    *,
+    align_score: Tensor,
+    range_score: Tensor,
+    near_score: Tensor,
+    weight: float,
+) -> Tensor:
+    """Combine smooth factors into the base alignment shaping reward."""
+    return float(weight) * align_score * range_score * near_score
 
 
 def compute_base_heading_penalty(

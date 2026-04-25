@@ -12,35 +12,40 @@ task:
   w_approach: 0.5            # 接近门板大表面奖励权重
   approach_eps: 1.0e-6          # 归一化距离公式分母稳定项
   approach_stop_angle: 0.70     # 门角度超过该阈值后关闭接近奖励
-  w_base_approach: 1.0       # base_link 接近门洞下沿线的奖励权重
-  base_approach_open_gate: 0.3  # 门至少打开到该角度后才激活底盘接近奖励
+  w_base_align: 0.005        # 底盘朝推门方向对齐的弱 shaping 奖励
+  w_base_forward: 25.0       # 底盘沿推门方向每米推进奖励
+  w_base_centerline: 0.03    # 底盘靠近门洞中线的逐步 shaping 奖励
+  base_align_mid_angle_deg: 35.0       # 朝向平滑因子的 0.5 过渡角
+  base_align_temperature_deg: 5.0      # 朝向 sigmoid 过渡宽度
+  base_near_sigma: 0.8       # 朝向奖励的门附近高斯宽度 (m)
+  base_range_tau: 0.05       # footprint 越界后的平滑衰减宽度 (m)
+  base_centerline_sigma: 0.25 # 中线高斯宽度 (m)
   w_base_cross: 50.0         # base_link 穿过门洞并继续向内推进的奖励权重
   base_cross_open_gate: 1.2  # 门达到该角度后才激活穿门进度奖励
 
 # ── 稳定性奖励 (§5) ──────────────────────────────────────────────
 stability:
-  w_zero_acc: 0.045          # 零线加速度奖励权重
-  lambda_acc: 3.0            # 零线加速度高斯核衰减率
-  w_zero_ang: 0.055          # 零角加速度奖励权重
-  lambda_ang: 1.2            # 零角加速度高斯核衰减率
-  w_acc: 0.015              # 线加速度惩罚系数
-  w_ang: 0.0005             # 角加速度惩罚系数
+  w_zero_acc: 0.055          # 零线加速度奖励权重
+  lambda_acc: 8.0            # 零线加速度高斯核衰减率
+  w_zero_ang: 0.060          # 零角加速度奖励权重
+  lambda_ang: 3.0            # 零角加速度高斯核衰减率
+  w_acc: 0.040              # 线加速度惩罚系数
+  w_ang: 0.0016             # 角加速度惩罚系数
   w_tilt: 3                # 重力倾斜惩罚系数
 
 # ── 安全惩罚 (§6) ────────────────────────────────────────────────
 safety:
-  mu: 0.90                    # 关节速度触发比例
-  beta_vel: 0.1              # 关节速度系数
+  mu: 0.75                    # 关节速度触发比例
+  beta_vel: 0.2              # 关节速度系数
   beta_target: 0.1            # 目标角边界带惩罚系数
   target_margin_ratio: 0.05   # 距离上下限 5% 范围内开始惩罚
-  beta_joint_move: 7.0        # 关节移动惩罚系数
+  beta_joint_move: 12.0       # 关节移动惩罚系数
   beta_cup_door_prox: 10000.0    # 杯体-门板接近惩罚系数
   cup_door_prox_threshold: 0.20  # 杯体-门板距离阈值 (m)
   w_drop: 25.0               # 杯体脱落惩罚
-  w_base_zero_speed: 0.12    # 底盘零速度奖励系数
-  lambda_base_speed: 10.0    # 底盘零速度奖励衰减率
-  w_base_speed: 1.0          # 底盘速度惩罚系数
-  beta_base_cmd: 2.0         # 相邻步底盘命令跳变惩罚系数
+  w_base_zero_speed: 0.02    # 底盘低速稳定弱奖励，避免压过任务进展
+  lambda_base_speed: 18.0    # 底盘零速度奖励衰减率
+  w_base_speed: 1.6          # 底盘速度惩罚系数
+  beta_base_cmd: 5.0         # 相邻步底盘命令跳变惩罚系数
   beta_base_heading: 2.0     # 底盘朝门框横向偏置惩罚系数
   beta_base_corridor: 1500.0 # 底盘越出门洞走廊惩罚系数
-  base_align_tolerance_deg: 25.0  # 底盘与门洞法向的最大夹角（度）

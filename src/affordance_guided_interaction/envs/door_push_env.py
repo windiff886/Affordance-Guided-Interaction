@@ -71,16 +71,19 @@ from .base_control_math import (
     twist_to_wheel_angular_velocity_targets,
 )
 from .door_reward_math import (
-    compute_base_alignment_gate,
-    compute_base_approach_active_mask,
+    compute_base_align_reward,
+    compute_base_alignment_score,
     compute_base_corridor_excess,
+    compute_base_range_score,
     compute_base_footprint_corners_door_frame,
     compute_base_heading_penalty,
+    compute_forward_progress_delta,
     compute_base_speed_penalty,
     compute_base_speed_squared,
     compute_base_zero_speed_reward,
     compute_door_traverse_success,
     compute_inside_progress_delta,
+    compute_near_line_score,
     compute_normalized_approach_score,
     compute_point_to_panel_face_distance,
     compute_point_to_segment_distance,
@@ -125,7 +128,9 @@ _EPISODE_REWARD_KEYS = (
     "task/open_bonus",
     "task/approach",
     "task/approach_raw",
-    "task/base_approach",
+    "task/base_align",
+    "task/base_forward",
+    "task/base_centerline",
     "task/base_cross",
     "stab_left",
     "stab_left/zero_acc",
@@ -287,7 +292,6 @@ class DoorPushEnv(DirectRLEnv):
         self._cached_base_signed_doorway_distance = torch.zeros(N, device=dev)
         self._prev_base_signed_doorway_distance = torch.full((N,), float("nan"), device=dev)
         self._cached_base_in_doorway_opening = torch.zeros(N, dtype=torch.bool, device=dev)
-        self._initial_base_doorway_dist = torch.full((N,), float("nan"), device=dev)
         self._base_link_crossed = torch.zeros(N, dtype=torch.bool, device=dev)
         self._cached_episode_success = torch.zeros(N, dtype=torch.bool, device=dev)
         self._cached_approach_dist = torch.zeros(N, device=dev)
@@ -551,11 +555,6 @@ class DoorPushEnv(DirectRLEnv):
             corridor_half_width=corridor_half_width,
         )
         base_corridor_gate = base_corridor_excess <= 1.0e-6
-        base_align_gate = compute_base_alignment_gate(
-            base_forward_world=base_forward_world,
-            doorway_normal_world=doorway_plane_normal_w,
-            max_angle_deg=self.cfg.rew_base_align_tolerance_deg,
-        )
         base_signed_distance = compute_signed_distance_to_plane(
             points=base_pos_w,
             plane_points=door_root_pos_w,
@@ -578,7 +577,6 @@ class DoorPushEnv(DirectRLEnv):
             "base_corners_door": base_corners_door,
             "base_corridor_excess": base_corridor_excess,
             "base_corridor_gate": base_corridor_gate,
-            "base_align_gate": base_align_gate,
             "base_line_dist": base_line_dist,
             "base_signed_distance": base_signed_distance,
             "base_in_opening": base_in_opening,
@@ -886,12 +884,6 @@ class DoorPushEnv(DirectRLEnv):
             doorway_state["base_signed_distance"],
             self._prev_base_signed_doorway_distance,
         )
-        self._initial_base_doorway_dist = torch.where(
-            torch.isnan(self._initial_base_doorway_dist),
-            doorway_state["base_line_dist"],
-            self._initial_base_doorway_dist,
-        )
-
         left_approach_dist = self._compute_point_to_panel_face_distance(
             points_base=left_ee_pos_base,
             face_center_base=door_panel_face_center_base,
@@ -1043,50 +1035,73 @@ class DoorPushEnv(DirectRLEnv):
             door_root_quat_w=door_root_quat_w,
         )
         current_base_line_dist = doorway_state["base_line_dist"]
-        self._initial_base_doorway_dist = torch.where(
-            torch.isnan(self._initial_base_doorway_dist),
-            current_base_line_dist,
-            self._initial_base_doorway_dist,
-        )
-        base_approach_raw = self._compute_normalized_approach_score(
-            current_dist=current_base_line_dist,
-            initial_dist=self._initial_base_doorway_dist,
-            eps=self.cfg.rew_approach_eps,
-        )
-        base_approach_active = compute_base_approach_active_mask(
-            base_crossed=self._base_link_crossed,
-            current_signed_distance=doorway_state["base_signed_distance"],
-        ) & doorway_state["base_align_gate"] & doorway_state["base_corridor_gate"]
-        r_task_base_approach = (
-            base_approach_active.float()
-            * (theta >= self.cfg.rew_base_approach_open_gate).float()
-            * self.cfg.rew_w_base_approach
-            * base_approach_raw
-        )
-
         current_base_signed_distance = doorway_state["base_signed_distance"]
         prev_base_signed_distance = torch.where(
             torch.isnan(self._prev_base_signed_doorway_distance),
             current_base_signed_distance,
             self._prev_base_signed_doorway_distance,
         )
-        r_task_base_cross = (
-            doorway_state["base_align_gate"].float()
-            * doorway_state["base_corridor_gate"].float()
-            *
-            (theta >= self.cfg.rew_base_cross_open_gate).float()
-            * self.cfg.rew_w_base_cross
-            * compute_inside_progress_delta(
-                previous_signed_distance=prev_base_signed_distance,
-                current_signed_distance=current_base_signed_distance,
-                in_opening=doorway_state["base_in_opening"],
+
+        base_align_score = compute_base_alignment_score(
+            base_forward_world=doorway_state["base_forward_world"],
+            doorway_normal_world=doorway_state["doorway_plane_normal_w"],
+            mid_angle_deg=self.cfg.rew_base_align_mid_angle_deg,
+            temperature_deg=self.cfg.rew_base_align_temperature_deg,
+        )
+        base_range_score = compute_base_range_score(
+            corridor_excess=doorway_state["base_corridor_excess"],
+            tau=self.cfg.rew_base_range_tau,
+        )
+        base_near_score = compute_near_line_score(
+            base_line_dist=current_base_line_dist,
+            sigma=self.cfg.rew_base_near_sigma,
+        )
+        r_task_base_align = compute_base_align_reward(
+            align_score=base_align_score,
+            range_score=base_range_score,
+            near_score=base_near_score,
+            weight=self.cfg.rew_w_base_align,
+        )
+        base_forward_delta = compute_forward_progress_delta(
+            previous_signed_distance=prev_base_signed_distance,
+            current_signed_distance=current_base_signed_distance,
+        )
+        r_task_base_forward = (
+            self.cfg.rew_w_base_forward
+            * base_align_score
+            * base_range_score
+            * base_forward_delta
+        )
+        base_centerline_score = torch.exp(
+            -0.5
+            * torch.square(
+                doorway_state["base_pos_door"][:, 1]
+                / max(float(self.cfg.rew_base_centerline_sigma), 1.0e-6)
             )
+        )
+        r_task_base_centerline = (
+            self.cfg.rew_w_base_centerline
+            * base_align_score
+            * base_range_score
+            * base_centerline_score
+        )
+        base_inside_progress = compute_inside_progress_delta(
+            previous_signed_distance=prev_base_signed_distance,
+            current_signed_distance=current_base_signed_distance,
+            in_opening=torch.ones_like(doorway_state["base_in_opening"], dtype=torch.bool),
+        )
+        r_task_base_cross = (
+            base_align_score
+            * base_range_score
+            * (theta >= self.cfg.rew_base_cross_open_gate).float()
+            * self.cfg.rew_w_base_cross
+            * base_inside_progress
         )
         self._base_link_crossed = update_crossing_latch(
             previous_crossed=self._base_link_crossed,
             previous_signed_distance=prev_base_signed_distance,
             current_signed_distance=current_base_signed_distance,
-            in_opening=doorway_state["base_in_opening"],
+            in_opening=doorway_state["base_corridor_gate"],
         )
         self._cached_base_signed_doorway_distance = current_base_signed_distance.clone()
         self._cached_base_in_doorway_opening = doorway_state["base_in_opening"].clone()
@@ -1105,7 +1120,9 @@ class DoorPushEnv(DirectRLEnv):
             r_task_delta
             + r_task_open_bonus
             + r_task_approach
-            + r_task_base_approach
+            + r_task_base_align
+            + r_task_base_forward
+            + r_task_base_centerline
             + r_task_base_cross
         )
 
@@ -1114,7 +1131,9 @@ class DoorPushEnv(DirectRLEnv):
         reward_info["task/open_bonus"] = r_task_open_bonus
         reward_info["task/approach"] = r_task_approach
         reward_info["task/approach_raw"] = r_task_approach_raw
-        reward_info["task/base_approach"] = r_task_base_approach
+        reward_info["task/base_align"] = r_task_base_align
+        reward_info["task/base_forward"] = r_task_base_forward
+        reward_info["task/base_centerline"] = r_task_base_centerline
         reward_info["task/base_cross"] = r_task_base_cross
 
         # ══════════════════════════════════════════════════════════════
@@ -1461,7 +1480,6 @@ class DoorPushEnv(DirectRLEnv):
         self._cached_base_signed_doorway_distance[env_ids] = 0.0
         self._prev_base_signed_doorway_distance[env_ids] = float("nan")
         self._cached_base_in_doorway_opening[env_ids] = False
-        self._initial_base_doorway_dist[env_ids] = float("nan")
         self._base_link_crossed[env_ids] = False
         self._cached_episode_success[env_ids] = False
         self._cached_approach_dist[env_ids] = 0.0
