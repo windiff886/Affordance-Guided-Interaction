@@ -6,6 +6,8 @@ runtime imports so the reward geometry can be regression-tested without Omni.
 
 from __future__ import annotations
 
+import math
+
 import torch
 from torch import Tensor
 
@@ -33,6 +35,10 @@ def compute_point_to_panel_face_distance(
     excess_y = torch.clamp(rel_local[:, 1].abs() - float(half_extent_y), min=0.0)
     excess_z = torch.clamp(rel_local[:, 2].abs() - float(half_extent_z), min=0.0)
     return torch.sqrt(rel_local[:, 0].square() + excess_y.square() + excess_z.square())
+
+
+def _normalize_vectors(vectors: Tensor) -> Tensor:
+    return vectors / vectors.norm(dim=-1, keepdim=True).clamp(min=1.0e-12)
 
 
 
@@ -81,6 +87,104 @@ def compute_base_approach_active_mask(
 ) -> Tensor:
     """Keep approach shaping active only while base_link is still outside the doorway plane."""
     return (~base_crossed) & (current_signed_distance > 0.0)
+
+
+def compute_base_alignment_gate(
+    *,
+    base_forward_world: Tensor,
+    doorway_normal_world: Tensor,
+    max_angle_deg: float,
+) -> Tensor:
+    """Gate base rewards by the angle to the fixed doorway normal."""
+    base_forward_unit = _normalize_vectors(base_forward_world)
+    doorway_normal_unit = _normalize_vectors(doorway_normal_world)
+    cos_threshold = math.cos(math.radians(float(max_angle_deg)))
+    return (base_forward_unit * doorway_normal_unit).sum(dim=-1) >= cos_threshold
+
+
+def compute_base_footprint_corners_door_frame(
+    *,
+    base_pos_door_xy: Tensor,
+    base_yaw_door: Tensor,
+    half_length: float,
+    half_width: float,
+) -> Tensor:
+    """Compute the four base footprint corners in doorway-frame XY coordinates."""
+    corners_local = torch.tensor(
+        [
+            [float(half_length), float(half_width)],
+            [float(half_length), -float(half_width)],
+            [-float(half_length), float(half_width)],
+            [-float(half_length), -float(half_width)],
+        ],
+        device=base_pos_door_xy.device,
+        dtype=base_pos_door_xy.dtype,
+    ).unsqueeze(0)
+    cos_yaw = torch.cos(base_yaw_door).unsqueeze(-1)
+    sin_yaw = torch.sin(base_yaw_door).unsqueeze(-1)
+    x_local = corners_local[..., 0]
+    y_local = corners_local[..., 1]
+    x_rot = x_local * cos_yaw - y_local * sin_yaw
+    y_rot = x_local * sin_yaw + y_local * cos_yaw
+    return torch.stack(
+        (
+            base_pos_door_xy[:, :1] + x_rot,
+            base_pos_door_xy[:, 1:2] + y_rot,
+        ),
+        dim=-1,
+    )
+
+
+def compute_base_corridor_excess(
+    *,
+    corner_y: Tensor,
+    corridor_half_width: float,
+) -> Tensor:
+    """Measure how far the base footprint extends outside the doorway corridor."""
+    return torch.clamp(corner_y.abs().amax(dim=-1) - float(corridor_half_width), min=0.0)
+
+
+def compute_base_heading_penalty(
+    *,
+    base_forward_world: Tensor,
+    doorway_tangent_world: Tensor,
+) -> Tensor:
+    """Penalize heading projected onto the doorway tangent direction."""
+    base_forward_unit = _normalize_vectors(base_forward_world)
+    doorway_tangent_unit = _normalize_vectors(doorway_tangent_world)
+    return torch.square((base_forward_unit * doorway_tangent_unit).sum(dim=-1))
+
+
+def compute_base_speed_squared(
+    *,
+    base_lin_vel_base: Tensor,
+    base_ang_vel_base: Tensor,
+) -> Tensor:
+    """Compute the raw mobile-base speed energy."""
+    return (
+        torch.square(base_lin_vel_base[:, 0])
+        + torch.square(base_lin_vel_base[:, 1])
+        + torch.square(base_ang_vel_base[:, 2])
+    )
+
+
+def compute_base_zero_speed_reward(
+    *,
+    speed_sq: Tensor,
+    weight: float,
+    decay: float,
+) -> Tensor:
+    """Compute the documented near-zero-speed reward."""
+    return float(weight) * torch.exp(-float(decay) * speed_sq)
+
+
+def compute_base_speed_penalty(
+    *,
+    speed_sq: Tensor,
+    weight: float,
+) -> Tensor:
+    """Compute the documented raw speed penalty."""
+    return float(weight) * speed_sq
 
 
 def compute_inside_progress_delta(

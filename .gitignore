@@ -11,3 +11,4 @@ tests/
 artifacts/
 .vscode/
 pyrightconfig.json
+train-md/

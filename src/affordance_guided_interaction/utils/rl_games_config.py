@@ -29,6 +29,10 @@ def ensure_central_value_config(agent_cfg: dict[str, Any]) -> dict[str, Any]:
     cv_cfg["lr_schedule"] = config_cfg.get("lr_schedule")
     if "kl_threshold" in config_cfg:
         cv_cfg["kl_threshold"] = float(config_cfg["kl_threshold"])
+    if "adaptive_lr_min" in config_cfg:
+        cv_cfg["adaptive_lr_min"] = float(config_cfg["adaptive_lr_min"])
+    if "adaptive_lr_max" in config_cfg:
+        cv_cfg["adaptive_lr_max"] = float(config_cfg["adaptive_lr_max"])
     cv_cfg["clip_value"] = bool(config_cfg["clip_value"])
     cv_cfg["normalize_input"] = bool(config_cfg["normalize_input"])
     cv_cfg["truncate_grads"] = bool(config_cfg["truncate_grads"])

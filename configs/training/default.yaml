@@ -1,6 +1,6 @@
 runtime_defaults: &runtime_defaults
   headless: true
-  device: cuda:0
+  device: cuda:1
   seed: 42
   resume: null
   log_dir: runs
@@ -11,7 +11,9 @@ ppo_common: &ppo_common
   clip_eps: 0.2
   value_clip_eps: 0.2
   use_clipped_value_loss: true
-  entropy_coef: 0.01
+  entropy_coef: 0.001
+  sigma_init_logstd: -2.0
+  adaptive_lr_max: 1.0e-3
   value_coef: 0.5
   max_grad_norm: 1.0
   seq_length: 16
@@ -80,7 +82,7 @@ profiles:
 
   env_6144: &profile_env6144
     num_envs: 6144
-    total_steps: 300_000_000
+    total_steps: 3000_000_000
     n_steps_per_rollout: 64
     checkpoint_interval: 20
     ppo:
@@ -90,4 +92,4 @@ profiles:
       num_mini_batches: 24
       num_epochs: 2
 
-<<: [*runtime_defaults, *profile_env4096]
+<<: [*runtime_defaults, *profile_env6144]

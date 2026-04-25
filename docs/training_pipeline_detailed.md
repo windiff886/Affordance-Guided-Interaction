@@ -20,7 +20,7 @@
 
 | 记号 | 含义 | 当前默认值 |
 | --- | --- | --- |
-| $N$ | 并行环境数 | $3072$ |
+| $N$ | 并行环境数 | $6144$ |
 | $\Delta t_{\text{phys}}$ | 物理积分步长 | $1/120 \,\text{s}\approx 0.008333$ |
 | $d$ | decimation，两个控制步之间包含的物理步数 | $2$ |
 | $\Delta t$ | 策略控制步长 | $d\Delta t_{\text{phys}}=1/60\,\text{s}$ |
@@ -669,12 +669,12 @@ $$
 其中：
 
 - $\mu_\theta(\cdot)$ 由 ELU MLP 产生，隐藏层宽度为 $[512,256,128]$。
-- $\sigma$ 不是状态相关函数，而是 state-independent 的固定参数向量。
+- $\sigma=\exp(\sigma_0)$，其中 $\sigma_0$ 不是状态相关函数，而是 state-independent 的固定可学习参数向量。
 
 因此当前策略学习的是：
 
 1. 一个把 $90$ 维 actor 观测映射到 $15$ 维均值的函数 $\mu_\theta$。
-2. 一个不随观测变化的对角协方差参数。
+2. 一个不随观测变化的对角协方差 log-std 参数。
 
 需要强调三点：
 
@@ -682,26 +682,96 @@ $$
 - 动作先经过 rl_games 的 `clip_actions=1.0`，随后环境再把前 12 维映射到 joint limits，并在需要时叠加位置目标噪声；后 3 维则重标定为 $(v_x, v_y, \omega_z)$，再转换成轮速目标。
 - gripper 不受策略控制，策略只控制双臂 12 个关节和底盘 3 个速度自由度。
 
-### 3.4 任务奖励：开门 + 接近门板
+### 3.4 奖励函数
 
-总奖励先拆成任务项、稳定项和安全项：
+#### 3.4.1 总体结构
 
-$$
-r_t = r_t^{\text{task}} + r_t^{\text{stab},L}+r_t^{\text{stab},R}-r_t^{\text{safe}}.
-$$
-
-任务项又分成三部分：
+整个奖励被拆成 3 个模块：任务推进、持杯稳定性和安全约束。统一写成：
 
 $$
-r_t^{\text{task}}=
-r_t^{\Delta \theta}
+r_t
+=
+r_t^{\text{task}}
++
+r_t^{\text{stab},L}
++
+r_t^{\text{stab},R}
+-
+r_t^{\text{safe}}.
+$$
+
+其中任务模块负责把策略从“接近门”推进到“开门并穿门”；稳定性模块只在持杯侧激活，用来抑制末端大幅晃动；安全模块负责压制关节越界、杯体碰门、底盘过猛运动以及底盘几何走形。
+
+任务模块写成：
+
+$$
+r_t^{\text{task}}
+=
+r_t^{\Delta\theta}
 +
 r_t^{\text{open}}
 +
-r_t^{\text{approach}}.
+r_t^{\text{approach}}
++
+r_t^{\text{base\_approach}}
++
+r_t^{\text{base\_cross}}.
 $$
 
-#### 3.4.1 门角增量奖励
+对每一侧 $k\in\{L,R\}$，稳定性模块写成：
+
+$$
+r_t^{\text{stab},k}
+=
+m_t^k\Big(
+r_t^{\text{zero\_acc},k}
++
+r_t^{\text{zero\_ang},k}
+-
+r_t^{\text{acc},k}
+-
+r_t^{\text{ang},k}
+-
+r_t^{\text{tilt},k}
+\Big),
+$$
+
+其中 $m_t^k\in\{0,1\}$ 是该侧 occupancy mask。
+
+安全模块统一写成：
+
+$$
+r_t^{\text{safe}}
+=
+r_t^{\text{vel}}
++
+r_t^{\text{target}}
++
+r_t^{\text{joint\_move}}
++
+r_t^{\text{cup\_door\_prox}}
++
+r_t^{\text{base\_speed}}
+-
+r_t^{\text{base\_zero\_speed}}
++
+r_t^{\text{base\_cmd\_delta}}
++
+r_t^{\text{drop}}
++
+r_t^{\text{base\_heading}}
++
+r_t^{\text{base\_corridor}}.
+$$
+
+这里底盘速度约束被拆成两个可单独记录的子项：一个是鼓励低速静稳的 `base_zero_speed`，一个是直接惩罚速度平方和的 `base_speed`。这样后续在 TensorBoard 里可以分别观察“底盘有没有获得零速度偏好奖励”和“底盘是否因为速度过大被罚”。同时，本文不再额外保留独立的 `base_motion` 项，以避免和这两个速度项在功能上重复。
+这里最后 2 项底盘几何约束在语义上仍然属于 `safe/*`，所以本文直接把它们并入安全模块统一描述；当前代码若尚未实现这些项，只意味着它们当前不会出现在训练日志里，不改变它们在奖励设计中的位置。
+
+#### 3.4.2 任务模块
+
+任务模块的作用是把策略从“碰到门”推进到“持续把门打开”，再推进到底盘穿过门洞。
+
+1. `task/delta`
 
 定义门角增量：
 
@@ -709,7 +779,7 @@ $$
 \Delta\theta_t=\theta_t-\theta_{t-1}.
 $$
 
-当门尚未接近成功角时，增量奖励权重是常数 $w_\Delta$。一旦超过“成功 bonus 阈值” $\theta_{\text{succ}}=1.2$ rad，增量权重开始衰减：
+当门角尚未到达成功阈值 $\theta_{\text{succ}}$ 时，门角增量奖励使用常数权重；当门角超过该阈值后，增量奖励的权重按衰减函数下降到一个保底比例：
 
 $$
 w(\theta_t)=
@@ -725,66 +795,56 @@ $$
 r_t^{\Delta\theta}=w(\theta_t)\Delta\theta_t.
 $$
 
-默认训练入口的实际常数：
+2. `task/open_bonus`
+
+当门角第一次超过成功阈值 $\theta_{\text{succ}}$ 时，给予一次性开门 bonus：
 
 $$
-w_\Delta=50,\qquad
-k_{\text{decay}}=0.5,\qquad
-\alpha=0.3.
-$$
-
-#### 3.4.2 一次性开门 bonus
-
-当门角第一次超过 $\theta_{\text{succ}}=1.2$ rad 时，给予一次性 bonus：
-
-$$
-r_t^{\text{open}}=
+r_t^{\text{open}}
+=
 w_{\text{open}}\cdot
 \mathbf 1[\theta_t\ge \theta_{\text{succ}}]\cdot
 \mathbf 1[\text{first-crossing at }t].
 $$
 
-默认训练入口的实际常数：
+3. `task/approach`
+
+环境把门的可推侧建模为一个矩形面片。对任意末端点 $p$，先转到门面局部系：
 
 $$
-w_{\text{open}}=250.
-$$
-
-#### 3.4.3 接近门板奖励
-
-环境把门的可推面视为一个矩形面片。对任意末端点 $p$，先转到门面局部系：
-
-$$
-u = R_{\text{face}}^\top (p-c_{\text{face}})=
+u = R_{\text{face}}^\top (p-c_{\text{face}})
+=
 \begin{bmatrix}
 u_x\\u_y\\u_z
 \end{bmatrix}.
 $$
 
-矩形面片在局部坐标中满足：
+门面矩形在局部坐标中满足：
 
 $$
-u_y\in[-0.45,0.45],\qquad u_z\in[-1.0,1.0].
+u_y\in[-h_y,h_y],\qquad u_z\in[-h_z,h_z].
 $$
 
-于是点到矩形面的距离被定义为：
+于是点到矩形面的距离定义为：
 
 $$
 d(p,\mathcal F)=
 \sqrt{
-u_x^2 +
-\big[\max(|u_y|-0.45,0)\big]^2 +
-\big[\max(|u_z|-1.0,0)\big]^2
+u_x^2
++
+\big[\max(|u_y|-h_y,0)\big]^2
++
+\big[\max(|u_z|-h_z,0)\big]^2
 }.
 $$
 
-左、右末端分别算距离，再取更靠近门面的那只手：
+左、右末端分别计算距离，再取更靠近门面的那只手：
 
 $$
 d_t=\min\big(d(p_t^{L},\mathcal F_t),\ d(p_t^{R},\mathcal F_t)\big).
 $$
 
-环境在回合中第一次得到 $d_t$ 时，把它缓存为初始距离 $d_0$。然后构造归一化接近度：
+环境在回合中第一次得到 $d_t$ 时，把它缓存为初始距离 $d_0$，并构造归一化接近度：
 
 $$
 s_t^{\text{approach}}
@@ -792,110 +852,223 @@ s_t^{\text{approach}}
 \max\left(
 1-\frac{d_t^2}{d_0^2+\varepsilon_{\text{app}}},
 0
-\right),
-\qquad
-\varepsilon_{\text{app}}=10^{-6}.
+\right).
 $$
 
-接近奖励只在门几乎还没打开时生效：
+接近奖励只在门角尚未超过设定 stop 阈值时生效：
 
 $$
-r_t^{\text{approach}}=
+r_t^{\text{approach}}
+=
 \mathbf 1[\theta_t<\theta_{\text{stop}}]
-\cdot w_{\text{approach}}
-\cdot s_t^{\text{approach}},
-\qquad \theta_{\text{stop}}=0.10.
+\cdot
+w_{\text{approach}}
+\cdot
+s_t^{\text{approach}}.
 $$
 
-默认训练入口的实际常数：
+4. `task/base_approach`
+
+底盘相关的任务奖励不再对所有“门附近状态”开放，而是只在底盘满足“正对门洞、且矩形 footprint 没有跑到门侧边”时才激活。为此先定义两个几何门控。
+
+记底盘前向在地面上的单位方向为 $f_t^{\text{base}}$，门洞平面的固定法向为 $n^{\text{doorway}}$，则底盘前向与门洞法向的夹角为：
 
 $$
-w_{\text{approach}}=2.
+\theta_t^{\text{align}}
+=
+\arccos\!\bigl(f_t^{\text{base}}\cdot n^{\text{doorway}}\bigr).
 $$
 
-这意味着训练初期，策略首先被鼓励“把至少一只手靠近门的可推面”，当门角超过 $0.10$ rad 以后，这个 shaping 就关闭，优化重点转向继续开门。
-
-#### 3.4.4 底盘接近门洞与穿门奖励
-
-在移动底盘版本中，还额外引入两项与门洞几何相关的 reward：
-
-- `task/base_approach`：当 `base_link` 仍位于门外侧时，奖励其接近门洞下沿在地面上的投影线段。
-- `task/base_cross`：当门角已经达到允许穿门的阈值后，奖励 `base_link` 穿过门洞平面并继续向室内推进。
-
-`task/base_approach` 使用 `base_link` 在地面上的投影点到门洞下沿线段的距离做归一化 shaping，只在 `base_link` 还未过门且门角大于 `base_approach_open_gate` 时激活。
-
-`task/base_cross` 不再看无符号距离，而是看 `base_link` 在门洞内侧半空间中的推进量，只在门角大于 `base_cross_open_gate` 时激活。这样 reward 会把策略从“靠近门洞”推进到“真正穿门并继续向内走”。
-
-### 3.5 稳定性奖励：只在持杯侧激活
-
-对每一侧 $k\in\{L,R\}$，定义 occupancy mask：
+朝向门控定义为：
 
 $$
-m_t^k\in\{0,1\}.
+g_t^{\text{align}}
+=
+\mathbf 1\!\left[\theta_t^{\text{align}}\le \phi_{\text{align}}\right],
+\qquad
+\phi_{\text{align}}=25^\circ.
 $$
 
-设该侧末端线加速度、角加速度和倾斜 proxy 分别为：
+等价地，也可写成：
+
+$$
+g_t^{\text{align}}
+=
+\mathbf 1\!\left[f_t^{\text{base}}\cdot n^{\text{doorway}}\ge \cos 25^\circ\right].
+$$
+
+再记底盘矩形 footprint 的 4 个角点在门洞坐标系中的横向坐标为
+$y_{t,1}^{\text{corner}},\dots,y_{t,4}^{\text{corner}}$，门洞走廊允许的横向半宽为 $w_{\text{corridor}}$，则横向越界量定义为：
+
+$$
+e_t^{\text{corridor}}
+=
+\max\left(
+\max_{i\in\{1,2,3,4\}}
+\left|y_{t,i}^{\text{corner}}\right|
+- w_{\text{corridor}},
+0
+\right).
+$$
+
+于是走廊门控为：
+
+$$
+g_t^{\text{corridor}}
+=
+\mathbf 1\!\left[e_t^{\text{corridor}}=0\right].
+$$
+
+只有当这两个门控同时成立时，`task/base_approach` 和 `task/base_cross` 才会生效。  
+
+在此基础上，`task/base_approach` 奖励底盘在门外侧时逐渐接近门洞下沿在地面上的投影线段。记 `base_link` 地面投影点到门洞下沿线段的当前距离为 $d_t^{\text{base}}$，回合内第一次观测到的距离为 $d_0^{\text{base}}$，则归一化接近度定义为：
+
+$$
+s_t^{\text{base\_approach}}
+=
+\max\left(
+1-\frac{(d_t^{\text{base}})^2}{(d_0^{\text{base}})^2+\varepsilon_{\text{app}}},
+0
+\right).
+$$
+
+再定义 `base_link` 相对门洞平面的有符号距离为 $\delta_t^{\text{plane}}$，并记 $\mathbf 1[\text{crossed}_t]$ 为回合级过门 latch，则：
+
+$$
+r_t^{\text{base\_approach}}
+=
+\;g_t^{\text{align}}
+\cdot
+g_t^{\text{corridor}}
+\cdot
+\mathbf 1[\neg \text{crossed}_t]
+\cdot
+\mathbf 1[\delta_t^{\text{plane}} > 0]
+\cdot
+\mathbf 1[\theta_t \ge \theta_{\text{base-app}}]
+\cdot
+w_{\text{base\_approach}}
+\cdot
+s_t^{\text{base\_approach}}.
+$$
+
+5. `task/base_cross`
+
+这项奖励底盘在门洞内侧半空间中的有效推进量。定义
+
+$$
+p_t^{\text{inside}}=\max(-\delta_t^{\text{plane}}, 0),
+$$
+
+并记 $\mathbf 1[\text{in\_opening}_t]$ 为 `base_link` 当前横向位置仍位于门洞宽度内，则：
+
+$$
+r_t^{\text{base\_cross}}
+=
+\;g_t^{\text{align}}
+\cdot
+g_t^{\text{corridor}}
+\cdot
+\mathbf 1[\theta_t \ge \theta_{\text{base-cross}}]
+\cdot
+w_{\text{base\_cross}}
+\cdot
+\mathbf 1[\text{in\_opening}_t]
+\cdot
+\max\big(p_t^{\text{inside}} - p_{t-1}^{\text{inside}}, 0\big).
+$$
+
+对应的过门成功 latch 更新规则为：
+
+$$
+\text{crossed}_t
+=
+\text{crossed}_{t-1}
+\;\text{or}\;
+\Big(
+\delta_{t-1}^{\text{plane}} > 0
+\;\land\;
+\delta_t^{\text{plane}} \le 0
+\;\land\;
+\text{in\_opening}_t
+\Big).
+$$
+
+#### 3.4.3 稳定性模块
+
+稳定性模块只在持杯侧激活，因此它不是纯粹的机械平滑项，而是“有杯时才需要认真压住晃动”的条件约束。
+
+对任一侧 $k\in\{L,R\}$，设末端线加速度、角加速度和竖直稳定性 proxy 分别为
 
 $$
 a_t^k,\qquad \alpha_t^k,\qquad u_t^k.
 $$
 
-则该侧稳定性奖励为：
+则 5 个稳定性子项分别定义为：
+
+$$
+r_t^{\text{zero\_acc},k}
+=
+w_{\text{zero-acc}}e^{-\lambda_{\text{acc}}\|a_t^k\|_2^2},
+$$
+
+$$
+r_t^{\text{zero\_ang},k}
+=
+w_{\text{zero-ang}}e^{-\lambda_{\text{ang}}\|\alpha_t^k\|_2^2},
+$$
+
+$$
+r_t^{\text{acc},k}
+=
+w_{\text{acc}}\|a_t^k\|_2^2,
+$$
+
+$$
+r_t^{\text{ang},k}
+=
+w_{\text{ang}}\|\alpha_t^k\|_2^2,
+$$
+
+$$
+r_t^{\text{tilt},k}
+=
+w_{\text{tilt}}\|u_t^k\|_2^2.
+$$
+
+因此整侧稳定性项可以写成：
 
 $$
 r_t^{\text{stab},k}
 =
 m_t^k\Big(
-w_{\text{zero-acc}}e^{-\lambda_{\text{acc}}\|a_t^k\|_2^2}
-
-+w_{\text{zero-ang}}e^{-\lambda_{\text{ang}}\|\alpha_t^k\|_2^2}
-
--w_{\text{acc}}\|a_t^k\|_2^2
--w_{\text{ang}}\|\alpha_t^k\|_2^2
--w_{\text{tilt}}\|u_t^k\|_2^2
+r_t^{\text{zero\_acc},k}
++
+r_t^{\text{zero\_ang},k}
+-
+r_t^{\text{acc},k}
+-
+r_t^{\text{ang},k}
+-
+r_t^{\text{tilt},k}
 \Big).
 $$
 
-默认训练入口的实际常数：
+如果某一侧没有持杯，则该侧 $m_t^k=0$，整项直接关闭。
 
-$$
-w_{\text{zero-acc}}=0.0,\quad \lambda_{\text{acc}}=2.0,
-$$
-$$
-w_{\text{zero-ang}}=0.0,\quad \lambda_{\text{ang}}=1.0,
-$$
-$$
-w_{\text{acc}}=5\times 10^{-4},\quad
-w_{\text{ang}}=10^{-5},\quad
-w_{\text{tilt}}=3\times 10^{-3}.
-$$
+#### 3.4.4 安全模块
 
-如果 occupancy 为 0，则整项直接变成 0。
+安全模块的作用不是给策略“做任务的动力”，而是持续裁掉危险但又容易被策略利用的动作模式，包括关节越界、杯体擦门、底盘速度过猛、方向偏向门框以及底盘越出门洞走廊。
 
-### 3.6 安全惩罚：速度越界、目标边界带、掉杯
+1. `safe/joint_vel`
 
-安全惩罚定义为：
-
-$$
-r_t^{\text{safe}}=
-r_t^{\text{vel}}
-+r_t^{\text{target}}
-+r_t^{\text{joint\_move}}
-+r_t^{\text{cup\_door\_prox}}
-+r_t^{\text{drop}}.
-$$
-
-#### 3.6.1 关节速度超限惩罚
-
-设每个关节的软速度上限为 $\dot q_{\max,j}$，环境只在超过比例阈值 $\mu\dot q_{\max,j}$ 后开始惩罚：
+设每个关节的软速度上限为 $\dot q_{\max,j}$，只在超过比例阈值后开始惩罚：
 
 $$
 e_{t,j}^{\text{vel}}
 =
 \max\big(|\dot q_{t,j}|-\mu\dot q_{\max,j},0\big).
 $$
-
-于是：
 
 $$
 r_t^{\text{vel}}
@@ -905,15 +1078,9 @@ r_t^{\text{vel}}
 \left(e_{t,j}^{\text{vel}}\right)^2.
 $$
 
-默认训练入口的实际常数：
+2. `safe/target_limit`
 
-$$
-\mu=0.09,\qquad \beta_{\text{vel}}=0.5.
-$$
-
-#### 3.6.2 目标角边界带惩罚
-
-注意这里惩罚的不是高斯策略的原始未裁剪样本，而是最终送入执行器的目标角 $\tilde q_t^\star$。先定义每个关节到最近限位的距离：
+这项惩罚的是最终写入执行器的目标角 $\tilde q_t^\star$ 进入 joint limit 边界带，而不是原始高斯动作样本。定义目标到最近限位的距离：
 
 $$
 d_{t,j}^{\text{limit}}
@@ -921,13 +1088,13 @@ d_{t,j}^{\text{limit}}
 \min\big(\tilde q_{t,j}^\star-q_{\min,j},\ q_{\max,j}-\tilde q_{t,j}^\star\big),
 $$
 
-再定义边界带宽度比例 $\rho_{\text{margin}}$：
+边界带宽度为：
 
 $$
 m_j=\rho_{\text{margin}}(q_{\max,j}-q_{\min,j}),
 $$
 
-只有当目标进入边界带时才开始惩罚：
+则边界带侵入量为：
 
 $$
 e_{t,j}^{\text{target}}
@@ -935,7 +1102,7 @@ e_{t,j}^{\text{target}}
 \max(m_j-d_{t,j}^{\text{limit}},0).
 $$
 
-则：
+对应惩罚为：
 
 $$
 r_t^{\text{target}}
@@ -945,72 +1112,264 @@ r_t^{\text{target}}
 \left(\frac{e_{t,j}^{\text{target}}}{m_j}\right)^2.
 $$
 
-默认训练入口的实际常数：
+3. `safe/joint_move`
+
+相邻控制步之间的关节运动变化量被直接二次惩罚：
 
 $$
-\beta_{\text{target}}=1.0,\qquad \rho_{\text{margin}}=0.1.
+r_t^{\text{joint\_move}}
+=
+\beta_{\text{joint\_move}}
+\sum_{j=1}^{12}(q_{t,j}-q_{t-1,j})^2.
 $$
 
-这项的作用不是惩罚 raw overflow，而是告诉策略：“即使执行层始终安全，目标也不应长期贴着 joint limits 运行”。
+4. `safe/cup_door_prox`
 
-#### 3.6.3 关节移动惩罚
-
-惩罚相邻控制步之间的关节角度变化量，鼓励策略产生平滑的关节运动：
+只对持杯侧生效。记杯体质心到门板矩形面的距离为 $d_t^k$，则当该距离低于阈值时施加二次惩罚：
 
 $$
-r_t^{\text{joint\_move}}=
-\beta_{\text{joint\_move}}\sum_{j=1}^{12}(q_{t,j}-q_{t-1,j})^2.
-$$
-
-默认训练入口的实际常数：
-
-$$
-\beta_{\text{joint\_move}}=0.1.
-$$
-
-#### 3.6.4 杯体-门板接近惩罚
-
-只对持杯侧生效。计算杯体质心到门板矩形面的距离 $d_t^k$（与接近奖励使用相同的点到面距离公式），当距离低于阈值时施加二次惩罚：
-
-$$
-r_t^{\text{cup\_door\_prox}}=
+r_t^{\text{cup\_door\_prox}}
+=
 \sum_{k\in\{L,R\}} m_t^k\cdot
 \beta_{\text{cup\_door\_prox}}\cdot
 \bigl[\max(d_{\text{thresh}}-d_t^k,\;0)\bigr]^2.
 $$
 
-默认训练入口的实际常数：
+5. `safe/base_zero_speed`
+
+设底盘在 `base_link` 系中的线速度和角速度分别为
+$v_{x,t}, v_{y,t}, \omega_{z,t}$。这里不做额外归一化，而是直接使用原始速度平方和：
 
 $$
-\beta_{\text{cup\_door\_prox}}=1.0,\qquad d_{\text{thresh}}=0.05\;\text{m}.
+s_t^{\text{base-speed}}
+=
+\left(v_{x,t}\right)^2
++
+\left(v_{y,t}\right)^2
++
+\left(\omega_{z,t}\right)^2.
 $$
 
-当 occupancy 为 0 时该项自动为 0，不影响空手推门行为。
+与稳定性模块中的 `zero_acc`、`zero_ang` 一样，先定义一个零速度奖励：
 
-#### 3.6.5 掉杯惩罚
+$$
+r_t^{\text{base\_zero\_speed}}
+=
+w_{\text{base-zero-speed}}
+\exp\!\bigl(-\lambda_{\text{base-speed}}\,s_t^{\text{base-speed}}\bigr).
+$$
+
+这项在底盘速度接近 0 时接近上界，随着速度变大而指数衰减。它的意义是把“尽量静稳地移动底盘”明确写成一个正向偏好。
+
+6. `safe/base_speed`
+
+与上面的零速度奖励配对，再定义一个速度惩罚项：
+
+$$
+r_t^{\text{base\_speed}}
+=
+w_{\text{base-speed}}\,s_t^{\text{base-speed}}.
+$$
+
+这样后，若单独从 signed shaping 的角度看，底盘速度项可写成：
+
+$$
+r_t^{\text{base-speed,shaping}}
+=
+r_t^{\text{base\_zero\_speed}}
+-
+r_t^{\text{base\_speed}}.
+$$
+
+而在本文的总奖励记号中，它被拆开放在 `safe` 分支里，写成
+$+r_t^{\text{base\_speed}}-r_t^{\text{base\_zero\_speed}}$，这样后续 TensorBoard 可以分开查看：
+
+- 底盘是否因为速度偏大受到惩罚；
+- 底盘是否因为低速静稳获得奖励。
+
+这里需要强调：速度相关约束只保留这一组“零速度奖励 + 速度惩罚”双项结构，不再额外保留独立的 `safe/base_motion`，以避免重复惩罚同一类底盘速度行为。
+
+7. `safe/base_cmd_delta`
+
+记当前步底盘命令为
+$u_t^{\text{base}}=(v_{x,t}^{\text{cmd}}, v_{y,t}^{\text{cmd}}, \omega_{z,t}^{\text{cmd}})$，则命令差分为：
+
+$$
+\Delta u_t^{\text{base}} = u_t^{\text{base}} - u_{t-1}^{\text{base}}.
+$$
+
+相应惩罚为：
+
+$$
+r_t^{\text{base\_cmd\_delta}}
+=
+\beta_{\text{base\_cmd}}
+\left\|\Delta u_t^{\text{base}}\right\|_2^2.
+$$
+
+8. `safe/drop`
+
+掉杯惩罚写成：
 
 $$
 r_t^{\text{drop}}=
 w_{\text{drop}}\cdot \mathbf 1[\text{cup\_dropped}_t].
 $$
 
-当前：
+9. `safe/base_heading`
+
+这一项惩罚的不是底盘偏离当前门板法向，而是底盘朝门框横向方向偏过去。原因是门板法向会随门角旋转，不能作为稳定的底盘朝向参考。定义固定门洞坐标系：
+
+- $n^{\text{doorway}}$：门洞平面的固定法向，指向穿门前进方向；
+- $t^{\text{doorway}}$：门洞下沿线段方向，也就是门框横向方向。
+
+记底盘前向在地面上的单位方向为 $f_t^{\text{base}}$，则：
 
 $$
-w_{\text{drop}}=100.
+r_t^{\text{base\_heading}}
+=
+\beta_{\text{base\_heading}}
+\bigl(f_t^{\text{base}}\cdot t^{\text{doorway}}\bigr)^2.
 $$
 
-### 3.7 当前默认训练下奖励的实际激活情况
+等价地，也可写成：
+
+$$
+r_t^{\text{base\_heading}}
+=
+\beta_{\text{base\_heading}}
+\left(1-\bigl(f_t^{\text{base}}\cdot n^{\text{doorway}}\bigr)^2\right).
+$$
+
+10. `safe/base_corridor`
+
+定义底盘地面矩形 footprint 的半长和半宽分别为
+$\ell_{\text{base}}$ 与 $w_{\text{base}}$。令底盘中心在门洞坐标系中的平面位置为
+$(x_t^{\text{base}}, y_t^{\text{base}})$，底盘前向与门洞法向夹角为 $\psi_t$。若底盘 4 个角点在门洞坐标系中的横向坐标为
+$y_{t,1}^{\text{corner}},\dots,y_{t,4}^{\text{corner}}$，门洞走廊允许的横向半宽为 $w_{\text{corridor}}$，则横向越界量定义为：
+
+$$
+e_t^{\text{corridor}}
+=
+\max\left(
+\max_{i\in\{1,2,3,4\}}
+\left|y_{t,i}^{\text{corner}}\right|
+- w_{\text{corridor}},
+0
+\right).
+$$
+
+相应惩罚为：
+
+$$
+r_t^{\text{base\_corridor}}
+=
+\beta_{\text{base\_corridor}}
+\left(e_t^{\text{corridor}}\right)^2.
+$$
+
+这项是纯软惩罚：越界越多，惩罚越大，但不直接终止 episode。
+
+#### 3.4.5 Reward 子项的数学与参数分析
+
+这一节不再只描述“公式形式”，而是明确给出一个数值标尺：我们希望每个 reward 子项在其对应的**典型激活工况**下，episode 级累计贡献尽量落在 `O(10)`，也就是大致 `5~20` 的范围。这样做的目的，是避免某一个子项轻易达到 `10^2~10^3`，从而把其他模块的梯度全部淹没。
+
+为此，先给出 5 个对量级平衡最关键的背景量：
+
+- 当前控制频率为 `60 Hz`，单个 episode 为 `15 s`，因此每回合有 `900` 个控制步。
+- 若某个子项在整回合 `900` 步都激活，那么它的目标平均单步贡献应约为 `10/900≈0.011`。
+- 若某个子项只在 `300 / 100 / 30 / 10` 步内激活，那么它的目标平均单步贡献应约为 `0.033 / 0.10 / 0.33 / 1.0`。
+- 当前门洞内宽由 `y\in[-0.51,0.51]` 给出，因此横向总宽度为 `1.02 m`。
+- 当前底盘 footprint 近似为长方形，半长 $\ell_{\text{base}}=0.285\ \text{m}$、半宽 $w_{\text{base}}=0.2104\ \text{m}$，因此外接尺寸约为 `0.57 m × 0.4208 m`。
+
+在这个标尺下，调参时最有用的 4 个反推公式如下：
+
+1. 对于线性 dense shaping
+   $$
+   r_t = w\,s_t,\qquad s_t\in[0,1],
+   $$
+   若它在 `N_{\text{act}}` 步内以平均值 $\bar s$ 激活，则要让 episode 级累计量级落到 `10` 左右，应取
+   $$
+   w^\star \approx \frac{10}{N_{\text{act}}\bar s}.
+   $$
+
+2. 对于二次惩罚
+   $$
+   r_t = \beta\,z_t,\qquad z_t\ge 0,
+   $$
+   若在 `N_{\text{act}}` 步内平均为 $\bar z$，则平衡到 `10` 左右的系数应取
+   $$
+   \beta^\star \approx \frac{10}{N_{\text{act}}\bar z}.
+   $$
+
+3. 对于积分型推进奖励，例如门角增量或穿门深度增量，
+   $$
+   R \approx w\cdot \Delta_{\text{ref}},
+   $$
+   因而要让参考工况下的累计量级落到 `10` 左右，应取
+   $$
+   w^\star \approx \frac{10}{\Delta_{\text{ref}}}.
+   $$
+
+4. 对于一次性 bonus / fail cost，若目标也是 `O(10)`，则最直接的标尺就是
+   $$
+   w^\star \approx 10.
+   $$
+
+下表只给出按上述标尺反推出的**建议量级**。这里分析的重点是负责数值尺度的主系数，也就是各项前面的 `w` 或 `\beta`；像 `open_gate`、`stop_angle`、`align` 阈值、`corridor` 阈值这类几何或阶段门控参数，主要控制“何时激活”，不直接参与这一张量级平衡表。
+
+| 子项 | 参考工况 | 平衡到 `O(10)` 的数学分析 | 建议系数/建议量级 |
+| --- | --- | --- | --- |
+| `task/delta` | 参考一次有效开门增量累计 $\Delta\theta_{\text{ref}}\approx 1.2\ \text{rad}$。 | 由 $R\approx w_{\delta}\Delta\theta_{\text{ref}}$ 得 $w_{\delta}^\star\approx 10/1.2\approx 8.3$。 | 主尺度系数建议 `w_delta≈8~10`。`k_decay` 与 `alpha` 主要控制超过目标角后还保留多少残余梯度，它们应服务于“成功后仍有弱梯度，但不能继续刷太多 reward”这一目标，而不是用来放大主尺度。 |
+| `task/open_bonus` | 门首次达到打开阈值时触发 1 次。 | 若希望 milestone 本身也是 `O(10)`，则直接取 $w_{\text{open}}^\star\approx 10$；若希望它略高于普通 dense shaping，也通常不应超过 `20`。 | 建议 `w_open≈10~20`。它应当是“阶段达成”的强化信号，但不应强到压过整段 dense shaping。 |
+| `task/approach` | 参考在 `40` 步内激活，平均 $s_t^{\text{approach}}\approx 0.5$。 | 有 $R\approx w_{\text{approach}}\cdot 40\cdot 0.5=20w_{\text{approach}}$，故 $w_{\text{approach}}^\star\approx 0.5$。 | 建议 `w_approach≈0.4~0.6`。`approach_stop_angle` 负责控制它覆盖到开门的哪个阶段，但不应通过增大 `w_approach` 去承担任务主奖励的角色。 |
+| `task/base_approach` | 参考在对准门洞且未越界的有效窗口中激活 `25` 步，平均 $s_t^{\text{base\_approach}}\approx 0.4$。 | 有 $R\approx w_{\text{base\_approach}}\cdot 25\cdot 0.4=10w_{\text{base\_approach}}$，故 $w_{\text{base\_approach}}^\star\approx 1.0$。 | 建议 `w_base_approach≈1.0`。这一项只应做“把底盘引到门前”的前置 shaping，不应承担真正的穿门奖励。 |
+| `task/base_cross` | 参考底盘在门洞内有效向前推进 `0.20 m`。 | 有 $R\approx w_{\text{base\_cross}}\cdot 0.20$，故 $w_{\text{base\_cross}}^\star\approx 50$。 | 建议 `w_base_cross≈40~60`。这一项应该代表“真正的穿门进度”，但在 `O(10)` 标尺下不需要到 `10^3` 量级。 |
+| `stab/zero_acc` | 持杯侧在 `300` 步内保持较稳，参考 $\|a_t\|\approx 0.35$，则 $e^{-2\|a\|^2}\approx e^{-0.245}\approx 0.783$。 | 有 $R\approx 300\cdot w_{\text{zero-acc}}\cdot 0.783$，故 $w_{\text{zero-acc}}^\star\approx 10/(300\cdot 0.783)\approx 0.043$。 | 建议 `w_zero_acc≈0.04~0.05`。若希望在 $\|a\|\approx 0.35$ 处奖励仍保留约 `0.6~0.8` 倍，则 `lambda_acc` 更适合放在 `2~4`。 |
+| `stab/zero_ang` | 参考持杯侧在 `300` 步内保持较小角加速度，令 $\|\alpha_t\|\approx 0.7$，则 $e^{-\|\alpha\|^2}\approx e^{-0.49}\approx 0.613$。 | 有 $R\approx 300\cdot w_{\text{zero-ang}}\cdot 0.613$，故 $w_{\text{zero-ang}}^\star\approx 10/(300\cdot 0.613)\approx 0.054$。 | 若启用，建议 `w_zero_ang≈0.05~0.06`。若希望在 $\|\alpha\|\approx 0.7$ 时仍保留约 `0.5~0.6` 的奖励系数，则 `lambda_ang` 更适合放在 `1.0~1.5`。 |
+| `stab/acc` | 参考持杯侧在 `300` 步内有中等线加速度，令 $\|a_t\|^2\approx 2.25$。 | 有 $R\approx 300\cdot w_{\text{acc}}\cdot 2.25$，故 $w_{\text{acc}}^\star\approx 10/675\approx 0.0148$。 | 建议 `w_acc≈0.012~0.018`。它负责对持续晃动给出线性增长的成本，应与 `zero_acc` 配成一正一负的稳定性通道。 |
+| `stab/ang` | 参考持杯侧在 `300` 步内有明显角加速度，令 $\|\alpha_t\|^2\approx 64$。 | 有 $R\approx 300\cdot w_{\text{ang}}\cdot 64$，故 $w_{\text{ang}}^\star\approx 10/19200\approx 5.2\times10^{-4}$。 | 建议 `w_ang≈(4~6)\times10^{-4}`。它通常应比 `w_acc` 小一个量级以上，但不能小到对角向抖动几乎没有约束。 |
+| `stab/tilt` | 参考持杯侧在 `300` 步内平均 tilt proxy 为 $\|u_t\|\approx 0.10$。 | 有 $R\approx 300\cdot w_{\text{tilt}}\cdot 0.01$，故 $w_{\text{tilt}}^\star\approx 3.33$。 | 建议 `w_tilt≈3.0~3.5`。这一项直接约束杯体姿态，通常应是稳定性模块里最强的单项之一。 |
+| `safe/joint_vel` | 参考 `100` 步内有 `3` 个关节持续明显超限，平均超限量各为 `0.6`，则 $\sum_j(e_{t,j}^{\text{vel}})^2\approx 3\times 0.6^2=1.08$。 | 有 $R\approx 100\cdot \beta_{\text{vel}}\cdot 1.08$，故 $\beta_{\text{vel}}^\star\approx 0.093$。 | 建议 `beta_vel≈0.08~0.10`。`mu` 负责决定从多早开始罚，主尺度仍应由 `beta_vel` 来定。 |
+| `safe/target_limit` | 参考 `100` 步内有 `4` 个关节进入边界带一半深度，即 $\left(e_{t,j}^{\text{target}}/m_j\right)^2\approx 0.25$，总和约 `1.0`。 | 有 $R\approx 100\cdot \beta_{\text{target}}\cdot 1.0$，故 $\beta_{\text{target}}^\star\approx 0.1$。 | 建议 `beta_target≈0.08~0.12`。`target_margin_ratio` 负责定义边界带宽度，`beta_target` 决定进入边界带后的实际成本。 |
+| `safe/joint_move` | 参考 `300` 步内，`12` 个关节平均每步变化量约 `0.02 rad`，则 $\sum_j(\Delta q_j)^2\approx 12\times 0.02^2=0.0048$。 | 有 $R\approx 300\cdot \beta_{\text{joint\_move}}\cdot 0.0048$，故 $\beta_{\text{joint\_move}}^\star\approx 6.94$。 | 建议 `beta_joint_move≈6~8`。这一项负责压制高频抽动，应保持在比较稳定的中高强度。 |
+| `safe/cup_door_prox` | 参考杯体对门板侵入 `1 cm`，并持续 `10` 步，则每步侵入平方为 `0.01^2=10^{-4}`。 | 有 $R\approx 10\cdot \beta_{\text{cup\_door\_prox}}\cdot 10^{-4}$，故 $\beta_{\text{cup\_door\_prox}}^\star\approx 10^4$。 | 建议 `beta_cup_door_prox≈10^4`。若希望 `2 cm` 侵入就明显更痛，可以维持阈值不变而把系数提升到 `1.5×10^4` 左右。 |
+| `safe/base_zero_speed` | 参考底盘在 `100` 步内维持低速静稳，令 $s_t^{\text{base-speed}}\approx 0.02$。若取 $\lambda_{\text{base-speed}}=10$，则 $e^{-10\cdot 0.02}\approx 0.819$。 | 有 $R\approx 100\cdot w_{\text{base-zero-speed}}\cdot 0.819$，故 $w_{\text{base-zero-speed}}^\star\approx 0.12$。 | 建议 `w_base_zero_speed≈0.10~0.15`，`lambda_base_speed≈8~12`。这项只负责表达“低速静稳是偏好的”，不应独自承担强惩罚功能。 |
+| `safe/base_speed` | 参考底盘在 `100` 步内维持“明显偏快但未失控”的速度，令 $s_t^{\text{base-speed}}\approx 0.10$。 | 有 $R\approx 100\cdot w_{\text{base-speed}}\cdot 0.10$，故 $w_{\text{base-speed}}^\star\approx 1.0$。 | 建议 `w_base_speed≈0.8~1.2`。这是底盘速度的主惩罚项，保留它后就不需要再单独增加重复的 `base_motion` 速度惩罚。 |
+| `safe/base_cmd_delta` | 参考底盘命令在 `100` 步内存在中等抖动，令 $\|\Delta u_t^{\text{base}}\|_2^2\approx 0.05$。 | 有 $R\approx 100\cdot \beta_{\text{base\_cmd}}\cdot 0.05$，故 $\beta_{\text{base\_cmd}}^\star\approx 2.0$。 | 建议 `beta_base_cmd≈1~3`。这一项主要用于抑制命令抖动，通常放在 `base_speed` 之后微调。 |
+| `safe/drop` | 掉杯时触发 1 次。 | 若坚持与其他子项同量级，则应取 $w_{\text{drop}}^\star\approx 10$；若希望它比一般 shaping 更像“硬安全事件”，也通常只需要 `20~30`。 | 建议 `w_drop≈20~30`。它可以比普通 dense shaping 更强，但不需要高到远离整体量级体系。 |
+| `safe/base_heading` | 参考底盘在 `20` 步内持续以 `30^\circ` 偏向门框横向方向，则 $(f_t^{\text{base}}\cdot t^{\text{doorway}})^2=\sin^2 30^\circ=0.25$。 | 有 $R\approx 20\cdot \beta_{\text{base\_heading}}\cdot 0.25$，故 $\beta_{\text{base\_heading}}^\star\approx 2.0$。 | 建议 `beta_base_heading≈2.0`。它应让 `15^\circ` 偏航只是轻罚，`30^\circ` 以上偏航开始明显不划算。 |
+| `safe/base_corridor` | 参考底盘矩形 footprint 持续 `10` 步越界 `3 cm`，则 $(e_t^{\text{corridor}})^2=0.03^2=9\times 10^{-4}$。 | 有 $R\approx 10\cdot \beta_{\text{base\_corridor}}\cdot 9\times 10^{-4}$，故 $\beta_{\text{base\_corridor}}^\star\approx 1111$。若把参考越界改成 `2 cm`，则会得到约 `2500`。 | 建议 `beta_base_corridor≈1000~2500`，中间值可取 `1500~2000`。这项是阻止“擦门框绕过去”的几何主约束，合理量级天然就在 `10^3`。 |
+
+如果后续要在配置文件里按这一套 `O(10)` 原则落地，更合理的做法不是逐项独立拍脑袋，而是按下面的顺序组织：
+
+1. 先固定真正的任务主项：
+   `w_delta≈8~10`、`w_open≈10~20`、`w_base_cross≈40~60`。
+   这三项共同定义“打开门并真正穿过去”。
+
+2. 再固定前置引导项：
+   `w_approach≈0.4~0.6`、`w_base_approach≈1.0`。
+   它们只负责把手和底盘引到正确位置，不应压过主任务项。
+
+3. 然后固定持杯稳定项：
+   `w_zero_acc≈0.04~0.05`、`w_zero_ang≈0.05~0.06`、`w_acc≈0.012~0.018`、`w_ang≈(4~6)\times10^{-4}`、`w_tilt≈3.0~3.5`。
+   目标是让“持续稳定持杯”的总成本也在 `O(10)`。
+
+4. 最后固定安全约束：
+   `beta_vel≈0.08~0.10`、`beta_target≈0.08~0.12`、`beta_joint_move≈6~8`、`beta_cup_door_prox≈10^4`、`w_base_speed≈0.8~1.2`、`beta_base_cmd≈1~3`、`w_drop≈20~30`、`beta_base_heading≈2.0`、`beta_base_corridor≈1000~2500`。
+   这些项的目标不是让 reward 变大，而是让明显危险或 exploit 行为在 episode 级累计上“至少不比完成任务更划算”。
+
+### 3.5 当前默认训练下奖励的实际激活情况
 
 由于当前主训练按 `empty / left / right / both` 四种模式均匀采样，所以奖励项的激活情况是分模式的：
 
 - 在 `empty` 回合里：
   $$
-  r_t^{\text{stab},L}=r_t^{\text{stab},R}=r_t^{\text{drop}}=0.
+  r_t^{\text{stab},L}=r_t^{\text{stab},R}=r_t^{\text{cup\_door\_prox}}=r_t^{\text{drop}}=0.
   $$
-- 在 `left` 回合里，只有左侧稳定性项和左侧掉杯约束可能生效。
-- 在 `right` 回合里，只有右侧稳定性项和右侧掉杯约束可能生效。
-- 在 `both` 回合里，左右两侧稳定性项和掉杯约束都可能生效。
+- 在 `left` 回合里，只有左侧稳定性项，以及左侧持杯相关的 `cup_door_prox` / 掉杯约束可能生效。
+- 在 `right` 回合里，只有右侧稳定性项，以及右侧持杯相关的 `cup_door_prox` / 掉杯约束可能生效。
+- 在 `both` 回合里，左右两侧稳定性项以及两侧持杯相关约束都可能生效。
 
 因此当前默认训练的总奖励不再退化成纯空手形式，而是一个 occupancy-conditioned 混合目标：
 
@@ -1020,7 +1379,7 @@ $$
 
 其中不同 episode 会根据 occupancy 样本激活不同的分项。
 
-### 3.8 一个必须说明的实现时序细节
+### 3.6 一个必须说明的实现时序细节
 
 从数学上，我们通常把 $r_t$ 视为由当前动作后的几何量直接计算：
 
@@ -1055,11 +1414,11 @@ $$
 
 这不改变总体训练目标，但在精读 reward 时必须知道：当前代码里的部分稳定性项和接近项是“上一轮观测刷新、本轮奖励消费”的。
 
-### 3.9 网络结构
+### 3.7 网络结构
 
 当前策略网络使用 rl_games 的 `continuous_a2c_logstd` 模型（对应 `ModelA2CContinuousLogStd` 类），配置为 `separate: False`，即策略均值头 $\mu_\theta$ 和值函数头 $V_\phi$ 共享同一个 MLP 骨干网络。
 
-#### 3.9.1 骨干网络
+#### 3.7.1 骨干网络
 
 骨干网络的输入为 90 维策略观测 $o_t^\pi$（经运行均值/标准差归一化后），依次通过三个全连接层：
 
@@ -1077,7 +1436,7 @@ $$
 
 其中 default 初始化为 PyTorch `nn.Linear` 的默认行为（Kaiming uniform）。
 
-#### 3.9.2 策略均值头
+#### 3.7.2 策略均值头
 
 $$
 \mu_\theta(o_t^\pi) = W_\mu\,h_t + b_\mu\in\mathbb R^{15}.
@@ -1086,7 +1445,7 @@ $$
 - 无激活函数（`mu_activation: None`）。
 - 初始化：default。
 
-#### 3.9.3 值函数头
+#### 3.7.3 值函数头
 
 $$
 V_\phi(o_t^\pi) = W_v\,h_t + b_v\in\mathbb R.
@@ -1096,24 +1455,24 @@ $$
 - 与策略均值头共享同一个骨干输出 $h_t$。
 - 输出经运行均值/标准差反归一化后作为最终值估计。
 
-#### 3.9.4 标准差参数
+#### 3.7.4 标准差参数
 
 $$
 \sigma = \exp(\sigma_0)\in\mathbb R^{15}.
 $$
 
 - `fixed_sigma: True`：$\sigma_0$ 是一个与状态无关的可学习参数向量，不经过骨干网络。
-- 初始化：`const_initializer`，$\sigma_0=\mathbf 0$，因此初始标准差 $\sigma=\exp(0)=\mathbf 1$。
+- 初始化：`const_initializer`，$\sigma_0=-2\cdot\mathbf 1$，因此初始标准差 $\sigma=\exp(-2)\cdot\mathbf 1\approx0.135\cdot\mathbf 1$。
 - 每个动作维度有独立的标准差参数。
 
-#### 3.9.5 归一化
+#### 3.7.5 归一化
 
 训练配置中启用了两种运行归一化：
 
 - `normalize_input: True`：对策略观测 $o_t^\pi$ 维护运行均值 $\mu_{\text{obs}}$ 和标准差 $\sigma_{\text{obs}}$，实际骨干输入为 $\hat o_t^\pi = (o_t^\pi - \mu_{\text{obs}})/(\sigma_{\text{obs}}+\epsilon)$。
 - `normalize_value: True`：对值函数输出维护运行均值 $\mu_V$ 和标准差 $\sigma_V$，最终值估计为 $V_\phi^{\text{raw}}\cdot\sigma_V+\mu_V$。
 
-#### 3.9.6 完整前向计算路径
+#### 3.7.6 完整前向计算路径
 
 把以上组件拼接，一次前向传播的计算流程为：
 
@@ -1137,7 +1496,7 @@ $$
 a_t \sim \mathcal N(\mu_t,\;\operatorname{diag}(\sigma^2)).
 $$
 
-#### 3.9.7 关于当前配置与不对称 Actor-Critic 的说明
+#### 3.7.7 关于当前配置与不对称 Actor-Critic 的说明
 
 当前 rl_games 配置仍然保持 actor 主干 `separate: False`，但已经额外启用了 `central_value_config`。这意味着：
 
@@ -1397,8 +1756,10 @@ $$
 当前：
 
 $$
-c_{\text{ent}}=0.01.
+c_{\text{ent}}=0.
 $$
+
+这意味着当前试训配置不再主动奖励更高熵。策略仍然是高斯策略，仍会根据 $\sigma_0$ 采样动作；但 PPO loss 不再额外推动 $\sigma_0$ 变大。这样做的目的，是先避免探索方差把动作推成随机饱和控制，再观察任务 reward 和安全/稳定项是否能形成有效学习信号。
 
 ### 4.10 Bounds loss：约束高斯均值不要漂太远
 
@@ -1408,12 +1769,14 @@ $$
 L_{\text{bound}}(\theta)=
 \mathbb E_t
 \left[
-\sum_{j=1}^{12}
+\sum_{j=1}^{15}
 \Big(
 [\mu_{t,j}-1.1]_+^2 + [-1.1-\mu_{t,j}]_+^2
 \Big)
 \right].
 $$
+
+这里的求和维度是完整动作维度 $15=12+3$，约束对象是 policy 直接输出的未截断高斯均值 $\mu_\theta(o_t^\pi)$，不是经过 `clip_actions=1.0` 之后送入环境的动作。
 
 当前权重是：
 
@@ -1440,7 +1803,7 @@ $$
 当前：
 
 $$
-c_V=0.5,\qquad c_{\text{ent}}=0.01,\qquad c_{\text{bound}}=10^{-4}.
+c_V=0.5,\qquad c_{\text{ent}}=0,\qquad c_{\text{bound}}=10^{-4}.
 $$
 
 因此 critic 项的实际总前系数是：
@@ -1467,7 +1830,7 @@ rl_games 的自适应调度规则是：
 
 - 若 $\mathrm{KL}>2\mathrm{KL}_{\text{th}}$，学习率除以 $1.5$
 - 若 $\mathrm{KL}<0.5\mathrm{KL}_{\text{th}}$，学习率乘以 $1.5$
-- 并约束在 $[10^{-6},10^{-2}]$ 内
+- 并约束在 $[10^{-6},10^{-3}]$ 内
 
 即：
 
@@ -1476,45 +1839,47 @@ $$
 \quad\text{if}\quad \mathrm{KL}>0.016,
 $$
 $$
-\eta \leftarrow \min(1.5\eta,10^{-2})
+\eta \leftarrow \min(1.5\eta,10^{-3})
 \quad\text{if}\quad \mathrm{KL}<0.004.
 $$
+
+需要注意，`rl_games` 原生 `AdaptiveScheduler` 的学习率上限是 $10^{-2}$。当前训练入口在启动 `Runner.load(...)` 前会按项目配置把 scheduler 上限 patch 为 `adaptive_lr_max=1e-3`，从而保留 KL 自适应机制，但避免学习率从初始值一路升到 $10^{-2}$。
 
 当前初始学习率：
 
 $$
-\eta_0 = 2.5\times 10^{-4}.
+\eta_0 = 2.0\times 10^{-4}.
 $$
 
 ### 4.13 Rollout、batch、mini-batch 和优化步数
 
 当前默认配置下：
 
-- 并行环境数 $N=3072$
+- 并行环境数 $N=6144$
 - horizon $H=64$
 
 所以每轮 PPO 迭代收集的样本数是：
 
 $$
-B = NH = 3072\times 64 = 196608.
+B = NH = 6144\times 64 = 393216.
 $$
 
-mini-batch 数量为 4，因此每个 mini-batch 大小为：
+mini-batch 数量为 24，因此每个 mini-batch 大小为：
 
 $$
-M = \frac{B}{4}=49152.
+M = \frac{B}{24}=16384.
 $$
 
 每轮 PPO 迭代对同一批数据重复训练 2 个 epoch，因此每轮总优化步数为：
 
 $$
-2\times 4 = 8.
+2\times 24 = 48.
 $$
 
 总训练步数配置为：
 
 $$
-\text{total\_steps}=300{,}000{,}000.
+\text{total\_steps}=3{,}000{,}000{,}000.
 $$
 
 于是 PPO 训练总迭代轮数约为：
@@ -1523,9 +1888,9 @@ $$
 \text{max\_epochs}
 =
 \left\lceil
-\frac{300{,}000{,}000}{196608}
+\frac{3{,}000{,}000{,}000}{393216}
 \right\rceil
-=1526.
+=7630.
 $$
 
 ### 4.14 当前训练链路下的几个关键实现约束
@@ -1669,346 +2034,241 @@ $$
 <a id="sec-6"></a>
 ## 6. TensorBoard：当前记录了哪些参数，它们具体表示什么
 
-### 6.1 一个先讲清楚的边界
+### 6.1 日志来源和覆盖边界
 
-当前训练日志由两部分共同组成：
+当前 TensorBoard 标量由三条路径共同写入：
 
-- `rl_games` 默认训练日志
-- 项目自定义 observer（`DoorPushTensorboardObserver`）基于 `extras` 追加的 episode 级指标
+1. `rl_games.common.a2c_common.ContinuousA2CBase.write_stats(...)` 写入性能、PPO loss、学习率和 KL。
+2. `rl_games.algos_torch.central_value.CentralValueTrain.train_net(...)` 写入 asymmetric central value 的 loss 和学习率。
+3. `DoorPushTensorboardObserver` 基于环境 `extras` 写入 episode 级 reward、任务状态、occupancy 成功率和失败原因。
 
-因此当前主训练不仅会记录常见 PPO/性能指标，也会把环境里的 `reward_info`、最终门角度、occupancy 分桶成功率和失败原因写进 TensorBoard。
+下面优先列当前默认训练链路实际会出现的标量 tag；最后再单独列出继承代码中存在、但当前默认环境通常不会产生的通用 tag。记第 $e$ 次写日志时，自定义 observer 收集到的完成 episode 集合为 $\mathcal K_e$，数量为 $K_e=|\mathcal K_e|$。对 episode $k$，长度为 $L_k$，单步总奖励为 $r_{k,t}^{\text{total}}$。任意单步分项 $x$ 的 episode 累计量记为：
 
-项目自定义指标统一以累计环境步数（frame）作为横轴，rl_games 内置指标则使用其自身的横轴约定。
+$$
+R_k[x]=\sum_{t=0}^{L_k-1} x_{k,t}.
+$$
+
+自定义 observer 的所有 `reward/*` 和 `reward_detail/*` 都按同一个规则聚合：
+
+$$
+\operatorname{TB}_e[x]=\frac{1}{K_e}\sum_{k\in\mathcal K_e} R_k[x].
+$$
+
+若某个日志周期内没有完成 episode，则这些 episode 级 tag 不写入。
 
 ### 6.2 性能类指标（rl_games 内置）
 
-#### `performance/step_inference_rl_update_fps`
+设本次 PPO epoch 采样到的环境步数为 $F_e$，环境 step 计时为 $T_{\text{step}}$，rollout 前向与采样计时为 $T_{\text{play}}$，PPO 更新计时为 $T_{\text{update}}$，`rl_games` 传入的整体计时为 $T_{\text{all}}$。
 
-定义近似为：
+| Tag | 含义 | 数学公式 |
+| --- | --- | --- |
+| `performance/step_inference_rl_update_fps` | 包含环境采样、策略前向和 PPO 更新的总体吞吐 | $\displaystyle F_e/T_{\text{all}}$ |
+| `performance/step_inference_fps` | 不含 PPO 反向更新的 rollout 吞吐 | $\displaystyle F_e/T_{\text{play}}$ |
+| `performance/step_fps` | 环境 step 阶段吞吐 | $\displaystyle F_e/T_{\text{step}}$ |
+| `performance/rl_update_time` | PPO 更新耗时 | $\displaystyle T_{\text{update}}$ |
+| `performance/step_inference_time` | rollout 前向与采样耗时 | $\displaystyle T_{\text{play}}$ |
+| `performance/step_time` | 环境 step 耗时 | $\displaystyle T_{\text{step}}$ |
 
-$$
-\frac{\text{curr\_frames}}{\text{sampling + inference + update 总时间}}.
-$$
+### 6.3 PPO 与 critic loss 指标（rl_games 内置）
 
-它反映整轮训练闭环吞吐率，包括：
+设一个 PPO epoch 内实际执行的 mini-batch 更新集合为 $\mathcal U_e$。TensorBoard 中的 loss 是 `rl_games` 对这些 mini-batch loss 的均值。
 
-- 环境步进
-- 策略前向
-- PPO 反向更新
+| Tag | 含义 | 数学公式 |
+| --- | --- | --- |
+| `losses/a_loss` | PPO actor clipped surrogate loss | $\displaystyle \frac{1}{\lvert\mathcal U_e\rvert}\sum_{u\in\mathcal U_e} L_{\text{actor}}^{(u)}$ |
+| `losses/c_loss` | actor-critic 模型 value head 的 clipped value loss | $\displaystyle \frac{1}{\lvert\mathcal U_e\rvert}\sum_{u\in\mathcal U_e} L_V^{(u)}$ |
+| `losses/entropy` | 高斯策略熵的均值；当前 `entropy_coef=0`，所以只监控、不进总 loss | $\displaystyle \frac{1}{\lvert\mathcal U_e\rvert}\sum_{u\in\mathcal U_e}\mathbb E_{t\in u}\left[\sum_{j=1}^{15}\frac{1}{2}\log(2\pi e\,\sigma_j^2)\right]$ |
+| `losses/bounds_loss` | 策略高斯均值的软边界损失，约束的是未 clip 的 $\mu_\theta(o)$ | $\displaystyle \frac{1}{\lvert\mathcal U_e\rvert}\sum_{u\in\mathcal U_e}\mathbb E_{t\in u}\sum_{j=1}^{15}\left([\mu_{t,j}-1.1]_+^2+[-1.1-\mu_{t,j}]_+^2\right)$ |
+| `losses/cval_loss` | asymmetric central value network 的 clipped value loss | $\displaystyle \frac{1}{\lvert\mathcal U_e^{V}\rvert}\sum_{u\in\mathcal U_e^{V}} L_{V,\text{central}}^{(u)}$ |
 
-#### `performance/step_inference_fps`
-
-定义近似为：
-
-$$
-\frac{\text{curr\_frames}}{\text{sampling + inference 时间}}.
-$$
-
-它反映不含反向更新时的 rollout 吞吐率。
-
-#### `performance/step_fps`
-
-定义为：
-
-$$
-\frac{\text{curr\_frames}}{\text{step\_time}}.
-$$
-
-它更接近“环境采样侧”的纯步进吞吐率。
-
-#### `performance/rl_update_time`
-
-单轮 PPO 更新耗时，单位秒。
-
-#### `performance/step_inference_time`
-
-单轮 rollout 采样和前向推理耗时，单位秒。
-
-#### `performance/step_time`
-
-环境步进阶段耗时，单位秒。
-
-### 6.3 损失类指标（rl_games 内置）
-
-#### `losses/a_loss`
-
-当前 mini-batch 上 actor clipped loss 的均值，对应第 4 节中的：
-
-$$
-L_{\text{actor}}.
-$$
-
-数值越小不一定越好，因为它是带符号和 clipping 的 surrogate loss，不是直接的任务回报。
-
-#### `losses/c_loss`
-
-当前 mini-batch 上 critic clipped value loss 的均值，对应：
-
-$$
-L_V.
-$$
-
-它反映值函数对 $\hat R_t$ 的拟合误差。
-
-#### `losses/entropy`
-
-当前策略熵：
-
-$$
-\mathcal H\big(\pi_\theta(\cdot\mid o_t^\pi)\big).
-$$
-
-若该值快速塌到很低，通常说明探索不足。
-
-#### `losses/bounds_loss`
-
-当前配置里 `bounds_loss_coef=0.0001`，它对应：
-
-$$
-L_{\text{bound}}.
-$$
-
-如果这项持续增大，通常意味着策略均值在某些动作维上正试图远离合理区域。
+其中 actor loss 和 value loss 的展开式见第 4 节。`losses/cval_loss` 使用 critic 观测 $o_t^V$ 训练 central value；`losses/c_loss` 则来自 actor-critic 主模型里的 value 输出。当前配置启用了 `central_value_config`，所以 `losses/cval_loss` 会写入。
 
 ### 6.4 PPO 信息类指标（rl_games 内置）
 
-#### `info/last_lr`
+| Tag | 含义 | 数学公式 |
+| --- | --- | --- |
+| `info/last_lr` | 当前 actor-critic 优化器实际学习率 | $\displaystyle \eta_e\cdot m_e$，当前连续 PPO 中 $m_e=\text{lr\_mul}=1$ |
+| `info/lr_mul` | 学习率乘子 | $\displaystyle m_e$，当前通常为 $1$ |
+| `info/e_clip` | PPO ratio clip 半宽 | $\displaystyle \varepsilon_e=\varepsilon\cdot m_e$，当前通常为 $0.2$ |
+| `info/kl` | 新旧高斯策略的经验 KL 均值 | $\displaystyle \frac{1}{\lvert\mathcal U_e\rvert}\sum_{u\in\mathcal U_e}\mathbb E_{t\in u}\left[\mathrm{KL}\big(\mathcal N(\mu_{\text{new}},\sigma_{\text{new}})\,\|\,\mathcal N(\mu_{\text{old}},\sigma_{\text{old}})\big)\right]$ |
+| `info/epochs` | PPO epoch 编号 | $\displaystyle e$ |
+| `info/cval_lr` | central value 优化器学习率 | $\displaystyle \eta_e^{V}$ |
 
-当前实际学习率。由于当前连续 PPO 实现中 `lr_mul=1`，它基本就是 adaptive scheduler 更新后的真实 $\eta$。
+当前项目保留 adaptive schedule，但在训练入口把 `rl_games` 原生上限 `1e-2` 改为 `adaptive_lr_max=1e-3`。因此正常情况下 `info/last_lr` 和 `info/cval_lr` 都不应超过 `0.001`。
 
-#### `info/lr_mul`
+### 6.5 rl_games 常规 episode 指标（rl_games 内置）
 
-学习率乘子。在当前连续控制实现里通常恒为 1，但 tag 仍会被写出。
+`rl_games` 还会维护一个完成 episode 的 rolling meter。记该 rolling meter 当前保留的 episode 集合为 $\mathcal W_e$，数量为 $W_e$。
 
-#### `info/e_clip`
+| Tag | 含义 | 数学公式 |
+| --- | --- | --- |
+| `rewards/step` | rolling window 内原始 episode return，横轴为 frame | $\displaystyle \frac{1}{W_e}\sum_{k\in\mathcal W_e}\sum_{t=0}^{L_k-1} r_{k,t}^{\text{total}}$ |
+| `rewards/iter` | 同上，横轴为 PPO epoch | 同 `rewards/step` |
+| `rewards/time` | 同上，横轴为墙钟时间 | 同 `rewards/step` |
+| `shaped_rewards/step` | reward shaper 后的 episode return，横轴为 frame | $\displaystyle \frac{1}{W_e}\sum_{k\in\mathcal W_e}\sum_{t=0}^{L_k-1} \tilde r_{k,t}$ |
+| `shaped_rewards/iter` | 同上，横轴为 PPO epoch | 同 `shaped_rewards/step` |
+| `shaped_rewards/time` | 同上，横轴为墙钟时间 | 同 `shaped_rewards/step` |
+| `episode_lengths/step` | rolling window 内平均 episode 长度，横轴为 frame | $\displaystyle \frac{1}{W_e}\sum_{k\in\mathcal W_e}L_k$ |
+| `episode_lengths/iter` | 同上，横轴为 PPO epoch | 同 `episode_lengths/step` |
+| `episode_lengths/time` | 同上，横轴为墙钟时间 | 同 `episode_lengths/step` |
 
-当前 clip 系数。写入逻辑是 `e_clip * lr_mul`，而当前 `lr_mul=1`，因此默认就是：
-
-$$
-0.2.
-$$
-
-#### `info/kl`
-
-当前新旧策略之间的经验 KL：
-
-$$
-\mathrm{KL}\big(\pi_{\theta_{\text{old}}}\|\pi_\theta\big).
-$$
-
-这个指标直接驱动自适应学习率调度。
-
-#### `info/epochs`
-
-当前 PPO 训练迭代轮数，也就是第几次“采样一整个 rollout batch 并完成若干 mini-batch 更新”。
-
-### 6.5 奖励指标（自定义 observer）
-
-以下指标全部由 `DoorPushTensorboardObserver` 按已完成 episode 聚合后写入，横轴为累计环境步数（frame）。
-
-环境在 episode 结束时会把 `episode_reward_info`、`door_angle`、`success`、`episode_left_occupied`、`episode_right_occupied`、`base_crossed`、`door_open_met`、`fail_cup_drop`、`fail_timeout`、`fail_not_crossed` 放进 `infos`，observer 正是基于这些 extras 做窗口聚合。
-
-#### `reward/*`
-
-大项奖励，对应环境里的一级汇总项：
-
-| Tag | 含义 |
-| --- | --- |
-| `reward/total` | 总回报 |
-| `reward/task` | 任务奖励 |
-| `reward/stab_left` | 左臂稳定性奖励 |
-| `reward/stab_right` | 右臂稳定性奖励 |
-| `reward/safe` | 安全惩罚 |
-
-如果某个已完成 episode 的对应大项回报记为 $R_k^{\text{big}}$，那么 TensorBoard 中记录的是当前统计窗口（一个 PPO epoch）内完成 episode 的均值：
+`DefaultRewardsShaper` 的逐步公式是：
 
 $$
-\bar R^{\text{big}}=\frac{1}{K}\sum_{k=1}^{K}R_k^{\text{big}}.
+\tilde r_t
+=
+\operatorname{clip}\big((r_t+\text{shift})\cdot\text{scale},\ \text{min},\ \text{max}\big),
 $$
 
-#### `reward_detail/*`
-
-细项奖励，对应 `episode_reward_info` 中除一级汇总项以外的全部 key：
-
-| Tag | 含义 |
-| --- | --- |
-| `reward_detail/task/delta` | 角度增量奖励 |
-| `reward_detail/task/open_bonus` | 一次性开门奖励 |
-| `reward_detail/task/approach` | 接近门板 shaping |
-| `reward_detail/task/approach_raw` | 接近原始距离 |
-| `reward_detail/task/base_approach` | 底盘接近门洞下沿线奖励 |
-| `reward_detail/task/base_cross` | 底盘穿门并向内推进奖励 |
-| `reward_detail/stab_left/zero_acc` | 左加速度归零奖励 |
-| `reward_detail/stab_left/zero_ang` | 左角速度归零奖励 |
-| `reward_detail/stab_left/acc` | 左加速度惩罚 |
-| `reward_detail/stab_left/ang` | 左角速度惩罚 |
-| `reward_detail/stab_left/tilt` | 左倾斜惩罚 |
-| `reward_detail/stab_right/*` | 右臂对应细项（同上 5 项） |
-| `reward_detail/safe/joint_vel` | 关节速度越界惩罚 |
-| `reward_detail/safe/target_limit` | 目标边界带惩罚 |
-| `reward_detail/safe/joint_move` | 关节移动惩罚 |
-| `reward_detail/safe/cup_door_prox` | 杯体-门板接近惩罚 |
-| `reward_detail/safe/cup_drop` | 杯子掉落惩罚 |
-
-它们同样记录当前统计窗口内已完成 episode 上对应分项的均值。
-
-### 6.6 任务状态指标（自定义 observer）
-
-#### `task_state/door_angle_final`
-
-episode 结束时门角度的均值：
+若 `log_val=True`，再取 $\log(\tilde r_t)$。当前默认只设置 `scale=1.0`，没有 shift、clip 或 log，因此默认近似为：
 
 $$
-\bar\theta_{\text{final}}=\frac{1}{K}\sum_{k=1}^{K}\theta_{k,\text{final}}.
+\tilde r_t=r_t.
 $$
 
-它不是 reward 分项，但属于任务进展最直接的状态量，因此单独记录。
+### 6.6 大项 reward 指标（自定义 observer）
 
-#### `task_state/base_crossed_rate`
+| Tag | 含义 | 数学公式 |
+| --- | --- | --- |
+| `reward/task` | 任务模块 episode 累计均值 | $\displaystyle \frac{1}{K_e}\sum_{k\in\mathcal K_e}\sum_t r_{k,t}^{\text{task}}$ |
+| `reward/stab_left` | 左臂稳定性模块 episode 累计均值 | $\displaystyle \frac{1}{K_e}\sum_{k\in\mathcal K_e}\sum_t r_{k,t}^{\text{stab},L}$ |
+| `reward/stab_right` | 右臂稳定性模块 episode 累计均值 | $\displaystyle \frac{1}{K_e}\sum_{k\in\mathcal K_e}\sum_t r_{k,t}^{\text{stab},R}$ |
+| `reward/safe` | 安全模块 episode 累计均值；最终总奖励会减去它，其中 `base_zero_speed` 在该组合内以负号进入 | $\displaystyle \frac{1}{K_e}\sum_{k\in\mathcal K_e}\sum_t r_{k,t}^{\text{safe}}$ |
+| `reward/total` | 最终送给 PPO 的总奖励 episode 累计均值 | $\displaystyle \frac{1}{K_e}\sum_{k\in\mathcal K_e}\sum_t \left(r_{k,t}^{\text{task}}+r_{k,t}^{\text{stab},L}+r_{k,t}^{\text{stab},R}-r_{k,t}^{\text{safe}}\right)$ |
 
-完成 episode 中，`base_link` 最终成功越过门洞平面的比例。
+### 6.7 任务 reward 细项（自定义 observer）
 
-#### `task_state/door_open_met_rate`
+| Tag | 含义 | 数学公式 |
+| --- | --- | --- |
+| `reward_detail/task/delta` | 门角增量奖励 | $\displaystyle \frac{1}{K_e}\sum_{k\in\mathcal K_e}\sum_t w(\theta_{k,t})(\theta_{k,t}-\theta_{k,t-1})$ |
+| `reward_detail/task/open_bonus` | 第一次达到开门阈值的一次性 bonus | $\displaystyle \frac{1}{K_e}\sum_{k\in\mathcal K_e}\sum_t w_{\text{open}}\mathbf 1[\theta_{k,t}\ge\theta_{\text{succ}}]\mathbf 1[\text{first-crossing}_{k,t}]$ |
+| `reward_detail/task/approach` | 手部接近门板的加权 shaping | $\displaystyle \frac{1}{K_e}\sum_{k\in\mathcal K_e}\sum_t \mathbf 1[\theta_{k,t}<\theta_{\text{stop}}]w_{\text{approach}}s_{k,t}^{\text{approach}}$ |
+| `reward_detail/task/approach_raw` | 未乘权重和 stop gate 的归一化接近度 | $\displaystyle \frac{1}{K_e}\sum_{k\in\mathcal K_e}\sum_t s_{k,t}^{\text{approach}}$ |
+| `reward_detail/task/base_approach` | 底盘在门外侧接近门洞下沿线段的奖励 | $\displaystyle \frac{1}{K_e}\sum_{k\in\mathcal K_e}\sum_t g_{k,t}^{\text{align}}g_{k,t}^{\text{corridor}}\mathbf 1[\neg\text{crossed}_{k,t}]\mathbf 1[\delta_{k,t}^{\text{plane}}>0]\mathbf 1[\theta_{k,t}\ge\theta_{\text{base-app}}]w_{\text{base\_approach}}s_{k,t}^{\text{base\_approach}}$ |
+| `reward_detail/task/base_cross` | 底盘穿门后在内侧半空间的推进奖励 | $\displaystyle \frac{1}{K_e}\sum_{k\in\mathcal K_e}\sum_t g_{k,t}^{\text{align}}g_{k,t}^{\text{corridor}}\mathbf 1[\theta_{k,t}\ge\theta_{\text{base-cross}}]w_{\text{base\_cross}}\mathbf 1[\text{in\_opening}_{k,t}]\max(p_{k,t}^{\text{inside}}-p_{k,t-1}^{\text{inside}},0)$ |
 
-完成 episode 中，门角最终达到 `1.2 rad` 阈值的比例。
+这里的 $s_t^{\text{approach}}$、$s_t^{\text{base\_approach}}$、$g_t^{\text{align}}$、$g_t^{\text{corridor}}$ 和 $p_t^{\text{inside}}$ 的定义见第 3.4.2 节。
 
-### 6.7 成功率指标（自定义 observer）
+### 6.8 稳定性 reward 细项（自定义 observer）
 
-当前成功率全部按 episode 完成口径定义，而不是逐步瞬时值。
+对侧别 $c\in\{L,R\}$，`stab_left/*` 对应 $c=L$，`stab_right/*` 对应 $c=R$。注意代码写入 TensorBoard 的 `acc`、`ang`、`tilt` 是已经带负号的 signed reward 分项。
 
-#### `success/all`
+| Tag | 含义 | 数学公式 |
+| --- | --- | --- |
+| `reward_detail/stab_left/zero_acc`、`reward_detail/stab_right/zero_acc` | 持杯侧末端线加速度接近 0 的奖励 | $\displaystyle \frac{1}{K_e}\sum_{i\in\mathcal K_e}\sum_t m_{i,t}^{c}w_{\text{zero-acc}}\exp(-\lambda_{\text{acc}}\|a_{i,t}^{c}\|_2^2)$ |
+| `reward_detail/stab_left/zero_ang`、`reward_detail/stab_right/zero_ang` | 持杯侧末端角加速度接近 0 的奖励 | $\displaystyle \frac{1}{K_e}\sum_{i\in\mathcal K_e}\sum_t m_{i,t}^{c}w_{\text{zero-ang}}\exp(-\lambda_{\text{ang}}\|\alpha_{i,t}^{c}\|_2^2)$ |
+| `reward_detail/stab_left/acc`、`reward_detail/stab_right/acc` | 持杯侧末端线加速度惩罚，日志中为负数 | $\displaystyle \frac{1}{K_e}\sum_{i\in\mathcal K_e}\sum_t -m_{i,t}^{c}w_{\text{acc}}\|a_{i,t}^{c}\|_2^2$ |
+| `reward_detail/stab_left/ang`、`reward_detail/stab_right/ang` | 持杯侧末端角加速度惩罚，日志中为负数 | $\displaystyle \frac{1}{K_e}\sum_{i\in\mathcal K_e}\sum_t -m_{i,t}^{c}w_{\text{ang}}\|\alpha_{i,t}^{c}\|_2^2$ |
+| `reward_detail/stab_left/tilt`、`reward_detail/stab_right/tilt` | 持杯侧杯体倾斜 proxy 惩罚，日志中为负数 | $\displaystyle \frac{1}{K_e}\sum_{i\in\mathcal K_e}\sum_t -m_{i,t}^{c}w_{\text{tilt}}\|u_{i,t}^{c}\|_2^2$ |
 
-记完成 episode 的成功指示量为 $s_k\in\{0,1\}$，则
+### 6.9 安全 reward 细项（自定义 observer）
 
-$$
-\text{success/all}=\frac{1}{K}\sum_{k=1}^{K}s_k.
-$$
-
-#### `success/empty`、`success/left`、`success/right`、`success/both`
-
-把完成 episode 按 occupancy 模式分桶后，分别统计条件成功率：
-
-$$
-\text{success/mode}=
-\frac{\sum_{k=1}^{K}\mathbf 1[\xi_k=\text{mode}]\,s_k}
-{\sum_{k=1}^{K}\mathbf 1[\xi_k=\text{mode}]}.
-$$
+| Tag | 含义 | 数学公式 |
+| --- | --- | --- |
+| `reward_detail/safe/joint_vel` | 关节速度超过软阈值后的二次惩罚 | $\displaystyle \frac{1}{K_e}\sum_{k\in\mathcal K_e}\sum_t \beta_{\text{vel}}\sum_{j=1}^{12}\left[\max(\lvert\dot q_{k,t,j}\rvert-\mu\dot q_{\max,j},0)\right]^2$ |
+| `reward_detail/safe/target_limit` | 执行目标进入 joint limit 边界带的惩罚 | $\displaystyle \frac{1}{K_e}\sum_{k\in\mathcal K_e}\sum_t \beta_{\text{target}}\sum_{j=1}^{12}\left(e_{k,t,j}^{\text{target}}/m_j\right)^2$ |
+| `reward_detail/safe/cup_drop` | 杯子掉落惩罚 | $\displaystyle \frac{1}{K_e}\sum_{k\in\mathcal K_e}\sum_t w_{\text{drop}}\mathbf 1[\text{cup\_dropped}_{k,t}]$ |
+| `reward_detail/safe/joint_move` | 相邻控制步关节位置变化惩罚 | $\displaystyle \frac{1}{K_e}\sum_{k\in\mathcal K_e}\sum_t \beta_{\text{joint\_move}}\sum_{j=1}^{12}(q_{k,t,j}-q_{k,t-1,j})^2$ |
+| `reward_detail/safe/cup_door_prox` | 持杯侧杯体低于门板距离阈值后的二次惩罚 | $\displaystyle \frac{1}{K_e}\sum_{k\in\mathcal K_e}\sum_t \sum_{c\in\{L,R\}}m_{k,t}^{c}\beta_{\text{cup\_door\_prox}}\left[\max(d_{\text{thresh}}-d_{k,t}^{c},0)\right]^2$ |
+| `reward_detail/safe/base_zero_speed` | 底盘低速静稳奖励；在 `reward/safe` 内以负号进入 | $\displaystyle \frac{1}{K_e}\sum_{k\in\mathcal K_e}\sum_t w_{\text{base-zero-speed}}\exp(-\lambda_{\text{base-speed}}s_{k,t}^{\text{base-speed}})$ |
+| `reward_detail/safe/base_speed` | 底盘速度平方惩罚 | $\displaystyle \frac{1}{K_e}\sum_{k\in\mathcal K_e}\sum_t w_{\text{base-speed}}s_{k,t}^{\text{base-speed}}$ |
+| `reward_detail/safe/base_cmd_delta` | 底盘速度命令跳变惩罚 | $\displaystyle \frac{1}{K_e}\sum_{k\in\mathcal K_e}\sum_t \beta_{\text{base\_cmd}}\|\Delta u_{k,t}^{\text{base}}\|_2^2$ |
+| `reward_detail/safe/base_heading` | 底盘前向偏向门框横向方向的惩罚 | $\displaystyle \frac{1}{K_e}\sum_{k\in\mathcal K_e}\sum_t \beta_{\text{base\_heading}}\left(f_{k,t}^{\text{base}}\cdot t^{\text{doorway}}\right)^2$ |
+| `reward_detail/safe/base_corridor` | 底盘矩形 footprint 越出门洞走廊的惩罚 | $\displaystyle \frac{1}{K_e}\sum_{k\in\mathcal K_e}\sum_t \beta_{\text{base\_corridor}}\left(e_{k,t}^{\text{corridor}}\right)^2$ |
 
 其中：
 
-- `empty` 对应 $(m^L,m^R)=(0,0)$
-- `left` 对应 $(1,0)$
-- `right` 对应 $(0,1)$
-- `both` 对应 $(1,1)$
-
-### 6.8 失败原因指标（自定义 observer）
-
-记录当前统计窗口内已完成 episode 中各类失败原因的发生率。当前代码会单独记录“杯子掉落”“超时”以及“超时但仍未过门”。
-
-#### `fail_reason/cup_drop`
-
-杯子掉落导致 episode 终止的比例：
-
 $$
-\text{fail\_reason/cup\_drop}=\frac{1}{K}\sum_{k=1}^{K}\mathbf 1[\text{cup\_dropped}_k].
+s_t^{\text{base-speed}}=v_{x,t}^2+v_{y,t}^2+\omega_{z,t}^2.
 $$
 
-#### `fail_reason/timeout`
-
-超时（达到最大步数）导致 episode 终止的比例，排除同时杯子掉落的情况：
+`reward/safe` 中的组合方式是：
 
 $$
-\text{fail\_reason/timeout}=\frac{1}{K}\sum_{k=1}^{K}\mathbf 1[\text{truncated}_k \land \lnot\text{cup\_dropped}_k].
+r_t^{\text{safe}}
+=
+r_t^{\text{vel}}
++r_t^{\text{target}}
++r_t^{\text{drop}}
++r_t^{\text{joint\_move}}
++r_t^{\text{cup\_door\_prox}}
+-r_t^{\text{base\_zero\_speed}}
++r_t^{\text{base\_speed}}
++r_t^{\text{base\_cmd\_delta}}
++r_t^{\text{base\_heading}}
++r_t^{\text{base\_corridor}}.
 $$
 
-注意二者不重叠：如果杯子掉落和超时同时发生，只计入 `cup_drop`。未计入任何失败原因的 episode 即为成功 episode，因此：
+### 6.10 任务状态、成功率和失败原因（自定义 observer）
+
+| Tag | 含义 | 数学公式 |
+| --- | --- | --- |
+| `task_state/door_angle_final` | 完成 episode 的最终门角均值 | $\displaystyle \frac{1}{K_e}\sum_{k\in\mathcal K_e}\theta_{k,L_k-1}$ |
+| `task_state/base_crossed_rate` | 完成 episode 中 `base_link` 最终穿过门洞平面的比例 | $\displaystyle \frac{1}{K_e}\sum_{k\in\mathcal K_e}\mathbf 1[\text{base\_crossed}_k]$ |
+| `task_state/door_open_met_rate` | 完成 episode 中最终门角达到阈值的比例 | $\displaystyle \frac{1}{K_e}\sum_{k\in\mathcal K_e}\mathbf 1[\theta_{k,L_k-1}\ge\theta_{\text{succ}}]$ |
+| `success/all` | 完成 episode 总成功率 | $\displaystyle \frac{1}{K_e}\sum_{k\in\mathcal K_e}s_k$ |
+| `success/empty` | 无杯场景条件成功率 | $\displaystyle \frac{\sum_{k\in\mathcal K_e}\mathbf 1[\xi_k=\text{empty}]s_k}{\sum_{k\in\mathcal K_e}\mathbf 1[\xi_k=\text{empty}]}$ |
+| `success/left` | 仅左杯场景条件成功率 | $\displaystyle \frac{\sum_{k\in\mathcal K_e}\mathbf 1[\xi_k=\text{left}]s_k}{\sum_{k\in\mathcal K_e}\mathbf 1[\xi_k=\text{left}]}$ |
+| `success/right` | 仅右杯场景条件成功率 | $\displaystyle \frac{\sum_{k\in\mathcal K_e}\mathbf 1[\xi_k=\text{right}]s_k}{\sum_{k\in\mathcal K_e}\mathbf 1[\xi_k=\text{right}]}$ |
+| `success/both` | 双杯场景条件成功率 | $\displaystyle \frac{\sum_{k\in\mathcal K_e}\mathbf 1[\xi_k=\text{both}]s_k}{\sum_{k\in\mathcal K_e}\mathbf 1[\xi_k=\text{both}]}$ |
+| `fail_reason/cup_drop` | 杯子掉落比例 | $\displaystyle \frac{1}{K_e}\sum_{k\in\mathcal K_e}\mathbf 1[\text{cup\_dropped}_k]$ |
+| `fail_reason/timeout` | 超时且非掉杯且非成功的比例 | $\displaystyle \frac{1}{K_e}\sum_{k\in\mathcal K_e}\mathbf 1[\text{truncated}_k\land\lnot\text{cup\_dropped}_k\land\lnot s_k]$ |
+| `fail_reason/not_crossed` | 超时、杯未掉、但底盘仍未穿过门洞的比例；它是 `timeout` 的子集 | $\displaystyle \frac{1}{K_e}\sum_{k\in\mathcal K_e}\mathbf 1[\text{truncated}_k\land\lnot\text{cup\_dropped}_k\land\lnot\text{base\_crossed}_k]$ |
+
+成功指示量为：
 
 $$
-\text{success/all} + \text{fail\_reason/cup\_drop} + \text{fail\_reason/timeout} = 1.
+s_k=
+\mathbf 1[
+\theta_{k,L_k-1}\ge\theta_{\text{succ}}
+\land
+\text{base\_crossed}_k
+\land
+\lnot\text{cup\_dropped}_k
+].
 $$
 
-#### `fail_reason/not_crossed`
-
-超时结束、杯子未掉、但 `base_link` 仍未穿过门洞的比例。这个指标与 `timeout` 高度相关，但更直接指向“门已打开却还没进门”这一失败模式。
-
-### 6.9 rl_games 常规回报指标（rl_games 内置）
-
-只有当有完整 episode 结束时，下面这些 tag 才会出现。
-
-#### `rewards/step`、`rewards/iter`、`rewards/time`
-
-这是已完成 episode 的平均原始回报，只是横轴不同：
-
-- `/step` 的横轴是累计环境步数 frame
-- `/iter` 的横轴是 PPO epoch 编号
-- `/time` 的横轴是墙钟时间
-
-如果记某个完成 episode 的原始 return 为
+occupancy 模式 $\xi_k$ 的定义为：
 
 $$
-G_0=\sum_{t=0}^{T-1}r_t,
+\xi_k=
+\begin{cases}
+\text{empty}, & (m^L_k,m^R_k)=(0,0),\\
+\text{left}, & (m^L_k,m^R_k)=(1,0),\\
+\text{right}, & (m^L_k,m^R_k)=(0,1),\\
+\text{both}, & (m^L_k,m^R_k)=(1,1).
+\end{cases}
 $$
 
-那么这些 tag 记录的是最近一批完成 episode 的平均值。
+### 6.11 PPO diagnostics（rl_games 内置）
 
-#### `shaped_rewards/step`、`shaped_rewards/iter`、`shaped_rewards/time`
+当前默认 `use_diagnostics=True`，所以会启用 `PpoDiagnostics`。这些 tag 的横轴是 PPO epoch，而不是 frame。
 
-这是 reward shaper 处理后的 episode 回报。一般定义为：
+| Tag | 出现条件 | 含义 | 数学公式 |
+| --- | --- | --- | --- |
+| `diagnostics/rms_value/mean` | 当前 `normalize_value=True` | value normalizer 的 running mean | $\displaystyle \mu_V$ |
+| `diagnostics/rms_value/var` | 当前 `normalize_value=True` | value normalizer 的 running variance | $\displaystyle \sigma_V^2$ |
+| `diagnostics/exp_var` | 当前 `use_diagnostics=True` | value 对 return 的 explained variance | $\displaystyle 1-\frac{\operatorname{Var}(\hat R_t-V_t)}{\operatorname{Var}(\hat R_t)}$ |
+| `diagnostics/clip_frac/<mini_epoch>` | 当前 `use_diagnostics=True` | 第 `<mini_epoch>` 个 mini-epoch 中 PPO ratio 超出 clip 区间的比例 | $\displaystyle \frac{1}{B}\sum_t\mathbf 1\left[\log\rho_t<\log(1-\varepsilon)\lor\log\rho_t>\log(1+\varepsilon)\right]$ |
+| `diagnostics/rms_advantage/mean` | 仅当 `normalize_rms_advantage=True` | advantage RMS normalizer 的 running mean | $\displaystyle \mu_A$ |
+| `diagnostics/rms_advantage/var` | 仅当 `normalize_rms_advantage=True` | advantage RMS normalizer 的 running variance | $\displaystyle \sigma_A^2$ |
 
-$$
-r_t^{\text{shaped}}=
-\operatorname{clip}\big((r_t+\text{shift})\cdot \text{scale},\ \text{min},\text{max}\big),
-$$
+当前默认配置没有设置 `normalize_rms_advantage=True`，所以通常不会出现 `diagnostics/rms_advantage/mean` 和 `diagnostics/rms_advantage/var`。`diagnostics/clip_frac/<mini_epoch>` 中 `<mini_epoch>` 对当前 `mini_epochs=3` 通常是 `0`、`1`、`2`。
 
-必要时还可附加对数变换。
+### 6.12 当前不会由默认环境产生的继承项
 
-但当前项目默认只设置了：
+`IsaacAlgoObserver` 和 `rl_games` 代码中还有几类通用 tag，但当前 `DoorPushEnv` 默认没有提供对应输入，因此通常不会出现：
 
-$$
-\text{scale}=1.0,
-$$
+| Tag 形式 | 不出现原因 | 若出现时的公式 |
+| --- | --- | --- |
+| `Episode/<key>` | 当前环境没有在 `infos` 中提供 `episode` 字典 | $\displaystyle \frac{1}{K}\sum_k \text{episode}_k[\text{key}]$ |
+| `<scalar_info>/frame`、`<scalar_info>/iter`、`<scalar_info>/time` | 当前 `extras` 中没有标量型 direct info；已有 extras 都由自定义 observer 专门消费 | 直接记录该 scalar info 的当前值 |
+| `scores/mean`、`scores/iter`、`scores/time` | 当前 `IsaacAlgoObserver.mean_scores` 没有被本环境更新 | $\displaystyle \frac{1}{K}\sum_k \text{score}_k$ |
+| `losses/<aux_loss_name>` | 当前 actor-critic 网络没有返回 auxiliary loss | $\displaystyle \frac{1}{|\mathcal U_e|}\sum_{u\in\mathcal U_e}L_{\text{aux}}^{(u)}$ |
 
-其余 shaping 选项没有打开，所以当前默认训练里：
-
-$$
-r_t^{\text{shaped}} \approx r_t.
-$$
-
-因此 `shaped_rewards/*` 与 `rewards/*` 在数值上通常几乎相同。
-
-#### `episode_lengths/step`、`episode_lengths/iter`、`episode_lengths/time`
-
-这是已完成 episode 的平均长度：
-
-$$
-\bar L = \frac{1}{K}\sum_{k=1}^{K} L_k.
-$$
-
-它能帮助判断训练是更多地提前成功终止，还是更多地拖到时间截断。
-
-### 6.10 PPO Diagnostics 与 `use_diagnostics`
-
-当前默认已经开启 `use_diagnostics=True`。它的意思不是“打开项目自定义 TensorBoard”，而是启用 `rl_games` 自己的 `PpoDiagnostics` 分支。
-
-不开时，`rl_games` 使用的是 `DefaultDiagnostics`，不会额外写 PPO 诊断项。
-
-开了以后，会额外出现：
-
-- `diagnostics/rms_advantage/mean`
-- `diagnostics/rms_advantage/var`
-- `diagnostics/rms_value/mean`
-- `diagnostics/rms_value/var`
-- `diagnostics/exp_var`
-- `diagnostics/clip_frac/<mini_epoch>`
-
-其中：
-
-- `diagnostics/exp_var` 是 value 预测与 return 之间的 explained variance
-- `diagnostics/clip_frac/<mini_epoch>` 是该 mini-epoch 上 PPO clip fraction
-
-需要特别区分：`use_diagnostics` 只负责这些 PPO 诊断量，它不会自动把 `reward_info`、`success/all` 或 `success/both` 之类的项目指标写出来。这些项目指标仍然来自自定义 observer。
+需要特别区分：`use_diagnostics` 只负责 `diagnostics/*`，不会自动写出 `reward_detail/*`、`success/*` 或 `fail_reason/*`。这些项目指标来自 `DoorPushTensorboardObserver`。
 
 <a id="sec-7"></a>
 ## 7. 一句话总结
 
-当前项目默认训练的数学本质是：在随机基座站位、随机门动力学、随机 occupancy、观测噪声和位置目标噪声下，使用一个以 $90$ 维低维观测为输入、输出“12 维双臂归一化 joint command + 3 维底盘速度命令”的高斯策略，通过带特权 critic 的 PPO 最大化“开门增量 + 一次性开门成功 + 近门 shaping + 持杯稳定性奖励 - 速度越界 - 目标边界带惩罚 - 掉杯失败”的条件期望回报。
+当前项目默认训练的数学本质是：在随机基座站位、随机门动力学、随机 occupancy、观测噪声和位置目标噪声下，使用一个以 $90$ 维低维观测为输入、输出“12 维双臂归一化 joint command + 3 维底盘速度命令”的高斯策略，通过带特权 critic 的 PPO 最大化“开门增量 + 一次性开门成功 + 近门 shaping + 底盘接近门洞与穿门 shaping + 持杯稳定性奖励 + 底盘零速度奖励 - 速度越界 - 目标边界带惩罚 - 关节移动惩罚 - 杯体贴门惩罚 - 底盘速度惩罚 - 底盘命令跳变惩罚 - 掉杯失败”的条件期望回报。

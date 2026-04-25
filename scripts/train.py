@@ -211,6 +211,14 @@ def build_rl_games_agent_cfg(
     config_section["gamma"] = float(ppo_cfg.get("gamma", config_section.get("gamma", 0.99)))
     config_section["tau"] = float(ppo_cfg.get("lam", config_section.get("tau", 0.95)))
     config_section["learning_rate"] = actor_lr
+    if "lr_schedule" in ppo_cfg:
+        config_section["lr_schedule"] = ppo_cfg["lr_schedule"]
+    if "kl_threshold" in ppo_cfg:
+        config_section["kl_threshold"] = float(ppo_cfg["kl_threshold"])
+    if "adaptive_lr_max" in ppo_cfg:
+        config_section["adaptive_lr_max"] = float(ppo_cfg["adaptive_lr_max"])
+    if "adaptive_lr_min" in ppo_cfg:
+        config_section["adaptive_lr_min"] = float(ppo_cfg["adaptive_lr_min"])
     config_section["entropy_coef"] = float(ppo_cfg.get("entropy_coef", config_section.get("entropy_coef", 0.0)))
     config_section["critic_coef"] = float(ppo_cfg.get("value_coef", config_section.get("critic_coef", 1.0)))
     config_section["grad_norm"] = float(ppo_cfg.get("max_grad_norm", config_section.get("grad_norm", 1.0)))
@@ -228,12 +236,60 @@ def build_rl_games_agent_cfg(
     reward_shaper = config_section.setdefault("reward_shaper", {})
     reward_shaper["scale_value"] = float(training_cfg.get("reward_scale", reward_shaper.get("scale_value", 1.0)))
 
+    continuous_space = params.setdefault("network", {}).setdefault("space", {}).setdefault("continuous", {})
+    sigma_init = continuous_space.setdefault("sigma_init", {})
+    if "sigma_init_logstd" in ppo_cfg:
+        sigma_init["val"] = float(ppo_cfg["sigma_init_logstd"])
+    elif "sigma_init_val" in ppo_cfg:
+        sigma_init["val"] = float(ppo_cfg["sigma_init_val"])
+
     ensure_central_value_config(agent_cfg)
 
     resume_path = Path(checkpoint_path) if checkpoint_path is not None else runtime_cfg.resume
     params["load_checkpoint"] = resume_path is not None
     params["load_path"] = str(resume_path) if resume_path is not None else ""
     return agent_cfg
+
+
+def _configure_rl_games_adaptive_scheduler_bounds(config_section: dict[str, Any]) -> None:
+    """Patch rl_games' adaptive LR scheduler to honor project-level bounds.
+
+    rl_games hard-codes AdaptiveScheduler bounds to [1e-6, 1e-2].  The
+    project config keeps those defaults unless adaptive_lr_min/max are set.
+    """
+    adaptive_lr_min = config_section.get("adaptive_lr_min")
+    adaptive_lr_max = config_section.get("adaptive_lr_max")
+    if adaptive_lr_min is None and adaptive_lr_max is None:
+        return
+
+    min_lr = float(adaptive_lr_min) if adaptive_lr_min is not None else None
+    max_lr = float(adaptive_lr_max) if adaptive_lr_max is not None else None
+    if min_lr is not None and min_lr <= 0.0:
+        raise ValueError(f"adaptive_lr_min must be positive, got {min_lr}.")
+    if max_lr is not None and max_lr <= 0.0:
+        raise ValueError(f"adaptive_lr_max must be positive, got {max_lr}.")
+    if min_lr is not None and max_lr is not None and min_lr > max_lr:
+        raise ValueError(f"adaptive_lr_min must be <= adaptive_lr_max, got {min_lr} > {max_lr}.")
+
+    from rl_games.common import schedulers
+
+    scheduler_cls = schedulers.AdaptiveScheduler
+    if not hasattr(scheduler_cls, "_door_push_original_init"):
+        scheduler_cls._door_push_original_init = scheduler_cls.__init__
+
+        def _bounded_init(self, kl_threshold: float = 0.008):
+            scheduler_cls._door_push_original_init(self, kl_threshold)
+            patched_min = getattr(scheduler_cls, "_door_push_min_lr", None)
+            patched_max = getattr(scheduler_cls, "_door_push_max_lr", None)
+            if patched_min is not None:
+                self.min_lr = patched_min
+            if patched_max is not None:
+                self.max_lr = patched_max
+
+        scheduler_cls.__init__ = _bounded_init
+
+    scheduler_cls._door_push_min_lr = min_lr
+    scheduler_cls._door_push_max_lr = max_lr
 
 
 _REWARD_PARAM_MAP: dict[str, dict[str, str]] = {
@@ -264,10 +320,17 @@ _REWARD_PARAM_MAP: dict[str, dict[str, str]] = {
         "beta_vel": "rew_beta_vel",
         "beta_target": "rew_beta_target",
         "target_margin_ratio": "rew_target_margin_ratio",
+        "beta_joint_move": "rew_beta_joint_move",
+        "beta_cup_door_prox": "rew_beta_cup_door_prox",
+        "cup_door_prox_threshold": "rew_cup_door_prox_threshold",
         "w_drop": "rew_w_drop",
-        "mu_base": "rew_mu_base",
-        "beta_base_speed": "rew_beta_base_speed",
+        "w_base_zero_speed": "rew_w_base_zero_speed",
+        "lambda_base_speed": "rew_lambda_base_speed",
+        "w_base_speed": "rew_w_base_speed",
         "beta_base_cmd": "rew_beta_base_cmd",
+        "beta_base_heading": "rew_beta_base_heading",
+        "beta_base_corridor": "rew_beta_base_corridor",
+        "base_align_tolerance_deg": "rew_base_align_tolerance_deg",
     },
 }
 
@@ -325,7 +388,8 @@ def main(argv: list[str] | None = None) -> int:
     task_name = args_cli.task or _resolve_task_name(cfg)
     num_envs = args_cli.num_envs if args_cli.num_envs is not None else _resolve_num_envs(cfg, runtime_cfg)
     seed = args_cli.seed if args_cli.seed is not None else runtime_cfg.seed
-    device = _normalize_device(args_cli.device or runtime_cfg.device)
+    cli_device_explicit = getattr(args_cli, "device_explicit", False) or _cli_option_present(argv_list, "--device")
+    device = _normalize_device(args_cli.device if cli_device_explicit else runtime_cfg.device)
     checkpoint_path = args_cli.checkpoint or runtime_cfg.resume
 
     if not _cli_option_present(argv_list, "--headless"):
@@ -423,6 +487,7 @@ def main(argv: list[str] | None = None) -> int:
         agent_cfg["params"]["config"]["num_actors"] = env.unwrapped.num_envs
 
         runner = Runner(DoorPushTensorboardObserver())
+        _configure_rl_games_adaptive_scheduler_bounds(agent_cfg["params"]["config"])
         runner.load(agent_cfg)
         runner.reset()
 

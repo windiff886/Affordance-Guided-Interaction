@@ -485,36 +485,40 @@ class DoorPushEnvCfg(DirectRLEnvCfg):
     rew_w_delta: float = 10.0
     rew_alpha: float = 0.3
     rew_k_decay: float = 0.5
-    rew_w_open: float = 50.0
-    rew_w_approach: float = 200.0
+    rew_w_open: float = 15.0
+    rew_w_approach: float = 0.5
     rew_approach_eps: float = 1.0e-6
-    rew_approach_stop_angle: float = 0.10
-    rew_w_base_approach: float = 2.0
+    rew_approach_stop_angle: float = 0.70
+    rew_w_base_approach: float = 1.0
     rew_base_approach_open_gate: float = 0.3
-    rew_w_base_cross: float = 5.0
+    rew_w_base_cross: float = 50.0
     rew_base_cross_open_gate: float = 1.2
 
     # 稳定性奖励 (§5)
-    rew_w_zero_acc: float = 1.0
-    rew_lambda_acc: float = 2.0
-    rew_w_zero_ang: float = 0.5
-    rew_lambda_ang: float = 1.0
-    rew_w_acc: float = 0.5
-    rew_w_ang: float = 0.3
-    rew_w_tilt: float = 0.3
+    rew_w_zero_acc: float = 0.045
+    rew_lambda_acc: float = 3.0
+    rew_w_zero_ang: float = 0.055
+    rew_lambda_ang: float = 1.2
+    rew_w_acc: float = 0.015
+    rew_w_ang: float = 0.0005
+    rew_w_tilt: float = 3.0
 
     # 安全惩罚 (§6)
     rew_mu: float = 0.9
-    rew_beta_vel: float = 0.5
-    rew_beta_target: float = 1.0
-    rew_target_margin_ratio: float = 0.1
-    rew_beta_joint_move: float = 0.1
-    rew_beta_cup_door_prox: float = 1.0
-    rew_cup_door_prox_threshold: float = 0.05
-    rew_w_drop: float = 100.0
-    rew_mu_base: float = 0.9
-    rew_beta_base_speed: float = 0.0
-    rew_beta_base_cmd: float = 0.0
+    rew_beta_vel: float = 0.1
+    rew_beta_target: float = 0.1
+    rew_target_margin_ratio: float = 0.05
+    rew_beta_joint_move: float = 7.0
+    rew_beta_cup_door_prox: float = 10000.0
+    rew_cup_door_prox_threshold: float = 0.20
+    rew_w_drop: float = 25.0
+    rew_w_base_zero_speed: float = 0.12
+    rew_lambda_base_speed: float = 10.0
+    rew_w_base_speed: float = 1.0
+    rew_beta_base_cmd: float = 2.0
+    rew_beta_base_heading: float = 2.0
+    rew_beta_base_corridor: float = 1500.0
+    rew_base_align_tolerance_deg: float = 25.0
 
     # ── 门几何观测 ────────────────────────────────────────────────────
     door_geometry_dim: int = 6  # center(3) + normal(3)

@@ -51,6 +51,12 @@ from affordance_guided_interaction.utils.train_runtime_config import TrainRuntim
 DEFAULT_INFERENCE_CONFIG = PROJECT_ROOT / "configs" / "inference" / "default.yaml"
 DEFAULT_VIDEO_LENGTH = 200
 _ROLLOUT_PROGRESS_INTERVAL = 100
+_EPISODE_END_REASON_PRIORITY = (
+    ("success", "success"),
+    ("fail_cup_drop", "cup_drop"),
+    ("fail_not_crossed", "not_crossed"),
+    ("fail_timeout", "timeout"),
+)
 
 
 @dataclass(frozen=True)
@@ -173,6 +179,41 @@ def _build_record_video_kwargs(mode_dir: Path, *, video_length: int) -> dict[str
     }
 
 
+def _as_any_true(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 0:
+            return False
+        return bool(torch.any(value.to(dtype=torch.bool)).item())
+    tensor = torch.as_tensor(value)
+    if tensor.numel() == 0:
+        return False
+    return bool(torch.any(tensor.to(dtype=torch.bool)).item())
+
+
+def _resolve_episode_end_reason(infos: Any) -> str:
+    if not isinstance(infos, dict):
+        return "episode_done"
+    for info_key, reason in _EPISODE_END_REASON_PRIORITY:
+        if _as_any_true(infos.get(info_key)):
+            return reason
+    return "episode_done"
+
+
+def _sanitize_episode_end_reason(reason: str) -> str:
+    safe_reason = "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in reason.strip().lower())
+    safe_reason = safe_reason.strip("_")
+    return safe_reason or "unknown"
+
+
+def _create_episode_end_reason_marker(mode_dir: Path, reason: str) -> Path:
+    mode_dir.mkdir(parents=True, exist_ok=True)
+    marker_path = mode_dir / f"{_sanitize_episode_end_reason(reason)}.txt"
+    marker_path.write_text("", encoding="utf-8")
+    return marker_path
+
+
 def _extract_policy_obs(obs: Any) -> Any:
     if isinstance(obs, dict) and "obs" in obs:
         return obs["obs"]
@@ -201,6 +242,7 @@ def _play_mode_rollout(
     mode: str,
     deterministic: bool,
     video_length: int,
+    reason_marker_dir: Path | None = None,
 ) -> int:
     _log_rollout_message(_format_rollout_event(mode=mode, event="start"))
 
@@ -216,11 +258,12 @@ def _play_mode_rollout(
 
     start_time = time.perf_counter()
     timestep = 0
+    end_reason = "video_length"
     while simulation_app.is_running() and timestep < video_length:
         with torch.inference_mode():
             obs = agent.obs_to_torch(obs)
             actions = agent.get_action(obs, is_deterministic=deterministic)
-            obs, _, dones, _ = env.step(actions)
+            obs, _, dones, infos = env.step(actions)
 
             if agent.is_rnn and agent.states is not None and len(dones) > 0:
                 for state in agent.states:
@@ -231,10 +274,16 @@ def _play_mode_rollout(
             elapsed_s = time.perf_counter() - start_time
             _log_rollout_message(_format_rollout_progress(mode=mode, event="step", step=timestep, elapsed_s=elapsed_s))
         if _episode_finished(dones):
+            end_reason = _resolve_episode_end_reason(infos)
             break
+    if not simulation_app.is_running() and timestep < video_length:
+        end_reason = "simulation_stopped"
 
     elapsed_s = time.perf_counter() - start_time
     _log_rollout_message(_format_rollout_progress(mode=mode, event="finished", step=timestep, elapsed_s=elapsed_s))
+    if reason_marker_dir is not None:
+        marker_path = _create_episode_end_reason_marker(reason_marker_dir, end_reason)
+        _log_rollout_message(f"{_format_rollout_event(mode=mode, event='end_reason')} reason={end_reason} marker={marker_path}")
     return timestep
 
 
@@ -423,6 +472,7 @@ def _render_all_modes_official(
                 mode=mode,
                 deterministic=rollout_cfg.deterministic,
                 video_length=rollout_cfg.video_length,
+                reason_marker_dir=mode_dir,
             )
         finally:
             _stop_recording_if_needed(env)

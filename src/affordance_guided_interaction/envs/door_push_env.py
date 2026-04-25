@@ -71,7 +71,14 @@ from .base_control_math import (
     twist_to_wheel_angular_velocity_targets,
 )
 from .door_reward_math import (
+    compute_base_alignment_gate,
     compute_base_approach_active_mask,
+    compute_base_corridor_excess,
+    compute_base_footprint_corners_door_frame,
+    compute_base_heading_penalty,
+    compute_base_speed_penalty,
+    compute_base_speed_squared,
+    compute_base_zero_speed_reward,
     compute_door_traverse_success,
     compute_inside_progress_delta,
     compute_normalized_approach_score,
@@ -138,8 +145,11 @@ _EPISODE_REWARD_KEYS = (
     "safe/joint_move",
     "safe/cup_door_prox",
     "safe/cup_drop",
+    "safe/base_zero_speed",
     "safe/base_speed",
     "safe/base_cmd_delta",
+    "safe/base_heading",
+    "safe/base_corridor",
     "total",
 )
 
@@ -520,7 +530,32 @@ class DoorPushEnv(DirectRLEnv):
             batch_quat_to_rotation_matrix(door_root_quat_w),
             self._doorway_plane_normal_local.view(1, 3, 1).expand(base_pos_w.shape[0], -1, -1),
         ).squeeze(-1)
+        doorway_tangent_w = doorway_lower_end_w - doorway_lower_start_w
+        base_rot_w = batch_quat_to_rotation_matrix(base_quat_w)
+        base_forward_world = base_rot_w[:, :, 0]
         base_pos_door = batch_vector_world_to_base(base_pos_w - door_root_pos_w, door_root_quat_w)
+        base_forward_door = batch_vector_world_to_base(base_forward_world, door_root_quat_w)
+        base_yaw_door = torch.atan2(base_forward_door[:, 1], base_forward_door[:, 0])
+        base_corners_door = compute_base_footprint_corners_door_frame(
+            base_pos_door_xy=base_pos_door[:, :2],
+            base_yaw_door=base_yaw_door,
+            half_length=self.cfg.wheel_base_half_length,
+            half_width=self.cfg.wheel_base_half_width,
+        )
+        corridor_half_width = max(
+            abs(float(self._doorway_lower_edge_start_local[1])),
+            abs(float(self._doorway_lower_edge_end_local[1])),
+        )
+        base_corridor_excess = compute_base_corridor_excess(
+            corner_y=base_corners_door[:, :, 1],
+            corridor_half_width=corridor_half_width,
+        )
+        base_corridor_gate = base_corridor_excess <= 1.0e-6
+        base_align_gate = compute_base_alignment_gate(
+            base_forward_world=base_forward_world,
+            doorway_normal_world=doorway_plane_normal_w,
+            max_angle_deg=self.cfg.rew_base_align_tolerance_deg,
+        )
         base_signed_distance = compute_signed_distance_to_plane(
             points=base_pos_w,
             plane_points=door_root_pos_w,
@@ -537,7 +572,13 @@ class DoorPushEnv(DirectRLEnv):
             "doorway_lower_start_w": doorway_lower_start_w,
             "doorway_lower_end_w": doorway_lower_end_w,
             "doorway_plane_normal_w": doorway_plane_normal_w,
+            "doorway_tangent_w": doorway_tangent_w,
             "base_pos_door": base_pos_door,
+            "base_forward_world": base_forward_world,
+            "base_corners_door": base_corners_door,
+            "base_corridor_excess": base_corridor_excess,
+            "base_corridor_gate": base_corridor_gate,
+            "base_align_gate": base_align_gate,
             "base_line_dist": base_line_dist,
             "base_signed_distance": base_signed_distance,
             "base_in_opening": base_in_opening,
@@ -1015,7 +1056,7 @@ class DoorPushEnv(DirectRLEnv):
         base_approach_active = compute_base_approach_active_mask(
             base_crossed=self._base_link_crossed,
             current_signed_distance=doorway_state["base_signed_distance"],
-        )
+        ) & doorway_state["base_align_gate"] & doorway_state["base_corridor_gate"]
         r_task_base_approach = (
             base_approach_active.float()
             * (theta >= self.cfg.rew_base_approach_open_gate).float()
@@ -1030,6 +1071,9 @@ class DoorPushEnv(DirectRLEnv):
             self._prev_base_signed_doorway_distance,
         )
         r_task_base_cross = (
+            doorway_state["base_align_gate"].float()
+            * doorway_state["base_corridor_gate"].float()
+            *
             (theta >= self.cfg.rew_base_cross_open_gate).float()
             * self.cfg.rew_w_base_cross
             * compute_inside_progress_delta(
@@ -1184,18 +1228,28 @@ class DoorPushEnv(DirectRLEnv):
             robot.data.body_ang_vel_w[:, self._base_body_idx],
             robot.data.body_quat_w[:, self._base_body_idx],
         )
-        base_speed_ratio = torch.stack(
-            [
-                torch.abs(base_lv[:, 0]) / max(self.cfg.base_max_lin_vel_x, 1.0e-6),
-                torch.abs(base_lv[:, 1]) / max(self.cfg.base_max_lin_vel_y, 1.0e-6),
-                torch.abs(base_av[:, 2]) / max(self.cfg.base_max_ang_vel_z, 1.0e-6),
-            ],
-            dim=-1,
+        base_speed_sq = compute_base_speed_squared(
+            base_lin_vel_base=base_lv,
+            base_ang_vel_base=base_av,
         )
-        base_speed_excess = torch.clamp(base_speed_ratio - self.cfg.rew_mu_base, min=0.0)
-        r_safe_base_speed = self.cfg.rew_beta_base_speed * torch.square(base_speed_excess).sum(dim=-1)
+        r_safe_base_zero_speed = compute_base_zero_speed_reward(
+            speed_sq=base_speed_sq,
+            weight=self.cfg.rew_w_base_zero_speed,
+            decay=self.cfg.rew_lambda_base_speed,
+        )
+        r_safe_base_speed = compute_base_speed_penalty(
+            speed_sq=base_speed_sq,
+            weight=self.cfg.rew_w_base_speed,
+        )
         base_cmd_delta_norm = self._cached_base_cmd_delta.norm(dim=-1)
         r_safe_base_cmd_delta = self.cfg.rew_beta_base_cmd * torch.square(base_cmd_delta_norm)
+        r_safe_base_heading = self.cfg.rew_beta_base_heading * compute_base_heading_penalty(
+            base_forward_world=doorway_state["base_forward_world"],
+            doorway_tangent_world=doorway_state["doorway_tangent_w"],
+        )
+        r_safe_base_corridor = self.cfg.rew_beta_base_corridor * torch.square(
+            doorway_state["base_corridor_excess"]
+        )
 
         r_safe = (
             r_safe_joint_vel
@@ -1203,8 +1257,11 @@ class DoorPushEnv(DirectRLEnv):
             + r_safe_cup_drop
             + r_safe_joint_move
             + r_safe_cup_door_prox
+            - r_safe_base_zero_speed
             + r_safe_base_speed
             + r_safe_base_cmd_delta
+            + r_safe_base_heading
+            + r_safe_base_corridor
         )
 
         reward_info["safe"] = r_safe
@@ -1213,8 +1270,11 @@ class DoorPushEnv(DirectRLEnv):
         reward_info["safe/cup_drop"] = r_safe_cup_drop
         reward_info["safe/joint_move"] = r_safe_joint_move
         reward_info["safe/cup_door_prox"] = r_safe_cup_door_prox
+        reward_info["safe/base_zero_speed"] = r_safe_base_zero_speed
         reward_info["safe/base_speed"] = r_safe_base_speed
         reward_info["safe/base_cmd_delta"] = r_safe_base_cmd_delta
+        reward_info["safe/base_heading"] = r_safe_base_heading
+        reward_info["safe/base_corridor"] = r_safe_base_corridor
 
         r_total = r_task + r_stab_left + r_stab_right - r_safe
         reward_info["total"] = r_total

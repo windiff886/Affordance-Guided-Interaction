@@ -1,10 +1,10 @@
 runtime:
   headless: true
-  device: cuda
+  device: cuda:0
   seed: 42
 
 policy:
-  checkpoint: /root/Affordance-Guided-Interaction/runs/rl_games/door_push_direct/2026-04-20_17-29-12/nn/last_door_push_direct_ep_763_rew__-1479.5917_.pth
+  checkpoint: /root/Affordance-Guided-Interaction/runs/rl_games/door_push_direct/2026-04-24_11-52-11/nn/last_door_push_direct_ep_5040_rew_-933.6197.pth
   deterministic: true
 
 rollout:

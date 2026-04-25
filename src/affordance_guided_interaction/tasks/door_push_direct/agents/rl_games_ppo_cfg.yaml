@@ -23,7 +23,7 @@ params:
           name: default
         sigma_init:
           name: const_initializer
-          val: 0
+          val: -2.0
         fixed_sigma: True
     mlp:
       units: [512, 256, 128]
@@ -57,12 +57,13 @@ params:
     learning_rate: 2.0e-4
     lr_schedule: adaptive
     kl_threshold: 0.008
+    adaptive_lr_max: 1.0e-3
     score_to_win: 100000000
     max_epochs: 4578
     save_best_after: 20
     save_frequency: 20
     grad_norm: 1.0
-    entropy_coef: 0.01
+    entropy_coef: 0.0
     truncate_grads: True
     e_clip: 0.2
     horizon_length: 16
@@ -80,6 +81,7 @@ params:
       lr_schedule: adaptive
       schedule_type: standard
       kl_threshold: 0.008
+      adaptive_lr_max: 1.0e-3
       clip_value: True
       normalize_input: True
       truncate_grads: True
