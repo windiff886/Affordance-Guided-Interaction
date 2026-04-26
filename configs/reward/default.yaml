@@ -15,13 +15,23 @@ task:
   w_base_align: 0.005        # 底盘朝推门方向对齐的弱 shaping 奖励
   w_base_forward: 25.0       # 底盘沿推门方向每米推进奖励
   w_base_centerline: 0.03    # 底盘靠近门洞中线的逐步 shaping 奖励
+  w_base_net_progress: 0.0   # 默认阶段不启用有符号底盘净推进，阶段调度中覆盖
   base_align_mid_angle_deg: 35.0       # 朝向平滑因子的 0.5 过渡角
   base_align_temperature_deg: 5.0      # 朝向 sigmoid 过渡宽度
   base_near_sigma: 0.8       # 朝向奖励的门附近高斯宽度 (m)
   base_range_tau: 0.05       # footprint 越界后的平滑衰减宽度 (m)
   base_centerline_sigma: 0.25 # 中线高斯宽度 (m)
+  hand_near_dist: 0.18       # 底盘协同奖励的手-门绝对距离 gate 中心 (m)
+  hand_near_tau: 0.05        # 手-门绝对距离 gate 平滑宽度 (m)
+  w_base_assist: 10.0        # 底盘-机械臂协同推进奖励权重
+  w_base_door_sync: 10.0     # 门角增加与底盘推进同步奖励权重
+  base_push_start_angle: 0.20 # 底盘协同推门开始角度 (rad)
+  base_push_end_angle: 1.00  # 底盘协同推门退出角度 (rad)
+  base_push_start_tau: 0.10  # 协同推门启动平滑宽度
+  base_push_end_tau: 0.15    # 协同推门退出平滑宽度
   w_base_cross: 50.0         # base_link 穿过门洞并继续向内推进的奖励权重
-  base_cross_open_gate: 1.2  # 门达到该角度后才激活穿门进度奖励
+  base_cross_open_gate: 0.80 # 平滑穿门门控中心角度 (rad)
+  base_cross_tau: 0.15       # 平滑穿门门控宽度
 
 # ── 稳定性奖励 (§5) ──────────────────────────────────────────────
 stability:
@@ -32,6 +42,10 @@ stability:
   w_acc: 0.040              # 线加速度惩罚系数
   w_ang: 0.0016             # 角加速度惩罚系数
   w_tilt: 3                # 重力倾斜惩罚系数
+  ee_lin_vel_free: 0.20      # 持杯末端世界线速度自由区 (m/s)
+  ee_ang_vel_free: 0.80      # 持杯末端世界角速度自由区 (rad/s)
+  w_ee_lin_vel: 10.0         # 持杯末端世界线速度 soft-cap 权重
+  w_ee_ang_vel: 5.0          # 持杯末端世界角速度 soft-cap 权重
 
 # ── 安全惩罚 (§6) ────────────────────────────────────────────────
 safety:
@@ -39,7 +53,8 @@ safety:
   beta_vel: 0.2              # 关节速度系数
   beta_target: 0.1            # 目标角边界带惩罚系数
   target_margin_ratio: 0.05   # 距离上下限 5% 范围内开始惩罚
-  beta_joint_move: 12.0       # 关节移动惩罚系数
+  beta_target_rate: 10.0      # 关节目标变化率惩罚系数
+  target_rate_free_l2: 0.0    # 目标变化 L2 自由区，阶段调度中覆盖
   beta_cup_door_prox: 10000.0    # 杯体-门板接近惩罚系数
   cup_door_prox_threshold: 0.20  # 杯体-门板距离阈值 (m)
   w_drop: 25.0               # 杯体脱落惩罚
@@ -49,3 +64,43 @@ safety:
   beta_base_cmd: 5.0         # 相邻步底盘命令跳变惩罚系数
   beta_base_heading: 2.0     # 底盘朝门框横向偏置惩罚系数
   beta_base_corridor: 1500.0 # 底盘越出门洞走廊惩罚系数
+
+# ── 单次运行自动阶段调度 ─────────────────────────────────────────
+# 由 DirectRLEnv 按 global_frames = common_step_counter * num_envs 自动切换。
+# 阶段 0 先放宽末端速度与 target-rate，让底盘学会配合推门；阶段 1 收紧持杯稳定性。
+stage_schedule:
+  enabled: true
+  stages:
+    - name: base_unlock
+      until_frames: 800000000
+      reward:
+        task:
+          w_base_net_progress: 30.0
+          w_base_assist: 30.0
+          w_base_door_sync: 30.0
+          hand_near_dist: 0.18
+          hand_near_tau: 0.05
+        stability:
+          ee_lin_vel_free: 0.35
+          ee_ang_vel_free: 1.20
+          w_ee_lin_vel: 3.0
+          w_ee_ang_vel: 1.5
+        safety:
+          beta_target_rate: 3.0
+          target_rate_free_l2: 0.35
+    - name: stabilize
+      reward:
+        task:
+          w_base_net_progress: 0.0
+          w_base_assist: 10.0
+          w_base_door_sync: 10.0
+          hand_near_dist: 0.18
+          hand_near_tau: 0.05
+        stability:
+          ee_lin_vel_free: 0.20
+          ee_ang_vel_free: 0.80
+          w_ee_lin_vel: 10.0
+          w_ee_ang_vel: 5.0
+        safety:
+          beta_target_rate: 10.0
+          target_rate_free_l2: 0.35

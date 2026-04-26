@@ -73,11 +73,17 @@ from .base_control_math import (
 from .door_reward_math import (
     compute_base_align_reward,
     compute_base_alignment_score,
+    compute_base_assist_reward,
     compute_base_corridor_excess,
+    compute_base_door_sync_reward,
+    compute_base_net_progress_reward,
     compute_base_range_score,
     compute_base_footprint_corners_door_frame,
     compute_base_heading_penalty,
+    compute_door_angle_cross_gate,
+    compute_door_angle_push_gate,
     compute_forward_progress_delta,
+    compute_hand_near_gate,
     compute_base_speed_penalty,
     compute_base_speed_squared,
     compute_base_zero_speed_reward,
@@ -87,7 +93,10 @@ from .door_reward_math import (
     compute_normalized_approach_score,
     compute_point_to_panel_face_distance,
     compute_point_to_segment_distance,
+    compute_soft_capped_velocity_penalty,
+    compute_signed_progress_delta,
     compute_signed_distance_to_plane,
+    compute_target_rate_penalty,
     update_crossing_latch,
 )
 from .doorway_geometry import (
@@ -131,6 +140,9 @@ _EPISODE_REWARD_KEYS = (
     "task/base_align",
     "task/base_forward",
     "task/base_centerline",
+    "task/base_net_progress",
+    "task/base_assist",
+    "task/base_door_sync",
     "task/base_cross",
     "stab_left",
     "stab_left/zero_acc",
@@ -138,16 +150,20 @@ _EPISODE_REWARD_KEYS = (
     "stab_left/acc",
     "stab_left/ang",
     "stab_left/tilt",
+    "stab_left/ee_lin_vel",
+    "stab_left/ee_ang_vel",
     "stab_right",
     "stab_right/zero_acc",
     "stab_right/zero_ang",
     "stab_right/acc",
     "stab_right/ang",
     "stab_right/tilt",
+    "stab_right/ee_lin_vel",
+    "stab_right/ee_ang_vel",
     "safe",
     "safe/joint_vel",
     "safe/target_limit",
-    "safe/joint_move",
+    "safe/target_rate",
     "safe/cup_door_prox",
     "safe/cup_drop",
     "safe/base_zero_speed",
@@ -156,6 +172,28 @@ _EPISODE_REWARD_KEYS = (
     "safe/base_heading",
     "safe/base_corridor",
     "total",
+)
+_EPISODE_STATE_SUM_KEYS = (
+    "base_push_progress_sum",
+    "base_net_progress_sum",
+    "base_inside_progress_sum",
+    "base_corridor_excess_sum",
+    "base_align_score_sum",
+    "base_range_score_sum",
+    "ee_left_speed_world_sum",
+    "ee_right_speed_world_sum",
+    "ee_left_ang_speed_world_sum",
+    "ee_right_ang_speed_world_sum",
+    "target_rate_l2_sum",
+    "target_rate_sq_sum",
+)
+_EPISODE_STATE_MAX_KEYS = (
+    "base_corridor_excess_max",
+    "ee_left_speed_world_max",
+    "ee_right_speed_world_max",
+    "ee_left_ang_speed_world_max",
+    "ee_right_ang_speed_world_max",
+    "target_rate_l2_max",
 )
 
 # 观测维度
@@ -233,6 +271,7 @@ class DoorPushEnv(DirectRLEnv):
 
         self._prev_joint_target = torch.zeros(N, 12, device=dev)
         self._prev_arm_joint_pos = torch.zeros(N, 12, device=dev)
+        self._cached_joint_target_delta = torch.zeros(N, 12, device=dev)
         self._prev_base_cmd = torch.zeros(N, 3, device=dev)
         self._left_occupied = torch.zeros(N, dtype=torch.bool, device=dev)
         self._right_occupied = torch.zeros(N, dtype=torch.bool, device=dev)
@@ -279,6 +318,10 @@ class DoorPushEnv(DirectRLEnv):
         self._cached_left_ee_aa = torch.zeros(N, 3, device=dev)
         self._cached_right_ee_la = torch.zeros(N, 3, device=dev)
         self._cached_right_ee_aa = torch.zeros(N, 3, device=dev)
+        self._cached_left_ee_lin_vel_w = torch.zeros(N, 3, device=dev)
+        self._cached_left_ee_ang_vel_w = torch.zeros(N, 3, device=dev)
+        self._cached_right_ee_lin_vel_w = torch.zeros(N, 3, device=dev)
+        self._cached_right_ee_ang_vel_w = torch.zeros(N, 3, device=dev)
         self._cached_left_tilt_perp = torch.zeros(N, 2, device=dev)
         self._cached_right_tilt_perp = torch.zeros(N, 2, device=dev)
         # L12: 每步在 _get_observations() 中缓存，供 _get_rewards/_get_dones 共用
@@ -291,18 +334,29 @@ class DoorPushEnv(DirectRLEnv):
         self._cached_doorway_corners_base = torch.zeros(N, 4, 3, device=dev)
         self._cached_base_signed_doorway_distance = torch.zeros(N, device=dev)
         self._prev_base_signed_doorway_distance = torch.full((N,), float("nan"), device=dev)
+        self._initial_base_signed_doorway_distance = torch.full((N,), float("nan"), device=dev)
         self._cached_base_in_doorway_opening = torch.zeros(N, dtype=torch.bool, device=dev)
         self._base_link_crossed = torch.zeros(N, dtype=torch.bool, device=dev)
         self._cached_episode_success = torch.zeros(N, dtype=torch.bool, device=dev)
         self._cached_approach_dist = torch.zeros(N, device=dev)
+        self._cached_left_approach_dist = torch.zeros(N, device=dev)
+        self._cached_right_approach_dist = torch.zeros(N, device=dev)
         self._cached_base_cmd_delta = torch.zeros(N, 3, device=dev)
         self._cached_base_force_cmd = torch.zeros(N, 3, device=dev)
         self._cached_base_torque_cmd = torch.zeros(N, 3, device=dev)
         self._cached_planar_joint_targets = torch.zeros(N, len(self._planar_joint_ids), device=dev)
         self._cached_wheel_saturation_ratio = torch.zeros(N, device=dev)
         self._initial_approach_dist = torch.full((N,), float("nan"), device=dev)
+        self._initial_left_approach_dist = torch.full((N,), float("nan"), device=dev)
+        self._initial_right_approach_dist = torch.full((N,), float("nan"), device=dev)
         self._episode_reward_sums = {
             key: torch.zeros(N, device=dev) for key in _EPISODE_REWARD_KEYS
+        }
+        self._episode_state_sums = {
+            key: torch.zeros(N, device=dev) for key in _EPISODE_STATE_SUM_KEYS
+        }
+        self._episode_state_max = {
+            key: torch.zeros(N, device=dev) for key in _EPISODE_STATE_MAX_KEYS
         }
         self._door_center_offset_local = torch.tensor(_DOOR_CENTER_OFFSET_LOCAL, device=dev, dtype=torch.float32)
         self._door_panel_face_center_offset_local = torch.tensor(
@@ -317,6 +371,59 @@ class DoorPushEnv(DirectRLEnv):
         self._doorway_plane_normal_local = torch.tensor([1.0, 0.0, 0.0], device=dev, dtype=torch.float32)
         self._left_cup_relative_xyz = torch.tensor(LEFT_CUP_RELATIVE_XYZ, device=dev, dtype=torch.float32)
         self._right_cup_relative_xyz = torch.tensor(RIGHT_CUP_RELATIVE_XYZ, device=dev, dtype=torch.float32)
+        self._initialize_reward_stage_schedule()
+
+    def _initialize_reward_stage_schedule(self) -> None:
+        schedule = getattr(self.cfg, "rew_stage_schedule", None)
+        stages = schedule.get("stages", []) if isinstance(schedule, dict) else []
+        self._reward_stage_schedule = schedule if isinstance(schedule, dict) else {"enabled": False, "stages": []}
+        self._reward_stage_active = bool(self._reward_stage_schedule.get("enabled", False) and stages)
+        self._reward_stage_index = -1
+        self._reward_stage_name = "default"
+        staged_attrs = {
+            attr
+            for stage in stages
+            if isinstance(stage, dict)
+            for attr in (stage.get("overrides", {}) or {})
+            if hasattr(self.cfg, attr)
+        }
+        self._reward_stage_base_values = {attr: getattr(self.cfg, attr) for attr in staged_attrs}
+        if self._reward_stage_active:
+            self._apply_reward_stage_schedule(force=True)
+
+    def _select_reward_stage_index(self) -> int:
+        stages = self._reward_stage_schedule.get("stages", [])
+        if not self._reward_stage_active or not stages:
+            return -1
+
+        step_counter = getattr(self, "common_step_counter", 0)
+        if isinstance(step_counter, torch.Tensor):
+            step_counter = int(step_counter.item())
+        global_frames = int(step_counter) * int(self.num_envs)
+        for index, stage in enumerate(stages):
+            until_frames = stage.get("until_frames")
+            if until_frames is None or global_frames < int(until_frames):
+                return index
+        return len(stages) - 1
+
+    def _apply_reward_stage_schedule(self, *, force: bool = False) -> None:
+        if not self._reward_stage_active:
+            return
+
+        stage_index = self._select_reward_stage_index()
+        if stage_index == self._reward_stage_index and not force:
+            return
+
+        stages = self._reward_stage_schedule.get("stages", [])
+        stage = stages[stage_index]
+        for attr, value in self._reward_stage_base_values.items():
+            setattr(self.cfg, attr, value)
+        for attr, value in (stage.get("overrides", {}) or {}).items():
+            if hasattr(self.cfg, attr):
+                setattr(self.cfg, attr, float(value))
+
+        self._reward_stage_index = int(stage_index)
+        self._reward_stage_name = str(stage.get("name", f"stage_{stage_index}"))
 
     def _initialize_base_controller_backend(self) -> None:
         """Configure the selected mobile-base backend."""
@@ -700,6 +807,7 @@ class DoorPushEnv(DirectRLEnv):
         self._set_gripper_hold_targets()
 
         # 5. 缓存最终目标，供下一步 obs 和边界惩罚使用
+        self._cached_joint_target_delta = q_target_cmd - self._prev_joint_target
         self._prev_joint_target = q_target_cmd.clone()
         self._prev_base_cmd = base_cmd.clone()
 
@@ -796,6 +904,11 @@ class DoorPushEnv(DirectRLEnv):
             base_quat,
         )
 
+        self._cached_left_ee_lin_vel_w = left_ee_lv_w.clone()
+        self._cached_left_ee_ang_vel_w = left_ee_av_w.clone()
+        self._cached_right_ee_lin_vel_w = right_ee_lv_w.clone()
+        self._cached_right_ee_ang_vel_w = right_ee_av_w.clone()
+
         # 更新速度缓存
         self._prev_left_ee_lin_vel_w = left_ee_lv_w.clone()
         self._prev_left_ee_ang_vel_w = left_ee_av_w.clone()
@@ -879,6 +992,12 @@ class DoorPushEnv(DirectRLEnv):
         self._cached_doorway_corners_base = doorway_corners_base.clone()
         self._cached_base_signed_doorway_distance = doorway_state["base_signed_distance"].clone()
         self._cached_base_in_doorway_opening = doorway_state["base_in_opening"].clone()
+        base_dist_uninitialized = torch.isnan(self._initial_base_signed_doorway_distance)
+        self._initial_base_signed_doorway_distance = torch.where(
+            base_dist_uninitialized,
+            doorway_state["base_signed_distance"],
+            self._initial_base_signed_doorway_distance,
+        )
         self._prev_base_signed_doorway_distance = torch.where(
             torch.isnan(self._prev_base_signed_doorway_distance),
             doorway_state["base_signed_distance"],
@@ -898,6 +1017,8 @@ class DoorPushEnv(DirectRLEnv):
             half_extent_y=_DOOR_PANEL_HALF_EXTENT_Y,
             half_extent_z=_DOOR_PANEL_HALF_EXTENT_Z,
         )
+        self._cached_left_approach_dist = left_approach_dist.clone()
+        self._cached_right_approach_dist = right_approach_dist.clone()
         current_approach_dist = torch.minimum(left_approach_dist, right_approach_dist)
         self._cached_approach_dist = current_approach_dist.clone()
         uninitialized = torch.isnan(self._initial_approach_dist)
@@ -905,6 +1026,18 @@ class DoorPushEnv(DirectRLEnv):
             uninitialized,
             current_approach_dist,
             self._initial_approach_dist,
+        )
+        left_uninitialized = torch.isnan(self._initial_left_approach_dist)
+        self._initial_left_approach_dist = torch.where(
+            left_uninitialized,
+            left_approach_dist,
+            self._initial_left_approach_dist,
+        )
+        right_uninitialized = torch.isnan(self._initial_right_approach_dist)
+        self._initial_right_approach_dist = torch.where(
+            right_uninitialized,
+            right_approach_dist,
+            self._initial_right_approach_dist,
         )
 
         door_geometry = torch.cat([door_center_base, door_normal_base], dim=-1)  # (N, 6)
@@ -988,6 +1121,8 @@ class DoorPushEnv(DirectRLEnv):
 
     def _get_rewards(self) -> Tensor:
         """批量计算完整奖励，并在回合完成时输出聚合后的 TensorBoard 分项信息。"""
+        self._apply_reward_stage_schedule()
+
         robot: Articulation = self.scene["robot"]
         door: Articulation = self.scene["door"]
         theta = door.data.joint_pos[:, 0]   # (N,)
@@ -1022,6 +1157,27 @@ class DoorPushEnv(DirectRLEnv):
             * self.cfg.rew_w_approach
             * r_task_approach_raw
         )
+        left_approach_score = self._compute_normalized_approach_score(
+            current_dist=self._cached_left_approach_dist,
+            initial_dist=self._initial_left_approach_dist,
+            eps=self.cfg.rew_approach_eps,
+        )
+        right_approach_score = self._compute_normalized_approach_score(
+            current_dist=self._cached_right_approach_dist,
+            initial_dist=self._initial_right_approach_dist,
+            eps=self.cfg.rew_approach_eps,
+        )
+        left_hand_near_score = compute_hand_near_gate(
+            hand_dist=self._cached_left_approach_dist,
+            near_dist=self.cfg.rew_hand_near_dist,
+            tau=self.cfg.rew_hand_near_tau,
+        )
+        right_hand_near_score = compute_hand_near_gate(
+            hand_dist=self._cached_right_approach_dist,
+            near_dist=self.cfg.rew_hand_near_dist,
+            tau=self.cfg.rew_hand_near_tau,
+        )
+        hand_near_score = torch.maximum(left_hand_near_score, right_hand_near_score)
         self._already_succeeded = self._already_succeeded | newly_succeeded
 
         door_root_pos_w = door.data.root_pos_w
@@ -1066,11 +1222,21 @@ class DoorPushEnv(DirectRLEnv):
             previous_signed_distance=prev_base_signed_distance,
             current_signed_distance=current_base_signed_distance,
         )
+        base_signed_progress_delta = compute_signed_progress_delta(
+            previous_signed_distance=prev_base_signed_distance,
+            current_signed_distance=current_base_signed_distance,
+        )
         r_task_base_forward = (
             self.cfg.rew_w_base_forward
             * base_align_score
             * base_range_score
             * base_forward_delta
+        )
+        r_task_base_net_progress = compute_base_net_progress_reward(
+            align_score=base_align_score,
+            range_score=base_range_score,
+            signed_progress=base_signed_progress_delta,
+            weight=self.cfg.rew_w_base_net_progress,
         )
         base_centerline_score = torch.exp(
             -0.5
@@ -1085,15 +1251,42 @@ class DoorPushEnv(DirectRLEnv):
             * base_range_score
             * base_centerline_score
         )
+        base_push_gate = compute_door_angle_push_gate(
+            door_angle=theta,
+            start_angle=self.cfg.rew_base_push_start_angle,
+            end_angle=self.cfg.rew_base_push_end_angle,
+            start_tau=self.cfg.rew_base_push_start_tau,
+            end_tau=self.cfg.rew_base_push_end_tau,
+        )
+        r_task_base_assist = compute_base_assist_reward(
+            align_score=base_align_score,
+            range_score=base_range_score,
+            hand_score=hand_near_score,
+            push_gate=base_push_gate,
+            base_push_progress=base_forward_delta,
+            weight=self.cfg.rew_w_base_assist,
+        )
+        r_task_base_door_sync = compute_base_door_sync_reward(
+            align_score=base_align_score,
+            range_score=base_range_score,
+            door_delta=delta,
+            base_push_progress=base_forward_delta,
+            weight=self.cfg.rew_w_base_door_sync,
+        )
         base_inside_progress = compute_inside_progress_delta(
             previous_signed_distance=prev_base_signed_distance,
             current_signed_distance=current_base_signed_distance,
             in_opening=torch.ones_like(doorway_state["base_in_opening"], dtype=torch.bool),
         )
+        base_cross_gate = compute_door_angle_cross_gate(
+            door_angle=theta,
+            cross_angle=self.cfg.rew_base_cross_open_gate,
+            tau=self.cfg.rew_base_cross_tau,
+        )
         r_task_base_cross = (
             base_align_score
             * base_range_score
-            * (theta >= self.cfg.rew_base_cross_open_gate).float()
+            * base_cross_gate
             * self.cfg.rew_w_base_cross
             * base_inside_progress
         )
@@ -1123,6 +1316,9 @@ class DoorPushEnv(DirectRLEnv):
             + r_task_base_align
             + r_task_base_forward
             + r_task_base_centerline
+            + r_task_base_net_progress
+            + r_task_base_assist
+            + r_task_base_door_sync
             + r_task_base_cross
         )
 
@@ -1134,6 +1330,9 @@ class DoorPushEnv(DirectRLEnv):
         reward_info["task/base_align"] = r_task_base_align
         reward_info["task/base_forward"] = r_task_base_forward
         reward_info["task/base_centerline"] = r_task_base_centerline
+        reward_info["task/base_net_progress"] = r_task_base_net_progress
+        reward_info["task/base_assist"] = r_task_base_assist
+        reward_info["task/base_door_sync"] = r_task_base_door_sync
         reward_info["task/base_cross"] = r_task_base_cross
 
         # ══════════════════════════════════════════════════════════════
@@ -1145,11 +1344,13 @@ class DoorPushEnv(DirectRLEnv):
         r_stab_left = torch.zeros(self.num_envs, device=self.device)
         r_stab_right = torch.zeros(self.num_envs, device=self.device)
 
-        for side_name, m, la, aa, tilt_perp in [
+        for side_name, m, la, aa, tilt_perp, ee_lv_w, ee_av_w in [
             ("left", m_l, self._cached_left_ee_la, self._cached_left_ee_aa,
-             self._cached_left_tilt_perp),
+             self._cached_left_tilt_perp, self._cached_left_ee_lin_vel_w,
+             self._cached_left_ee_ang_vel_w),
             ("right", m_r, self._cached_right_ee_la, self._cached_right_ee_aa,
-             self._cached_right_tilt_perp),
+             self._cached_right_tilt_perp, self._cached_right_ee_lin_vel_w,
+             self._cached_right_ee_ang_vel_w),
         ]:
             la_sq = (la * la).sum(-1)
             aa_sq = (aa * aa).sum(-1)
@@ -1165,6 +1366,18 @@ class DoorPushEnv(DirectRLEnv):
                 "acc": m * (-self.cfg.rew_w_acc * la_sq),
                 "ang": m * (-self.cfg.rew_w_ang * aa_sq),
                 "tilt": m * (-self.cfg.rew_w_tilt * tilt_sq),
+                "ee_lin_vel": compute_soft_capped_velocity_penalty(
+                    velocity=ee_lv_w,
+                    occupied=m.bool(),
+                    free_speed=self.cfg.rew_ee_lin_vel_free,
+                    weight=self.cfg.rew_w_ee_lin_vel,
+                ),
+                "ee_ang_vel": compute_soft_capped_velocity_penalty(
+                    velocity=ee_av_w,
+                    occupied=m.bool(),
+                    free_speed=self.cfg.rew_ee_ang_vel_free,
+                    weight=self.cfg.rew_w_ee_ang_vel,
+                ),
             }
             r_stab_side = sum(side_terms.values())
             reward_info[f"stab_{side_name}"] = r_stab_side
@@ -1206,9 +1419,13 @@ class DoorPushEnv(DirectRLEnv):
 
         r_safe_cup_drop = cup_dropped.float() * self.cfg.rew_w_drop
 
-        # 关节移动惩罚：惩罚相邻步的关节角变化量
-        arm_joint_pos = robot.data.joint_pos[:, self._arm_joint_ids]  # (N, 12)
-        r_safe_joint_move = self.cfg.rew_beta_joint_move * ((arm_joint_pos - self._prev_arm_joint_pos) ** 2).sum(-1)
+        # 关节目标变化率惩罚：约束策略写入 PD 的最终目标变化
+        r_safe_target_rate = compute_target_rate_penalty(
+            current_target=self._prev_joint_target,
+            previous_target=self._prev_joint_target - self._cached_joint_target_delta,
+            beta=self.cfg.rew_beta_target_rate,
+            free_l2=self.cfg.rew_target_rate_free_l2,
+        )
 
         # 杯体-门板接近惩罚：只对持杯侧生效
         cup_left: RigidObject = self.scene["cup_left"]
@@ -1274,7 +1491,7 @@ class DoorPushEnv(DirectRLEnv):
             r_safe_joint_vel
             + r_safe_target_limit
             + r_safe_cup_drop
-            + r_safe_joint_move
+            + r_safe_target_rate
             + r_safe_cup_door_prox
             - r_safe_base_zero_speed
             + r_safe_base_speed
@@ -1287,7 +1504,7 @@ class DoorPushEnv(DirectRLEnv):
         reward_info["safe/joint_vel"] = r_safe_joint_vel
         reward_info["safe/target_limit"] = r_safe_target_limit
         reward_info["safe/cup_drop"] = r_safe_cup_drop
-        reward_info["safe/joint_move"] = r_safe_joint_move
+        reward_info["safe/target_rate"] = r_safe_target_rate
         reward_info["safe/cup_door_prox"] = r_safe_cup_door_prox
         reward_info["safe/base_zero_speed"] = r_safe_base_zero_speed
         reward_info["safe/base_speed"] = r_safe_base_speed
@@ -1300,20 +1517,143 @@ class DoorPushEnv(DirectRLEnv):
         for key, value in reward_info.items():
             self._episode_reward_sums[key] += value
 
+        target_rate_l2 = self._cached_joint_target_delta.norm(dim=-1)
+        target_rate_sq = torch.square(self._cached_joint_target_delta).sum(dim=-1)
+        left_ee_speed_world = self._cached_left_ee_lin_vel_w.norm(dim=-1)
+        right_ee_speed_world = self._cached_right_ee_lin_vel_w.norm(dim=-1)
+        left_ee_ang_speed_world = self._cached_left_ee_ang_vel_w.norm(dim=-1)
+        right_ee_ang_speed_world = self._cached_right_ee_ang_vel_w.norm(dim=-1)
+
+        self._episode_state_sums["base_push_progress_sum"] += base_forward_delta
+        self._episode_state_sums["base_net_progress_sum"] += base_signed_progress_delta
+        self._episode_state_sums["base_inside_progress_sum"] += base_inside_progress
+        self._episode_state_sums["base_corridor_excess_sum"] += doorway_state["base_corridor_excess"]
+        self._episode_state_sums["base_align_score_sum"] += base_align_score
+        self._episode_state_sums["base_range_score_sum"] += base_range_score
+        self._episode_state_sums["ee_left_speed_world_sum"] += m_l * left_ee_speed_world
+        self._episode_state_sums["ee_right_speed_world_sum"] += m_r * right_ee_speed_world
+        self._episode_state_sums["ee_left_ang_speed_world_sum"] += m_l * left_ee_ang_speed_world
+        self._episode_state_sums["ee_right_ang_speed_world_sum"] += m_r * right_ee_ang_speed_world
+        self._episode_state_sums["target_rate_l2_sum"] += target_rate_l2
+        self._episode_state_sums["target_rate_sq_sum"] += target_rate_sq
+
+        self._episode_state_max["base_corridor_excess_max"] = torch.maximum(
+            self._episode_state_max["base_corridor_excess_max"],
+            doorway_state["base_corridor_excess"],
+        )
+        self._episode_state_max["ee_left_speed_world_max"] = torch.maximum(
+            self._episode_state_max["ee_left_speed_world_max"],
+            m_l * left_ee_speed_world,
+        )
+        self._episode_state_max["ee_right_speed_world_max"] = torch.maximum(
+            self._episode_state_max["ee_right_speed_world_max"],
+            m_r * right_ee_speed_world,
+        )
+        self._episode_state_max["ee_left_ang_speed_world_max"] = torch.maximum(
+            self._episode_state_max["ee_left_ang_speed_world_max"],
+            m_l * left_ee_ang_speed_world,
+        )
+        self._episode_state_max["ee_right_ang_speed_world_max"] = torch.maximum(
+            self._episode_state_max["ee_right_ang_speed_world_max"],
+            m_r * right_ee_ang_speed_world,
+        )
+        self._episode_state_max["target_rate_l2_max"] = torch.maximum(
+            self._episode_state_max["target_rate_l2_max"],
+            target_rate_l2,
+        )
+
         door_open_met = theta >= self.cfg.door_angle_target
         truncated = (self._step_count + 1) >= self.max_episode_length
         done_mask = cup_dropped | success | truncated
         if done_mask.any():
             done_env_ids = done_mask.nonzero(as_tuple=False).squeeze(-1)
+            episode_lengths = (self._step_count[done_env_ids] + 1).to(dtype=torch.float32).clamp(min=1.0)
+            nan_state = torch.full_like(episode_lengths, float("nan"))
+            left_done = self._left_occupied[done_env_ids]
+            right_done = self._right_occupied[done_env_ids]
+            episode_state_info = {
+                "base_signed_distance_final": current_base_signed_distance[done_env_ids].clone(),
+                "base_signed_distance_delta": (
+                    self._initial_base_signed_doorway_distance[done_env_ids]
+                    - current_base_signed_distance[done_env_ids]
+                ).clone(),
+                "base_push_progress_sum": self._episode_state_sums["base_push_progress_sum"][done_env_ids].clone(),
+                "base_net_progress_sum": self._episode_state_sums["base_net_progress_sum"][done_env_ids].clone(),
+                "base_inside_progress_sum": self._episode_state_sums["base_inside_progress_sum"][done_env_ids].clone(),
+                "base_corridor_excess_mean": (
+                    self._episode_state_sums["base_corridor_excess_sum"][done_env_ids] / episode_lengths
+                ).clone(),
+                "base_corridor_excess_max": self._episode_state_max["base_corridor_excess_max"][done_env_ids].clone(),
+                "base_align_score_mean": (
+                    self._episode_state_sums["base_align_score_sum"][done_env_ids] / episode_lengths
+                ).clone(),
+                "base_range_score_mean": (
+                    self._episode_state_sums["base_range_score_sum"][done_env_ids] / episode_lengths
+                ).clone(),
+                "ee_left_speed_world_mean": torch.where(
+                    left_done,
+                    self._episode_state_sums["ee_left_speed_world_sum"][done_env_ids] / episode_lengths,
+                    nan_state,
+                ).clone(),
+                "ee_right_speed_world_mean": torch.where(
+                    right_done,
+                    self._episode_state_sums["ee_right_speed_world_sum"][done_env_ids] / episode_lengths,
+                    nan_state,
+                ).clone(),
+                "ee_left_speed_world_max": torch.where(
+                    left_done,
+                    self._episode_state_max["ee_left_speed_world_max"][done_env_ids],
+                    nan_state,
+                ).clone(),
+                "ee_right_speed_world_max": torch.where(
+                    right_done,
+                    self._episode_state_max["ee_right_speed_world_max"][done_env_ids],
+                    nan_state,
+                ).clone(),
+                "ee_left_ang_speed_world_mean": torch.where(
+                    left_done,
+                    self._episode_state_sums["ee_left_ang_speed_world_sum"][done_env_ids] / episode_lengths,
+                    nan_state,
+                ).clone(),
+                "ee_right_ang_speed_world_mean": torch.where(
+                    right_done,
+                    self._episode_state_sums["ee_right_ang_speed_world_sum"][done_env_ids] / episode_lengths,
+                    nan_state,
+                ).clone(),
+                "ee_left_ang_speed_world_max": torch.where(
+                    left_done,
+                    self._episode_state_max["ee_left_ang_speed_world_max"][done_env_ids],
+                    nan_state,
+                ).clone(),
+                "ee_right_ang_speed_world_max": torch.where(
+                    right_done,
+                    self._episode_state_max["ee_right_ang_speed_world_max"][done_env_ids],
+                    nan_state,
+                ).clone(),
+                "target_rate_l2_mean": (
+                    self._episode_state_sums["target_rate_l2_sum"][done_env_ids] / episode_lengths
+                ).clone(),
+                "target_rate_l2_max": self._episode_state_max["target_rate_l2_max"][done_env_ids].clone(),
+                "target_rate_sq_sum": self._episode_state_sums["target_rate_sq_sum"][done_env_ids].clone(),
+            }
             self.extras["episode_reward_info"] = {
                 key: value[done_env_ids].clone() for key, value in self._episode_reward_sums.items()
             }
+            self.extras["episode_state_info"] = episode_state_info
+            self.extras["reward_stage_index"] = torch.full(
+                (done_env_ids.numel(),),
+                float(self._reward_stage_index),
+                device=self.device,
+            )
             self.extras["success"] = success[done_env_ids].clone()
             self.extras["episode_left_occupied"] = self._left_occupied[done_env_ids].clone()
             self.extras["episode_right_occupied"] = self._right_occupied[done_env_ids].clone()
             self.extras["door_angle"] = theta[done_env_ids].clone()
             self.extras["base_crossed"] = self._base_link_crossed[done_env_ids].clone()
             self.extras["door_open_met"] = door_open_met[done_env_ids].clone()
+            self.extras["door_open_but_not_crossed"] = (
+                door_open_met & ~self._base_link_crossed
+            )[done_env_ids].clone()
             self.extras["fail_cup_drop"] = cup_dropped[done_env_ids].clone()
             self.extras["fail_timeout"] = (truncated & ~cup_dropped & ~success)[done_env_ids].clone()
             self.extras["fail_not_crossed"] = (
@@ -1466,30 +1806,45 @@ class DoorPushEnv(DirectRLEnv):
         # ── 7. 重置 per-env 状态 ────────────────────────────────
         self._step_count[env_ids] = 0
         self._prev_door_angle[env_ids] = 0.0
-        self._prev_joint_target[env_ids] = 0.0
-        self._prev_arm_joint_pos[env_ids] = 0.0
+        current_arm_pos = robot.data.joint_pos[env_ids][:, self._arm_joint_ids].clone()
+        self._prev_joint_target[env_ids] = current_arm_pos
+        self._prev_arm_joint_pos[env_ids] = current_arm_pos
+        self._cached_joint_target_delta[env_ids] = 0.0
         self._prev_base_cmd[env_ids] = 0.0
         self._already_succeeded[env_ids] = False
         self._prev_left_ee_lin_vel_w[env_ids] = 0.0
         self._prev_left_ee_ang_vel_w[env_ids] = 0.0
         self._prev_right_ee_lin_vel_w[env_ids] = 0.0
         self._prev_right_ee_ang_vel_w[env_ids] = 0.0
+        self._cached_left_ee_lin_vel_w[env_ids] = 0.0
+        self._cached_left_ee_ang_vel_w[env_ids] = 0.0
+        self._cached_right_ee_lin_vel_w[env_ids] = 0.0
+        self._cached_right_ee_ang_vel_w[env_ids] = 0.0
         self._cached_cup_dropped[env_ids] = False
         self._cached_doorway_corners_world[env_ids] = 0.0
         self._cached_doorway_corners_base[env_ids] = 0.0
         self._cached_base_signed_doorway_distance[env_ids] = 0.0
         self._prev_base_signed_doorway_distance[env_ids] = float("nan")
+        self._initial_base_signed_doorway_distance[env_ids] = float("nan")
         self._cached_base_in_doorway_opening[env_ids] = False
         self._base_link_crossed[env_ids] = False
         self._cached_episode_success[env_ids] = False
         self._cached_approach_dist[env_ids] = 0.0
+        self._cached_left_approach_dist[env_ids] = 0.0
+        self._cached_right_approach_dist[env_ids] = 0.0
         self._cached_base_cmd_delta[env_ids] = 0.0
         self._cached_base_force_cmd[env_ids] = 0.0
         self._cached_base_torque_cmd[env_ids] = 0.0
         self._cached_planar_joint_targets[env_ids] = 0.0
         self._cached_wheel_saturation_ratio[env_ids] = 0.0
         self._initial_approach_dist[env_ids] = float("nan")
+        self._initial_left_approach_dist[env_ids] = float("nan")
+        self._initial_right_approach_dist[env_ids] = float("nan")
         for value in self._episode_reward_sums.values():
+            value[env_ids] = 0.0
+        for value in self._episode_state_sums.values():
+            value[env_ids] = 0.0
+        for value in self._episode_state_max.values():
             value[env_ids] = 0.0
 
         robot.instantaneous_wrench_composer.reset(env_ids)

@@ -713,7 +713,17 @@ r_t^{\text{open}}
 +
 r_t^{\text{approach}}
 +
-r_t^{\text{base\_approach}}
+r_t^{\text{base\_align}}
++
+r_t^{\text{base\_forward}}
++
+r_t^{\text{base\_centerline}}
++
+r_t^{\text{base\_net}}
++
+r_t^{\text{base\_assist}}
++
+r_t^{\text{base\_door\_sync}}
 +
 r_t^{\text{base\_cross}}.
 $$
@@ -733,6 +743,10 @@ r_t^{\text{acc},k}
 r_t^{\text{ang},k}
 -
 r_t^{\text{tilt},k}
++
+r_t^{\text{ee\_lin\_vel},k}
++
+r_t^{\text{ee\_ang\_vel},k}
 \Big),
 $$
 
@@ -747,7 +761,7 @@ r_t^{\text{vel}}
 +
 r_t^{\text{target}}
 +
-r_t^{\text{joint\_move}}
+r_t^{\text{target\_rate}}
 +
 r_t^{\text{cup\_door\_prox}}
 +
@@ -766,6 +780,14 @@ $$
 
 这里底盘速度约束被拆成两个可单独记录的子项：一个是鼓励低速静稳的 `base_zero_speed`，一个是直接惩罚速度平方和的 `base_speed`。这样后续在 TensorBoard 里可以分别观察“底盘有没有获得零速度偏好奖励”和“底盘是否因为速度过大被罚”。同时，本文不再额外保留独立的 `base_motion` 项，以避免和这两个速度项在功能上重复。
 这里最后 2 项底盘几何约束在语义上仍然属于 `safe/*`，所以本文直接把它们并入安全模块统一描述；当前代码若尚未实现这些项，只意味着它们当前不会出现在训练日志里，不改变它们在奖励设计中的位置。
+
+当前默认配置启用了单次运行自动阶段调度。`scripts/train.py` 把 `configs/reward/default.yaml` 中的 `reward.stage_schedule` 编译为 `DoorPushEnvCfg.rew_stage_schedule`，`DirectRLEnv` 内部按
+
+$$
+F_t=\texttt{common\_step\_counter}_t\cdot N
+$$
+
+选择当前阶段并覆盖对应 `rew_*` 参数。阶段 0 `base_unlock` 持续到 `800000000` frames，放松 target-rate 与末端世界速度约束，并强化底盘净推进；阶段 1 `stabilize` 持续到训练结束，恢复强末端世界速度约束。整个流程由一次 `python scripts/train.py` 完成，不需要手动停止和 resume。
 
 #### 3.4.2 任务模块
 
@@ -1016,7 +1038,71 @@ g_t^{\text{range}}
 s_t^{\text{center}}.
 $$
 
-8. `task/base_cross`
+8. `task/base_net_progress`
+
+`base_forward` 只奖励正向小步前进，不能惩罚之后退回去的行为。因此额外定义有符号净推进量：
+
+$$
+\Delta_t^{\text{base\_net}}
+=
+\delta_{t-1}^{\text{plane}}-\delta_t^{\text{plane}}.
+$$
+
+这里不取正部；若底盘远离门洞，$\Delta_t^{\text{base\_net}}<0$。对应奖励为：
+
+$$
+r_t^{\text{base\_net}}
+=
+w_{\text{base\_net}}
+\cdot
+g_t^{\text{align}}
+\cdot
+g_t^{\text{range}}
+\cdot
+\Delta_t^{\text{base\_net}}.
+$$
+
+当前默认基础值 `w_base_net_progress=0`，在 `base_unlock` 阶段覆盖为 `30.0`。
+
+9. `task/base_assist` 与 `task/base_door_sync`
+
+底盘协同奖励只在手真正靠近门面时激活。对左右末端分别计算到门面的绝对距离 $d_{t}^{L}, d_t^R$，定义：
+
+$$
+g_t^{\text{hand}}
+=
+\max_{k\in\{L,R\}}
+\sigma\left(
+\frac{d_{\text{near}}-d_t^k}{\tau_{\text{hand}}}
+\right).
+$$
+
+然后：
+
+$$
+r_t^{\text{base\_assist}}
+=
+w_{\text{base\_assist}}
+g_t^{\text{align}}
+g_t^{\text{range}}
+g_t^{\text{hand}}
+g_t^{\text{push}}
+\Delta_t^{\text{base\_forward}},
+$$
+
+$$
+r_t^{\text{base\_door\_sync}}
+=
+w_{\text{base\_door\_sync}}
+g_t^{\text{align}}
+g_t^{\text{range}}
+\max(\theta_t-\theta_{t-1},0)
+\Delta_t^{\text{base\_forward}}.
+$$
+
+其中 $g_t^{\text{push}}$ 是门角位于中段推门区间时的平滑 gate。当前 `base_unlock` 阶段把 `w_base_assist` 与 `w_base_door_sync` 覆盖为 `30.0`，`stabilize` 阶段恢复为 `10.0`。
+
+10. `task/base_cross`
 
 这项奖励底盘在门洞内侧半空间中的有效推进量。定义：
 
@@ -1174,16 +1260,23 @@ r_t^{\text{target}}
 \left(\frac{e_{t,j}^{\text{target}}}{m_j}\right)^2.
 $$
 
-3. `safe/joint_move`
+3. `safe/target_rate`
 
-相邻控制步之间的关节运动变化量被直接二次惩罚：
+该项惩罚最终写入 PD 控制器的关节目标变化，而不是直接惩罚真实关节位移。当前实现使用 L2 free-zone soft-cap：
 
 $$
-r_t^{\text{joint\_move}}
+r_t^{\text{target\_rate}}
 =
-\beta_{\text{joint\_move}}
-\sum_{j=1}^{12}(q_{t,j}-q_{t-1,j})^2.
+\beta_{\Delta q^\star}
+\left[
+\left\|
+\tilde q_t^\star-\tilde q_{t-1}^\star
+\right\|_2
+-q_{\text{free}}^\star
+\right]_+^2.
 $$
+
+`base_unlock` 阶段使用 `beta_target_rate=3.0`、`target_rate_free_l2=0.35`；`stabilize` 阶段使用 `beta_target_rate=10.0`、`target_rate_free_l2=0.35`。
 
 4. `safe/cup_door_prox`
 
@@ -1388,6 +1481,8 @@ $$
 | `task/base_align` | 参考底盘在门附近对齐 `900` 步，平均平滑因子乘积约 `1.0`。 | 若希望它只是弱 shaping，则 $R\approx900w_{\text{base\_align}}$ 控制在 `5~10`，故 $w_{\text{base\_align}}\approx0.005~0.01$。 | 当前默认 `w_base_align=0.005`。它只帮助底盘转向推门方向，不应压过推进奖励。 |
 | `task/base_forward` | 参考底盘沿推门方向有效推进 `0.4 m`。 | 有 $R\approx w_{\text{base\_forward}}\cdot0.4$，故 $w_{\text{base\_forward}}^\star\approx25$。 | 当前默认 `w_base_forward=25`。这一项替代旧 `base_approach`，作为持续推进 shaping。 |
 | `task/base_centerline` | 参考底盘在中线附近保持 `900` 步，平均平滑因子乘积约 `1.0`。 | 有 $R\approx900w_{\text{base\_centerline}}$，若取 `0.03` 理论最大约 `27`，实际会被朝向和范围因子衰减。 | 当前默认 `w_base_centerline=0.03`。若出现站中线不动，应降到 `0.01`。 |
+| `task/base_net_progress` | 参考阶段 1 中底盘需要形成 `0.3 m` 左右 episode 净推进。 | 有 $R\approx w_{\text{base\_net}}\cdot0.3$，故 $w_{\text{base\_net}}^\star\approx 33$。 | `base_unlock` 阶段使用 `w_base_net_progress=30`，基础值为 `0`，用于专门打破“局部前进但 episode 净后退”的行为。 |
+| `task/base_assist` / `task/base_door_sync` | 参考协同推门阶段内，底盘正向进度约 `0.3 m`，且 hand/align/range/push gate 均值乘积约 `0.3~0.5`。 | 若希望累计贡献达到 `O(10)`，需要 $w\approx10/(0.3\cdot0.3\sim0.5)\approx 20~35$。 | `base_unlock` 阶段使用 `30`，`stabilize` 阶段恢复 `10`。 |
 | `task/base_cross` | 参考底盘在门洞内有效向前推进 `0.20 m`。 | 有 $R\approx w_{\text{base\_cross}}\cdot 0.20$，故 $w_{\text{base\_cross}}^\star\approx 50$。 | 建议 `w_base_cross≈40~60`。这一项应该代表“真正的穿门进度”，但在 `O(10)` 标尺下不需要到 `10^3` 量级。 |
 | `stab/zero_acc` | 持杯侧在 `300` 步内保持较稳，参考 $\|a_t\|\approx 0.25$，并希望该处仍保留约 `0.6` 倍零加速度奖励；取 $\lambda_{\text{acc}}=8$ 时，$e^{-8\cdot0.25^2}=e^{-0.5}\approx0.607$。 | 有 $R\approx 300\cdot w_{\text{zero-acc}}\cdot 0.607$，故 $w_{\text{zero-acc}}^\star\approx 10/(300\cdot0.607)\approx0.055$。 | 建议 `w_zero_acc≈0.055`、`lambda_acc≈8`。相比旧参考 $\|a\|\approx0.35$，现在更早衰减零加速度奖励。 |
 | `stab/zero_ang` | 参考持杯侧在 `300` 步内保持较小角加速度，令 $\|\alpha_t\|\approx 0.45$，并希望该处保留约 `0.5~0.6` 倍零角加速度奖励；取 $\lambda_{\text{ang}}=3$ 时，$e^{-3\cdot0.45^2}\approx0.545$。 | 有 $R\approx 300\cdot w_{\text{zero-ang}}\cdot 0.545$，故 $w_{\text{zero-ang}}^\star\approx 10/(300\cdot0.545)\approx0.061$。 | 建议 `w_zero_ang≈0.06`、`lambda_ang≈3`。相比旧参考 $\|\alpha\|\approx0.7$，现在更严格地压制角加速度。 |
@@ -1396,7 +1491,7 @@ $$
 | `stab/tilt` | 参考持杯侧在 `300` 步内平均 tilt proxy 为 $\|u_t\|\approx 0.10$。 | 有 $R\approx 300\cdot w_{\text{tilt}}\cdot 0.01$，故 $w_{\text{tilt}}^\star\approx 3.33$。 | 建议 `w_tilt≈3.0~3.5`。这一项直接约束杯体姿态，通常应是稳定性模块里最强的单项之一。 |
 | `safe/joint_vel` | 参考 `100` 步内有 `3` 个关节持续明显超限，降低速度期望后令平均超限量各为 `0.4`，则 $\sum_j(e_{t,j}^{\text{vel}})^2\approx3\times0.4^2=0.48$。 | 有 $R\approx100\cdot\beta_{\text{vel}}\cdot0.48$，故 $\beta_{\text{vel}}^\star\approx10/48\approx0.208$。 | 建议 `mu≈0.75`、`beta_vel≈0.20`。`mu` 让惩罚从更低速度比例开始，`beta_vel` 让同样的超限更痛。 |
 | `safe/target_limit` | 参考 `100` 步内有 `4` 个关节进入边界带一半深度，即 $\left(e_{t,j}^{\text{target}}/m_j\right)^2\approx 0.25$，总和约 `1.0`。 | 有 $R\approx 100\cdot \beta_{\text{target}}\cdot 1.0$，故 $\beta_{\text{target}}^\star\approx 0.1$。 | 建议 `beta_target≈0.08~0.12`。`target_margin_ratio` 负责定义边界带宽度，`beta_target` 决定进入边界带后的实际成本。 |
-| `safe/joint_move` | 参考 `300` 步内，`12` 个关节平均每步变化量从 `0.02 rad` 降到 `0.015 rad`，则 $\sum_j(\Delta q_j)^2\approx12\times0.015^2=0.0027$。 | 有 $R\approx300\cdot\beta_{\text{joint\_move}}\cdot0.0027$，故 $\beta_{\text{joint\_move}}^\star\approx10/0.81\approx12.35$。 | 建议 `beta_joint_move≈12`。这一项用于压制高频关节抽动，降低期望步进后需要显著提高。 |
+| `safe/target_rate` | 参考最终目标变化 L2 在 `0.35` 自由区附近波动，只对超出部分惩罚。若平均超出量约 `0.08` 并持续 `300` 步，则累计为 $300\beta(0.08)^2$。 | 令该项落到 `O(10)`，得 $\beta\approx10/(300\cdot0.0064)\approx5.2$；阶段 1 可更低，阶段 2 可更强。 | `base_unlock` 使用 `beta_target_rate=3`，`stabilize` 使用 `10`，二者均保留 `target_rate_free_l2=0.35`。 |
 | `safe/cup_door_prox` | 参考杯体对门板侵入 `1 cm`，并持续 `10` 步，则每步侵入平方为 `0.01^2=10^{-4}`。 | 有 $R\approx 10\cdot \beta_{\text{cup\_door\_prox}}\cdot 10^{-4}$，故 $\beta_{\text{cup\_door\_prox}}^\star\approx 10^4$。 | 建议 `beta_cup_door_prox≈10^4`。若希望 `2 cm` 侵入就明显更痛，可以维持阈值不变而把系数提升到 `1.5×10^4` 左右。 |
 | `safe/base_zero_speed` | 参考整段 episode 低速静稳时可能持续激活；希望在 $s_t^{\text{base-speed}}\approx0.025$ 附近仍保留约 `0.6` 倍零速度奖励。 | 由 $e^{-\lambda_{\text{base-speed}}\cdot0.025}\approx0.64$ 得 $\lambda_{\text{base-speed}}\approx18$。`w_base_zero_speed` 仍保持弱正则 `0.02`，避免低速生存奖励压过任务进展。 | 建议 `w_base_zero_speed=0.02`、`lambda_base_speed≈18`。这会让零速度奖励比旧配置更快衰减。 |
 | `safe/base_speed` | 参考底盘在 `100` 步内维持“明显偏快但未失控”的速度，降低速度期望后令 $s_t^{\text{base-speed}}\approx0.0625$。 | 有 $R\approx100\cdot w_{\text{base-speed}}\cdot0.0625$，故 $w_{\text{base-speed}}^\star\approx10/6.25=1.6$。 | 建议 `w_base_speed≈1.6`。这是底盘速度的主惩罚项，降低速度预估后需要提高系数。 |
@@ -1420,7 +1515,7 @@ $$
    目标是让“持续稳定持杯”的总成本也在 `O(10)`。
 
 4. 最后固定安全约束：
-   `mu≈0.75`、`beta_vel≈0.20`、`beta_target≈0.08~0.12`、`beta_joint_move≈12`、`beta_cup_door_prox≈10^4`、`lambda_base_speed≈18`、`w_base_speed≈1.6`、`beta_base_cmd≈5`、`w_drop≈20~30`、`beta_base_heading≈2.0`、`beta_base_corridor≈1000~2500`。
+   `mu≈0.75`、`beta_vel≈0.20`、`beta_target≈0.08~0.12`、`beta_target_rate≈3~10`、`target_rate_free_l2≈0.35`、`beta_cup_door_prox≈10^4`、`lambda_base_speed≈18`、`w_base_speed≈1.6`、`beta_base_cmd≈5`、`w_drop≈20~30`、`beta_base_heading≈2.0`、`beta_base_corridor≈1000~2500`。
    这些项的目标不是让 reward 变大，而是让明显危险或 exploit 行为在 episode 级累计上“至少不比完成任务更划算”。
 
 ### 3.5 当前默认训练下奖励的实际激活情况
@@ -2211,6 +2306,9 @@ $$
 | `reward_detail/task/base_align` | 底盘朝推门方向对齐的弱 shaping | $\displaystyle \frac{1}{K_e}\sum_{k\in\mathcal K_e}\sum_t w_{\text{base\_align}}g_{k,t}^{\text{near}}g_{k,t}^{\text{range}}g_{k,t}^{\text{align}}$ |
 | `reward_detail/task/base_forward` | 底盘沿推门方向的连续推进奖励 | $\displaystyle \frac{1}{K_e}\sum_{k\in\mathcal K_e}\sum_t w_{\text{base\_forward}}g_{k,t}^{\text{align}}g_{k,t}^{\text{range}}\max(\delta_{k,t-1}^{\text{plane}}-\delta_{k,t}^{\text{plane}},0)$ |
 | `reward_detail/task/base_centerline` | 底盘靠近门洞中线的弱 shaping | $\displaystyle \frac{1}{K_e}\sum_{k\in\mathcal K_e}\sum_t w_{\text{base\_centerline}}g_{k,t}^{\text{align}}g_{k,t}^{\text{range}}s_{k,t}^{\text{center}}$ |
+| `reward_detail/task/base_net_progress` | 底盘有符号净推进奖励，后退为负 | $\displaystyle \frac{1}{K_e}\sum_{k\in\mathcal K_e}\sum_t w_{\text{base\_net}}g_{k,t}^{\text{align}}g_{k,t}^{\text{range}}(\delta_{k,t-1}^{\text{plane}}-\delta_{k,t}^{\text{plane}})$ |
+| `reward_detail/task/base_assist` | 手靠近门面且门处于推门阶段时的底盘协同推进奖励 | $\displaystyle \frac{1}{K_e}\sum_{k\in\mathcal K_e}\sum_t w_{\text{base\_assist}}g^{\text{align}}g^{\text{range}}g^{\text{hand}}g^{\text{push}}\Delta^{\text{base\_forward}}$ |
+| `reward_detail/task/base_door_sync` | 门角正增长与底盘推进同步时的奖励 | $\displaystyle \frac{1}{K_e}\sum_{k\in\mathcal K_e}\sum_t w_{\text{base\_sync}}g^{\text{align}}g^{\text{range}}\max(\theta_t-\theta_{t-1},0)\Delta^{\text{base\_forward}}$ |
 | `reward_detail/task/base_cross` | 底盘穿门后在内侧半空间的推进奖励 | $\displaystyle \frac{1}{K_e}\sum_{k\in\mathcal K_e}\sum_t g_{k,t}^{\text{align}}g_{k,t}^{\text{range}}\mathbf 1[\theta_{k,t}\ge\theta_{\text{base-cross}}]w_{\text{base\_cross}}\max(p_{k,t}^{\text{inside}}-p_{k,t-1}^{\text{inside}},0)$ |
 
 这里的 $s_t^{\text{approach}}$、$g_t^{\text{align}}$、$g_t^{\text{range}}$、$g_t^{\text{near}}$、$s_t^{\text{center}}$ 和 $p_t^{\text{inside}}$ 的定义见第 3.4.2 节。
@@ -2226,6 +2324,8 @@ $$
 | `reward_detail/stab_left/acc`、`reward_detail/stab_right/acc` | 持杯侧末端线加速度惩罚，日志中为负数 | $\displaystyle \frac{1}{K_e}\sum_{i\in\mathcal K_e}\sum_t -m_{i,t}^{c}w_{\text{acc}}\|a_{i,t}^{c}\|_2^2$ |
 | `reward_detail/stab_left/ang`、`reward_detail/stab_right/ang` | 持杯侧末端角加速度惩罚，日志中为负数 | $\displaystyle \frac{1}{K_e}\sum_{i\in\mathcal K_e}\sum_t -m_{i,t}^{c}w_{\text{ang}}\|\alpha_{i,t}^{c}\|_2^2$ |
 | `reward_detail/stab_left/tilt`、`reward_detail/stab_right/tilt` | 持杯侧杯体倾斜 proxy 惩罚，日志中为负数 | $\displaystyle \frac{1}{K_e}\sum_{i\in\mathcal K_e}\sum_t -m_{i,t}^{c}w_{\text{tilt}}\|u_{i,t}^{c}\|_2^2$ |
+| `reward_detail/stab_left/ee_lin_vel`、`reward_detail/stab_right/ee_lin_vel` | 持杯侧末端世界线速度 soft-cap 惩罚，日志中为负数 | $\displaystyle \frac{1}{K_e}\sum_{i\in\mathcal K_e}\sum_t -m_{i,t}^{c}w_{ee,v}[\|v_{ee,i,t}^{W,c}\|_2-v_{\text{free}}]_+^2$ |
+| `reward_detail/stab_left/ee_ang_vel`、`reward_detail/stab_right/ee_ang_vel` | 持杯侧末端世界角速度 soft-cap 惩罚，日志中为负数 | $\displaystyle \frac{1}{K_e}\sum_{i\in\mathcal K_e}\sum_t -m_{i,t}^{c}w_{ee,\omega}[\|\omega_{ee,i,t}^{W,c}\|_2-\omega_{\text{free}}]_+^2$ |
 
 ### 6.9 安全 reward 细项（自定义 observer）
 
@@ -2234,7 +2334,7 @@ $$
 | `reward_detail/safe/joint_vel` | 关节速度超过软阈值后的二次惩罚 | $\displaystyle \frac{1}{K_e}\sum_{k\in\mathcal K_e}\sum_t \beta_{\text{vel}}\sum_{j=1}^{12}\left[\max(\lvert\dot q_{k,t,j}\rvert-\mu\dot q_{\max,j},0)\right]^2$ |
 | `reward_detail/safe/target_limit` | 执行目标进入 joint limit 边界带的惩罚 | $\displaystyle \frac{1}{K_e}\sum_{k\in\mathcal K_e}\sum_t \beta_{\text{target}}\sum_{j=1}^{12}\left(e_{k,t,j}^{\text{target}}/m_j\right)^2$ |
 | `reward_detail/safe/cup_drop` | 杯子掉落惩罚 | $\displaystyle \frac{1}{K_e}\sum_{k\in\mathcal K_e}\sum_t w_{\text{drop}}\mathbf 1[\text{cup\_dropped}_{k,t}]$ |
-| `reward_detail/safe/joint_move` | 相邻控制步关节位置变化惩罚 | $\displaystyle \frac{1}{K_e}\sum_{k\in\mathcal K_e}\sum_t \beta_{\text{joint\_move}}\sum_{j=1}^{12}(q_{k,t,j}-q_{k,t-1,j})^2$ |
+| `reward_detail/safe/target_rate` | 最终 PD 目标变化率 soft-cap 惩罚 | $\displaystyle \frac{1}{K_e}\sum_{k\in\mathcal K_e}\sum_t \beta_{\Delta q^\star}[\|\tilde q_{k,t}^{\star}-\tilde q_{k,t-1}^{\star}\|_2-q_{\text{free}}^\star]_+^2$ |
 | `reward_detail/safe/cup_door_prox` | 持杯侧杯体低于门板距离阈值后的二次惩罚 | $\displaystyle \frac{1}{K_e}\sum_{k\in\mathcal K_e}\sum_t \sum_{c\in\{L,R\}}m_{k,t}^{c}\beta_{\text{cup\_door\_prox}}\left[\max(d_{\text{thresh}}-d_{k,t}^{c},0)\right]^2$ |
 | `reward_detail/safe/base_zero_speed` | 底盘低速静稳奖励；在 `reward/safe` 内以负号进入 | $\displaystyle \frac{1}{K_e}\sum_{k\in\mathcal K_e}\sum_t w_{\text{base-zero-speed}}\exp(-\lambda_{\text{base-speed}}s_{k,t}^{\text{base-speed}})$ |
 | `reward_detail/safe/base_speed` | 底盘速度平方惩罚 | $\displaystyle \frac{1}{K_e}\sum_{k\in\mathcal K_e}\sum_t w_{\text{base-speed}}s_{k,t}^{\text{base-speed}}$ |
@@ -2256,7 +2356,7 @@ r_t^{\text{safe}}
 r_t^{\text{vel}}
 +r_t^{\text{target}}
 +r_t^{\text{drop}}
-+r_t^{\text{joint\_move}}
++r_t^{\text{target\_rate}}
 +r_t^{\text{cup\_door\_prox}}
 -r_t^{\text{base\_zero\_speed}}
 +r_t^{\text{base\_speed}}
@@ -2306,7 +2406,22 @@ $$
 \end{cases}
 $$
 
-### 6.11 PPO diagnostics（rl_games 内置）
+### 6.11 阶段学习与状态诊断指标（自定义 observer）
+
+阶段学习和 episode 状态诊断也通过 `DoorPushTensorboardObserver` 写入 TensorBoard：
+
+| Tag | 含义 |
+| --- | --- |
+| `stage/current_stage_index` | 当前完成 episode 所处 reward 阶段的均值；`0` 表示 `base_unlock`，`1` 表示 `stabilize`。 |
+| `state/base_signed_distance_delta` | episode 起点到终点的底盘有符号距离变化，正值表示底盘净向推门方向前进。 |
+| `state/base_push_progress_sum` | episode 内只取正部的底盘局部推进累计。 |
+| `state/base_net_progress_sum` | episode 内有符号底盘推进累计，后退会抵消前进。 |
+| `state/base_inside_progress_sum` | 底盘进入门洞内侧半空间后的推进累计。 |
+| `state/target_rate_l2_mean`、`state/target_rate_l2_max` | 最终 PD 目标变化 L2 的 episode 均值和最大值。 |
+| `state/ee_left_speed_world_mean`、`state/ee_right_speed_world_mean` | 持杯侧末端世界线速度 episode 均值；无杯侧记为 NaN 并在聚合时忽略。 |
+| `state/ee_left_ang_speed_world_mean`、`state/ee_right_ang_speed_world_mean` | 持杯侧末端世界角速度 episode 均值；无杯侧记为 NaN 并在聚合时忽略。 |
+
+### 6.12 PPO diagnostics（rl_games 内置）
 
 当前默认 `use_diagnostics=True`，所以会启用 `PpoDiagnostics`。这些 tag 的横轴是 PPO epoch，而不是 frame。
 

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
+from typing import Any
 
 import gymnasium as gym
 import isaaclab.sim as sim_utils
@@ -492,13 +493,23 @@ class DoorPushEnvCfg(DirectRLEnvCfg):
     rew_w_base_align: float = 0.005
     rew_w_base_forward: float = 25.0
     rew_w_base_centerline: float = 0.03
+    rew_w_base_net_progress: float = 0.0
     rew_base_align_mid_angle_deg: float = 35.0
     rew_base_align_temperature_deg: float = 5.0
     rew_base_near_sigma: float = 0.8
     rew_base_range_tau: float = 0.05
     rew_base_centerline_sigma: float = 0.25
+    rew_hand_near_dist: float = 0.18
+    rew_hand_near_tau: float = 0.05
+    rew_w_base_assist: float = 10.0
+    rew_w_base_door_sync: float = 10.0
+    rew_base_push_start_angle: float = 0.20
+    rew_base_push_end_angle: float = 1.00
+    rew_base_push_start_tau: float = 0.10
+    rew_base_push_end_tau: float = 0.15
     rew_w_base_cross: float = 50.0
-    rew_base_cross_open_gate: float = 1.2
+    rew_base_cross_open_gate: float = 0.80
+    rew_base_cross_tau: float = 0.15
 
     # 稳定性奖励 (§5)
     rew_w_zero_acc: float = 0.045
@@ -508,13 +519,18 @@ class DoorPushEnvCfg(DirectRLEnvCfg):
     rew_w_acc: float = 0.015
     rew_w_ang: float = 0.0005
     rew_w_tilt: float = 3.0
+    rew_ee_lin_vel_free: float = 0.20
+    rew_ee_ang_vel_free: float = 0.80
+    rew_w_ee_lin_vel: float = 10.0
+    rew_w_ee_ang_vel: float = 5.0
 
     # 安全惩罚 (§6)
     rew_mu: float = 0.9
     rew_beta_vel: float = 0.1
     rew_beta_target: float = 0.1
     rew_target_margin_ratio: float = 0.05
-    rew_beta_joint_move: float = 7.0
+    rew_beta_target_rate: float = 10.0
+    rew_target_rate_free_l2: float = 0.0
     rew_beta_cup_door_prox: float = 10000.0
     rew_cup_door_prox_threshold: float = 0.20
     rew_w_drop: float = 25.0
@@ -524,6 +540,7 @@ class DoorPushEnvCfg(DirectRLEnvCfg):
     rew_beta_base_cmd: float = 2.0
     rew_beta_base_heading: float = 2.0
     rew_beta_base_corridor: float = 1500.0
+    rew_stage_schedule: dict[str, Any] | None = None
 
     # ── 门几何观测 ────────────────────────────────────────────────────
     door_geometry_dim: int = 6  # center(3) + normal(3)

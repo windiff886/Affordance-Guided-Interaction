@@ -304,13 +304,23 @@ _REWARD_PARAM_MAP: dict[str, dict[str, str]] = {
         "w_base_align": "rew_w_base_align",
         "w_base_forward": "rew_w_base_forward",
         "w_base_centerline": "rew_w_base_centerline",
+        "w_base_net_progress": "rew_w_base_net_progress",
         "base_align_mid_angle_deg": "rew_base_align_mid_angle_deg",
         "base_align_temperature_deg": "rew_base_align_temperature_deg",
         "base_near_sigma": "rew_base_near_sigma",
         "base_range_tau": "rew_base_range_tau",
         "base_centerline_sigma": "rew_base_centerline_sigma",
+        "hand_near_dist": "rew_hand_near_dist",
+        "hand_near_tau": "rew_hand_near_tau",
+        "w_base_assist": "rew_w_base_assist",
+        "w_base_door_sync": "rew_w_base_door_sync",
+        "base_push_start_angle": "rew_base_push_start_angle",
+        "base_push_end_angle": "rew_base_push_end_angle",
+        "base_push_start_tau": "rew_base_push_start_tau",
+        "base_push_end_tau": "rew_base_push_end_tau",
         "w_base_cross": "rew_w_base_cross",
         "base_cross_open_gate": "rew_base_cross_open_gate",
+        "base_cross_tau": "rew_base_cross_tau",
     },
     "stability": {
         "w_zero_acc": "rew_w_zero_acc",
@@ -320,13 +330,18 @@ _REWARD_PARAM_MAP: dict[str, dict[str, str]] = {
         "w_acc": "rew_w_acc",
         "w_ang": "rew_w_ang",
         "w_tilt": "rew_w_tilt",
+        "ee_lin_vel_free": "rew_ee_lin_vel_free",
+        "ee_ang_vel_free": "rew_ee_ang_vel_free",
+        "w_ee_lin_vel": "rew_w_ee_lin_vel",
+        "w_ee_ang_vel": "rew_w_ee_ang_vel",
     },
     "safety": {
         "mu": "rew_mu",
         "beta_vel": "rew_beta_vel",
         "beta_target": "rew_beta_target",
         "target_margin_ratio": "rew_target_margin_ratio",
-        "beta_joint_move": "rew_beta_joint_move",
+        "beta_target_rate": "rew_beta_target_rate",
+        "target_rate_free_l2": "rew_target_rate_free_l2",
         "beta_cup_door_prox": "rew_beta_cup_door_prox",
         "cup_door_prox_threshold": "rew_cup_door_prox_threshold",
         "w_drop": "rew_w_drop",
@@ -379,6 +394,49 @@ def _inject_reward_params(env_cfg: Any, reward_cfg: dict[str, Any]) -> None:
         for yaml_key, cfg_attr in mapping.items():
             if yaml_key in section_cfg:
                 setattr(env_cfg, cfg_attr, float(section_cfg[yaml_key]))
+    env_cfg.rew_stage_schedule = _build_reward_stage_schedule(reward_cfg)
+
+
+def _build_reward_stage_schedule(reward_cfg: dict[str, Any]) -> dict[str, Any] | None:
+    schedule_cfg = reward_cfg.get("stage_schedule")
+    if not isinstance(schedule_cfg, dict):
+        return None
+
+    stages_cfg = schedule_cfg.get("stages", [])
+    if not isinstance(stages_cfg, list):
+        raise ValueError("reward.stage_schedule.stages must be a list.")
+
+    stages: list[dict[str, Any]] = []
+    for index, stage_cfg in enumerate(stages_cfg):
+        if not isinstance(stage_cfg, dict):
+            raise ValueError(f"reward.stage_schedule.stages[{index}] must be a mapping.")
+
+        reward_overrides = stage_cfg.get("reward", {})
+        if not isinstance(reward_overrides, dict):
+            raise ValueError(f"reward.stage_schedule.stages[{index}].reward must be a mapping.")
+
+        overrides: dict[str, float] = {}
+        for section, mapping in _REWARD_PARAM_MAP.items():
+            section_cfg = reward_overrides.get(section, {})
+            if not isinstance(section_cfg, dict):
+                raise ValueError(f"reward.stage_schedule.stages[{index}].reward.{section} must be a mapping.")
+            for yaml_key, cfg_attr in mapping.items():
+                if yaml_key in section_cfg:
+                    overrides[cfg_attr] = float(section_cfg[yaml_key])
+
+        until_frames = stage_cfg.get("until_frames")
+        stages.append(
+            {
+                "name": str(stage_cfg.get("name", f"stage_{index}")),
+                "until_frames": None if until_frames is None else int(until_frames),
+                "overrides": overrides,
+            }
+        )
+
+    return {
+        "enabled": bool(schedule_cfg.get("enabled", False)),
+        "stages": stages,
+    }
 
 
 def main(argv: list[str] | None = None) -> int:

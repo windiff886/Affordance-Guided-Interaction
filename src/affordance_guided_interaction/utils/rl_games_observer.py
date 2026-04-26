@@ -42,6 +42,25 @@ class DoorPushTensorboardObserver(IsaacAlgoObserver):
                 self._reward_sums[key] += selected.sum().item()
                 self._reward_counts[key] += int(selected.numel())
 
+        state_info = infos.get("episode_state_info")
+        if isinstance(state_info, dict):
+            for key, value in state_info.items():
+                selected = self._select_done_values(value, done_env_ids)
+                if selected is None:
+                    continue
+                selected = selected[torch.isfinite(selected)]
+                if selected.numel() == 0:
+                    continue
+                self._state_sums[key] += selected.sum().item()
+                self._state_counts[key] += int(selected.numel())
+
+        reward_stage_index = self._select_done_values(infos.get("reward_stage_index"), done_env_ids)
+        if reward_stage_index is not None:
+            reward_stage_index = reward_stage_index[torch.isfinite(reward_stage_index)]
+            if reward_stage_index.numel() > 0:
+                self._reward_stage_index_sum += reward_stage_index.sum().item()
+                self._reward_stage_index_count += int(reward_stage_index.numel())
+
         door_angle = self._select_done_values(infos.get("door_angle"), done_env_ids)
         if door_angle is not None:
             self._door_angle_sum += door_angle.sum().item()
@@ -72,6 +91,15 @@ class DoorPushTensorboardObserver(IsaacAlgoObserver):
             door_open_met = door_open_met.to(dtype=torch.bool)
             self._task_state_counts["door_open_met"] += int(door_open_met.sum().item())
             self._task_state_totals["door_open_met"] += int(door_open_met.numel())
+        door_open_but_not_crossed = self._select_done_values(
+            infos.get("door_open_but_not_crossed"),
+            done_env_ids,
+            cast_float=False,
+        )
+        if door_open_but_not_crossed is not None:
+            door_open_but_not_crossed = door_open_but_not_crossed.to(dtype=torch.bool)
+            self._task_state_counts["door_open_but_not_crossed"] += int(door_open_but_not_crossed.sum().item())
+            self._task_state_totals["door_open_but_not_crossed"] += int(door_open_but_not_crossed.numel())
         left_occupied = left_occupied.to(dtype=torch.bool)
         right_occupied = right_occupied.to(dtype=torch.bool)
 
@@ -112,13 +140,22 @@ class DoorPushTensorboardObserver(IsaacAlgoObserver):
             if value is not None:
                 self.writer.add_scalar(f"reward_detail/{key}", value, frame)
 
+        for key in sorted(self._state_sums):
+            value = self._mean_state(key)
+            if value is not None:
+                self.writer.add_scalar(f"state/{key}", value, frame)
+
+        if self._reward_stage_index_count > 0:
+            stage_index_value = self._reward_stage_index_sum / self._reward_stage_index_count
+            self.writer.add_scalar("stage/current_stage_index", stage_index_value, frame)
+
         if self._door_angle_count > 0:
             self.writer.add_scalar(
                 "task_state/door_angle_final",
                 self._door_angle_sum / self._door_angle_count,
                 frame,
             )
-        for key in ("base_crossed", "door_open_met"):
+        for key in ("base_crossed", "door_open_met", "door_open_but_not_crossed"):
             total = self._task_state_totals.get(key, 0)
             if total > 0:
                 rate = self._task_state_counts[key] / total
@@ -141,6 +178,8 @@ class DoorPushTensorboardObserver(IsaacAlgoObserver):
     def _reset_custom_stats(self) -> None:
         self._reward_sums: defaultdict[str, float] = defaultdict(float)
         self._reward_counts: defaultdict[str, int] = defaultdict(int)
+        self._state_sums: defaultdict[str, float] = defaultdict(float)
+        self._state_counts: defaultdict[str, int] = defaultdict(int)
         self._success_counts: defaultdict[str, int] = defaultdict(int)
         self._success_totals: defaultdict[str, int] = defaultdict(int)
         self._task_state_counts: defaultdict[str, int] = defaultdict(int)
@@ -149,6 +188,8 @@ class DoorPushTensorboardObserver(IsaacAlgoObserver):
         self._fail_totals: defaultdict[str, int] = defaultdict(int)
         self._door_angle_sum = 0.0
         self._door_angle_count = 0
+        self._reward_stage_index_sum = 0.0
+        self._reward_stage_index_count = 0
 
     def _normalize_done_indices(self, done_indices: Any) -> torch.Tensor:
         if done_indices is None:
@@ -194,3 +235,9 @@ class DoorPushTensorboardObserver(IsaacAlgoObserver):
         if count <= 0:
             return None
         return self._reward_sums[key] / count
+
+    def _mean_state(self, key: str) -> float | None:
+        count = self._state_counts.get(key, 0)
+        if count <= 0:
+            return None
+        return self._state_sums[key] / count

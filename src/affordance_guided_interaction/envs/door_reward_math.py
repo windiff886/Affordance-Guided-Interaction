@@ -183,6 +183,127 @@ def compute_forward_progress_delta(
     return torch.clamp(previous_signed_distance - current_signed_distance, min=0.0)
 
 
+def compute_signed_progress_delta(
+    *,
+    previous_signed_distance: Tensor,
+    current_signed_distance: Tensor,
+) -> Tensor:
+    """Measure signed progress along the push direction, preserving retreat."""
+    return previous_signed_distance - current_signed_distance
+
+
+def compute_target_rate_penalty(
+    *,
+    current_target: Tensor,
+    previous_target: Tensor,
+    beta: float,
+    free_l2: float = 0.0,
+) -> Tensor:
+    """Penalize final arm-target jumps above an L2 free zone."""
+    target_delta_l2 = (current_target - previous_target).norm(dim=-1)
+    excess = torch.clamp(target_delta_l2 - float(free_l2), min=0.0)
+    return float(beta) * torch.square(excess)
+
+
+def compute_hand_near_gate(
+    *,
+    hand_dist: Tensor,
+    near_dist: float,
+    tau: float,
+) -> Tensor:
+    """Gate coordination rewards by absolute hand distance to the door face."""
+    width = max(float(tau), 1.0e-6)
+    return torch.sigmoid((float(near_dist) - hand_dist) / width)
+
+
+def compute_base_net_progress_reward(
+    *,
+    align_score: Tensor,
+    range_score: Tensor,
+    signed_progress: Tensor,
+    weight: float,
+) -> Tensor:
+    """Reward forward base motion and penalize retreat under alignment/range gates."""
+    return float(weight) * align_score * range_score * signed_progress
+
+
+def compute_soft_capped_velocity_penalty(
+    *,
+    velocity: Tensor,
+    occupied: Tensor,
+    free_speed: float,
+    weight: float,
+) -> Tensor:
+    """Penalize only velocity norm above a free-speed cap for occupied cup sides."""
+    excess = torch.clamp(velocity.norm(dim=-1) - float(free_speed), min=0.0)
+    return -occupied.float() * float(weight) * torch.square(excess)
+
+
+def compute_door_angle_push_gate(
+    *,
+    door_angle: Tensor,
+    start_angle: float,
+    end_angle: float,
+    start_tau: float,
+    end_tau: float,
+) -> Tensor:
+    """Gate base-assist reward to the mid opening range where push coordination matters."""
+    start_width = max(float(start_tau), 1.0e-6)
+    end_width = max(float(end_tau), 1.0e-6)
+    start_gate = torch.sigmoid((door_angle - float(start_angle)) / start_width)
+    end_gate = torch.sigmoid((float(end_angle) - door_angle) / end_width)
+    return start_gate * end_gate
+
+
+def compute_door_angle_cross_gate(
+    *,
+    door_angle: Tensor,
+    cross_angle: float,
+    tau: float,
+) -> Tensor:
+    """Smoothly activate base-cross progress before the hard task success angle."""
+    width = max(float(tau), 1.0e-6)
+    return torch.sigmoid((door_angle - float(cross_angle)) / width)
+
+
+def compute_base_assist_reward(
+    *,
+    align_score: Tensor,
+    range_score: Tensor,
+    hand_score: Tensor,
+    push_gate: Tensor,
+    base_push_progress: Tensor,
+    weight: float,
+) -> Tensor:
+    """Reward base progress only when hand contact, alignment and doorway range agree."""
+    return (
+        float(weight)
+        * align_score
+        * range_score
+        * hand_score
+        * push_gate
+        * base_push_progress
+    )
+
+
+def compute_base_door_sync_reward(
+    *,
+    align_score: Tensor,
+    range_score: Tensor,
+    door_delta: Tensor,
+    base_push_progress: Tensor,
+    weight: float,
+    eps: float = 0.0,
+) -> Tensor:
+    """Reward simultaneous positive door opening and base push progress."""
+    coupled_progress = torch.clamp(door_delta, min=0.0) * torch.clamp(
+        base_push_progress,
+        min=0.0,
+    )
+    reward = float(weight) * align_score * range_score * torch.sqrt(coupled_progress + float(eps))
+    return torch.where(coupled_progress > 0.0, reward, torch.zeros_like(reward))
+
+
 def compute_base_align_reward(
     *,
     align_score: Tensor,
