@@ -9,8 +9,7 @@ Runner.load/create_player -> obs_to_torch/get_action/env.step
 The project-specific additions are:
 
 - parameters come from the local YAML tree
-- occupancy is forced to one fixed mode per clip
-- four clips are exported: empty / left / right / both
+- one clip is exported per configured mode
 """
 
 from __future__ import annotations
@@ -53,9 +52,10 @@ DEFAULT_VIDEO_LENGTH = 200
 _ROLLOUT_PROGRESS_INTERVAL = 100
 _EPISODE_END_REASON_PRIORITY = (
     ("success", "success"),
-    ("fail_cup_drop", "cup_drop"),
-    ("fail_not_crossed", "not_crossed"),
     ("fail_timeout", "timeout"),
+    ("hard_collision", "hard_collision_at_end"),
+    ("reverse_open", "reverse_open_at_end"),
+    ("fail_not_passed", "not_passed"),
 )
 
 
@@ -88,19 +88,6 @@ def _parse_optional_vector3(value: Any, *, key_path: str) -> tuple[float, float,
     return tuple(float(component) for component in value)
 
 
-def resolve_occupancy_mode(mode: str) -> tuple[bool, bool]:
-    normalized = str(mode).strip().lower()
-    if normalized == "empty":
-        return False, False
-    if normalized == "left":
-        return True, False
-    if normalized == "right":
-        return False, True
-    if normalized == "both":
-        return True, True
-    raise ValueError(f"Unsupported occupancy mode: {mode!r}")
-
-
 def resolve_rollout_config(
     inference_cfg: dict[str, Any],
     *,
@@ -118,12 +105,10 @@ def resolve_rollout_config(
     if not checkpoint:
         raise ValueError("Inference config must provide policy.checkpoint or --checkpoint.")
 
-    raw_modes = rollout_cfg.get("modes", ("empty", "left", "right", "both"))
+    raw_modes = rollout_cfg.get("modes", ("default",))
     modes = tuple(str(mode).strip().lower() for mode in raw_modes)
     if not modes:
         raise ValueError("Inference config must provide at least one rollout mode.")
-    for mode in modes:
-        resolve_occupancy_mode(mode)
 
     video_length = int(video_cfg.get("length", DEFAULT_VIDEO_LENGTH))
     if video_length <= 0:
@@ -226,14 +211,6 @@ def _episode_finished(dones: Any) -> bool:
     return bool(torch.any(torch.as_tensor(dones)).item())
 
 
-def _set_mode_occupancy(env: Any, mode: str) -> None:
-    left_occ, right_occ = resolve_occupancy_mode(mode)
-    env.unwrapped.set_occupancy(
-        torch.tensor([left_occ], dtype=torch.bool, device=env.unwrapped.device),
-        torch.tensor([right_occ], dtype=torch.bool, device=env.unwrapped.device),
-    )
-
-
 def _play_mode_rollout(
     *,
     simulation_app: Any,
@@ -246,7 +223,6 @@ def _play_mode_rollout(
 ) -> int:
     _log_rollout_message(_format_rollout_event(mode=mode, event="start"))
 
-    _set_mode_occupancy(env, mode)
     agent.reset()
 
     obs = env.reset()
@@ -574,7 +550,6 @@ def main(argv: list[str] | None = None) -> int:
         return _run_driver(script_args=script_args, rollout_cfg=rollout_cfg, run_dir=run_dir)
 
     mode = str(args_cli.single_mode).strip().lower()
-    resolve_occupancy_mode(mode)
     return _run_single_mode_worker(
         args_cli=args_cli,
         rollout_cfg=rollout_cfg,

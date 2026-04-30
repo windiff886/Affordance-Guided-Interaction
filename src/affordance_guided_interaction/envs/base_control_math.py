@@ -235,3 +235,25 @@ def clip_wheel_velocity_targets(
     saturated = torch.abs(wheel_targets) > limit
     saturation_ratio = saturated.to(dtype=wheel_targets.dtype).mean(dim=-1)
     return clipped, saturation_ratio
+
+
+def map_raw_base_actions_to_command(
+    actions: Tensor,
+    *,
+    max_lin_vel_x: float,
+    max_lin_vel_y: float,
+    max_ang_vel_z: float,
+    deadband: float,
+) -> Tensor:
+    """Map raw base actions to command-layer velocity with saturation and deadband.
+
+    Does NOT clamp actions; clamps only the scaled command.
+    """
+    scale = torch.tensor(
+        [float(max_lin_vel_x), float(max_lin_vel_y), float(max_ang_vel_z)],
+        device=actions.device,
+        dtype=actions.dtype,
+    )
+    raw_cmd = actions * scale.unsqueeze(0)
+    cmd = torch.clamp(raw_cmd, -scale.unsqueeze(0), scale.unsqueeze(0))
+    return torch.where(cmd.abs() < float(deadband), torch.zeros_like(cmd), cmd)

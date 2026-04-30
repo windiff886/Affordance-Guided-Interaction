@@ -1,20 +1,34 @@
 # Minimal Push Door Asset
 
-主场景：
+Handle-free push-only door for the door-traversal training task.
 
-- `assets/minimal_push_door/minimal_push_door.usda`
+## Files
 
-门资产：
+- `solid_push_door.usda` — single rigid door panel with hinge revolute joint
+- `minimal_push_door.usda` — full scene with room, door frame, and lighting
+- `room_shell.usda` — room enclosure
+- `door_side_walls.usda` — wall segments flanking the door frame
 
-- `assets/minimal_push_door/solid_push_door.usda`
+## Door Parameters
 
-使用方式：
+| Parameter | Nominal | Training Range |
+|---|---:|---:|
+| Door width | 0.90 m | [0.8, 1.0] m |
+| Door thickness | 0.04 m | [0.02, 0.06] m |
+| Door mass | 25 kg | [15, 75] kg |
+| Hinge resistance | 5 Nm | [0, 30] Nm (0.2 prob zero) |
+| Hinge air damping | 0 | [0, 4] Nms^2 |
+| Hinge closer damping scale | — | alpha in [1.5, 3.0] (0.4 prob zero) |
 
-- 在 Isaac Sim 里直接打开 `minimal_push_door.usda`
-- `SuggestedRobotBase` 位于门外侧的推门一侧，后续机器人可以优先摆在这个位置附近
-- 门是单扇非玻璃实体门，围绕竖直铰链轴单向打开
+## Door Structure
 
-当前范围：
+- Door panel body: `DoorLeaf`
+- Single hinge revolute joint (no handle joint)
+- Push-only: door opens in the positive-angle direction
+- No handle prim, no contact patches, no grasp targets
 
-- 已包含最小房间、门框、实体门板、基础光照、相机、碰撞体和铰链关节
-- 不包含机器人，不包含控制脚本，不包含训练环境接入
+## Notes
+
+- No handle geometry. The entire front face is a valid push surface.
+- Hinge joint is the only actuated/articulated door joint.
+- Door angle range: [-0.05, ~1.57] rad.

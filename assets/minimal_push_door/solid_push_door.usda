@@ -90,17 +90,6 @@ def Xform "SolidPushDoor" (
             float3 xformOp:scale = (0.04, 0.90, 2)
             uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
         }
-
-        def Cube "PushPlate" (
-            prepend apiSchemas = ["PhysicsCollisionAPI"]
-        )
-        {
-            color3f[] primvars:displayColor = [(0.72, 0.72, 0.74)]
-            double size = 1
-            double3 xformOp:translate = (0.05, 0.72, 1)
-            float3 xformOp:scale = (0.01, 0.18, 0.32)
-            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
-        }
     }
 
     def PhysicsFixedJoint "RootJoint"
@@ -117,8 +106,8 @@ def Xform "SolidPushDoor" (
     )
     {
         uniform token physics:axis = "Z"
-        float physics:lowerLimit = -105
-        float physics:upperLimit = 105
+        float physics:lowerLimit = -3
+        float physics:upperLimit = 90
         point3f physics:localPos0 = (0, 0, 0)
         point3f physics:localPos1 = (0, 0, 0)
         quatf physics:localRot0 = (1, 0, 0, 0)

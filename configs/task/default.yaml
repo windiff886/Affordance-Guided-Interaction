@@ -1,13 +1,10 @@
-# ═══════════════════════════════════════════════════════════════════════
-# 任务定义配置
-# 对应文档：docs/training_pipeline_detailed.md
-# ═══════════════════════════════════════════════════════════════════════
+# Task definition for the handle-free push-door task.
 
-# ── 成功条件参数 ─────────────────────────────────────────────────────
-door_angle_target: 1.2     # 门角度成功阈值；episode 仍需同时满足不掉杯 + base_link 过门
+# Success conditions
+theta_open: 0.5236          # pi/6 rad = 30 deg (opened_enough metric)
+theta_pass: 1.2217          # 70*pi/180 rad (stage switch)
+theta_hat: 1.3090           # 75*pi/180 rad (opening reward target)
+reverse_angle_limit: -0.05  # terminate if door reverses past this
 
-# ── 失败条件参数 ─────────────────────────────────────────────────────
-cup_drop_threshold: 0.40   # 杯体脱落距离阈值（m）—— 超过即判定杯体脱落
-
-# ── 超时参数 ─────────────────────────────────────────────────────────
-# max_episode_steps 在 env/default.yaml 中定义
+# Timeout
+# episode_length_s = 10.0, max_episode_steps = 600 (set in env cfg)

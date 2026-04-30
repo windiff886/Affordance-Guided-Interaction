@@ -4,6 +4,10 @@ __pycache__/
 outputs/
 **/superpowers/
 .codex
+.claude
+.trellis
+AGENTS.md
+.agents
 model/
 runs/
 checkpoints/

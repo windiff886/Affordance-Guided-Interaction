@@ -30,7 +30,6 @@ if str(_SRC_ROOT) not in sys.path:
 from affordance_guided_interaction.utils.runtime_env import resolve_headless_mode
 from affordance_guided_interaction.utils.rl_games_config import (
     build_rl_games_wrapper_kwargs,
-    ensure_central_value_config,
 )
 from affordance_guided_interaction.utils.train_runtime_config import TrainRuntimeConfig, resolve_train_runtime_config
 
@@ -67,7 +66,7 @@ def _resolve_configs_root(configs_dir: str | Path | None) -> Path:
     if path.is_file():
         return path.parents[1]
 
-    if path.name in {"training", "env", "task", "reward"}:
+    if path.name in {"training", "env", "task", "reward", "curriculum"}:
         default_yaml = path / "default.yaml"
         if default_yaml.exists():
             return path.parent
@@ -115,8 +114,12 @@ def build_env_cfg(
         env_cfg.arm_pd_stiffness = float(control_cfg["arm_pd_stiffness"])
     if "arm_pd_damping" in control_cfg:
         env_cfg.arm_pd_damping = float(control_cfg["arm_pd_damping"])
-    if "position_target_noise_std" in control_cfg:
-        env_cfg.position_target_noise_std = float(control_cfg["position_target_noise_std"])
+    if "arm_action_scale_rad" in control_cfg:
+        env_cfg.arm_action_scale_rad = float(control_cfg["arm_action_scale_rad"])
+    if "torque_proxy_sigma" in control_cfg:
+        env_cfg.torque_proxy_sigma = float(control_cfg["torque_proxy_sigma"])
+    if "base_command_deadband" in control_cfg:
+        env_cfg.base_command_deadband = float(control_cfg["base_command_deadband"])
     if "base_max_lin_vel_x" in control_cfg:
         env_cfg.base_max_lin_vel_x = float(control_cfg["base_max_lin_vel_x"])
     if "base_max_lin_vel_y" in control_cfg:
@@ -134,10 +137,14 @@ def build_env_cfg(
     _apply_arm_control_to_actuators(env_cfg)
 
     task_cfg = cfg.get("task", {})
-    if "door_angle_target" in task_cfg:
-        env_cfg.door_angle_target = float(task_cfg["door_angle_target"])
-    if "cup_drop_threshold" in task_cfg:
-        env_cfg.cup_drop_threshold = float(task_cfg["cup_drop_threshold"])
+    if "theta_open" in task_cfg:
+        env_cfg.theta_open = float(task_cfg["theta_open"])
+    if "theta_pass" in task_cfg:
+        env_cfg.theta_pass = float(task_cfg["theta_pass"])
+    if "theta_hat" in task_cfg:
+        env_cfg.theta_hat = float(task_cfg["theta_hat"])
+    if "reverse_angle_limit" in task_cfg:
+        env_cfg.reverse_angle_limit = float(task_cfg["reverse_angle_limit"])
 
     _inject_reward_params(env_cfg, cfg.get("reward", {}))
     if for_training:
@@ -166,7 +173,7 @@ def build_rl_games_agent_cfg(
 
     rl_device = _normalize_device(device or runtime_cfg.device)
     horizon_length = int(training_cfg.get("n_steps_per_rollout", agent_cfg["params"]["config"]["horizon_length"]))
-    num_envs = int(training_cfg.get("num_envs", runtime_cfg.num_envs or 1))
+    num_envs = int(runtime_cfg.num_envs if runtime_cfg.num_envs is not None else training_cfg.get("num_envs", 1))
     num_mini_batches = int(ppo_cfg.get("num_mini_batches", 1))
     total_batch_size = num_envs * horizon_length
     if total_batch_size % num_mini_batches != 0:
@@ -221,6 +228,9 @@ def build_rl_games_agent_cfg(
         config_section["adaptive_lr_min"] = float(ppo_cfg["adaptive_lr_min"])
     config_section["entropy_coef"] = float(ppo_cfg.get("entropy_coef", config_section.get("entropy_coef", 0.0)))
     config_section["critic_coef"] = float(ppo_cfg.get("value_coef", config_section.get("critic_coef", 1.0)))
+    config_section["bounds_loss_coef"] = float(
+        ppo_cfg.get("bounds_loss_coef", config_section.get("bounds_loss_coef", 0.0))
+    )
     config_section["grad_norm"] = float(ppo_cfg.get("max_grad_norm", config_section.get("grad_norm", 1.0)))
     config_section["e_clip"] = float(ppo_cfg.get("clip_eps", config_section.get("e_clip", 0.2)))
     config_section["clip_value"] = bool(
@@ -242,8 +252,6 @@ def build_rl_games_agent_cfg(
         sigma_init["val"] = float(ppo_cfg["sigma_init_logstd"])
     elif "sigma_init_val" in ppo_cfg:
         sigma_init["val"] = float(ppo_cfg["sigma_init_val"])
-
-    ensure_central_value_config(agent_cfg)
 
     resume_path = Path(checkpoint_path) if checkpoint_path is not None else runtime_cfg.resume
     params["load_checkpoint"] = resume_path is not None
@@ -293,64 +301,21 @@ def _configure_rl_games_adaptive_scheduler_bounds(config_section: dict[str, Any]
 
 
 _REWARD_PARAM_MAP: dict[str, dict[str, str]] = {
-    "task": {
-        "w_delta": "rew_w_delta",
-        "alpha": "rew_alpha",
-        "k_decay": "rew_k_decay",
-        "w_open": "rew_w_open",
-        "w_approach": "rew_w_approach",
-        "approach_eps": "rew_approach_eps",
-        "approach_stop_angle": "rew_approach_stop_angle",
-        "w_base_align": "rew_w_base_align",
-        "w_base_forward": "rew_w_base_forward",
-        "w_base_centerline": "rew_w_base_centerline",
-        "w_base_net_progress": "rew_w_base_net_progress",
-        "base_align_mid_angle_deg": "rew_base_align_mid_angle_deg",
-        "base_align_temperature_deg": "rew_base_align_temperature_deg",
-        "base_near_sigma": "rew_base_near_sigma",
-        "base_range_tau": "rew_base_range_tau",
-        "base_centerline_sigma": "rew_base_centerline_sigma",
-        "hand_near_dist": "rew_hand_near_dist",
-        "hand_near_tau": "rew_hand_near_tau",
-        "w_base_assist": "rew_w_base_assist",
-        "w_base_door_sync": "rew_w_base_door_sync",
-        "base_push_start_angle": "rew_base_push_start_angle",
-        "base_push_end_angle": "rew_base_push_end_angle",
-        "base_push_start_tau": "rew_base_push_start_tau",
-        "base_push_end_tau": "rew_base_push_end_tau",
-        "w_base_cross": "rew_w_base_cross",
-        "base_cross_open_gate": "rew_base_cross_open_gate",
-        "base_cross_tau": "rew_base_cross_tau",
+    "opening": {
+        "scale": "rew_opening_scale",
     },
-    "stability": {
-        "w_zero_acc": "rew_w_zero_acc",
-        "lambda_acc": "rew_lambda_acc",
-        "w_zero_ang": "rew_w_zero_ang",
-        "lambda_ang": "rew_lambda_ang",
-        "w_acc": "rew_w_acc",
-        "w_ang": "rew_w_ang",
-        "w_tilt": "rew_w_tilt",
-        "ee_lin_vel_free": "rew_ee_lin_vel_free",
-        "ee_ang_vel_free": "rew_ee_ang_vel_free",
-        "w_ee_lin_vel": "rew_w_ee_lin_vel",
-        "w_ee_ang_vel": "rew_w_ee_ang_vel",
+    "passing": {
+        "max_speed": "rew_passing_max_speed",
     },
-    "safety": {
-        "mu": "rew_mu",
-        "beta_vel": "rew_beta_vel",
-        "beta_target": "rew_beta_target",
-        "target_margin_ratio": "rew_target_margin_ratio",
-        "beta_target_rate": "rew_beta_target_rate",
-        "target_rate_free_l2": "rew_target_rate_free_l2",
-        "beta_cup_door_prox": "rew_beta_cup_door_prox",
-        "cup_door_prox_threshold": "rew_cup_door_prox_threshold",
-        "w_drop": "rew_w_drop",
-        "w_base_zero_speed": "rew_w_base_zero_speed",
-        "lambda_base_speed": "rew_lambda_base_speed",
-        "w_base_speed": "rew_w_base_speed",
-        "beta_base_cmd": "rew_beta_base_cmd",
-        "beta_base_heading": "rew_beta_base_heading",
-        "beta_base_corridor": "rew_beta_base_corridor",
+    "shaping": {
+        "w_min_arm_motion": "rew_ma_weight",
+        "w_stretched_arm": "rew_psa_weight",
+        "w_end_effector_to_panel": "rew_eep_weight",
+        "w_command_limit": "rew_pcl_weight",
+        "w_collision": "rew_pc_weight",
+        "stretched_arm_threshold": "rew_stretched_arm_threshold",
+        "stretched_arm_scale": "rew_stretched_arm_scale",
+        "cmd_limit_threshold": "rew_cmd_limit_threshold",
     },
 }
 
@@ -394,49 +359,6 @@ def _inject_reward_params(env_cfg: Any, reward_cfg: dict[str, Any]) -> None:
         for yaml_key, cfg_attr in mapping.items():
             if yaml_key in section_cfg:
                 setattr(env_cfg, cfg_attr, float(section_cfg[yaml_key]))
-    env_cfg.rew_stage_schedule = _build_reward_stage_schedule(reward_cfg)
-
-
-def _build_reward_stage_schedule(reward_cfg: dict[str, Any]) -> dict[str, Any] | None:
-    schedule_cfg = reward_cfg.get("stage_schedule")
-    if not isinstance(schedule_cfg, dict):
-        return None
-
-    stages_cfg = schedule_cfg.get("stages", [])
-    if not isinstance(stages_cfg, list):
-        raise ValueError("reward.stage_schedule.stages must be a list.")
-
-    stages: list[dict[str, Any]] = []
-    for index, stage_cfg in enumerate(stages_cfg):
-        if not isinstance(stage_cfg, dict):
-            raise ValueError(f"reward.stage_schedule.stages[{index}] must be a mapping.")
-
-        reward_overrides = stage_cfg.get("reward", {})
-        if not isinstance(reward_overrides, dict):
-            raise ValueError(f"reward.stage_schedule.stages[{index}].reward must be a mapping.")
-
-        overrides: dict[str, float] = {}
-        for section, mapping in _REWARD_PARAM_MAP.items():
-            section_cfg = reward_overrides.get(section, {})
-            if not isinstance(section_cfg, dict):
-                raise ValueError(f"reward.stage_schedule.stages[{index}].reward.{section} must be a mapping.")
-            for yaml_key, cfg_attr in mapping.items():
-                if yaml_key in section_cfg:
-                    overrides[cfg_attr] = float(section_cfg[yaml_key])
-
-        until_frames = stage_cfg.get("until_frames")
-        stages.append(
-            {
-                "name": str(stage_cfg.get("name", f"stage_{index}")),
-                "until_frames": None if until_frames is None else int(until_frames),
-                "overrides": overrides,
-            }
-        )
-
-    return {
-        "enabled": bool(schedule_cfg.get("enabled", False)),
-        "stages": stages,
-    }
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -562,6 +484,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Training time: {round(time.time() - start_time, 2)} seconds")
         env.close()
         return 0
+    except Exception:
+        import traceback
+
+        traceback.print_exc()
+        raise
     finally:
         simulation_app.close()
 

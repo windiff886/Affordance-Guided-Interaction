@@ -1,26 +1,23 @@
 # configs/
 
-当前默认训练链路会消费以下 4 份配置：
+Active training pipeline consumes 4 config files:
 
-- `training/default.yaml`
-- `env/default.yaml`
-- `task/default.yaml`
-- `reward/default.yaml`
+- `training/default.yaml` — runtime params and rl_games/PPO hyperparameters (RoboDuet aligned)
+- `env/default.yaml` — simulation timestep, decimation, arm/base control parameters
+- `task/default.yaml` — task success/failure thresholds (theta_open, theta_pass, theta_hat)
+- `reward/default.yaml` — reward coefficients injected back into DoorPushEnvCfg
 
-另外，仓库还提供 1 份推理/可视化配置：
+Inference/visualization config:
 
-- `inference/default.yaml`
+- `inference/default.yaml` — checkpoint, inference mode, video output for render_policy_rollouts.py
 
-训练入口只走这一条链路：
+Training entry flow:
 
 `YAML -> task registry -> env_cfg / agent_cfg -> AppLauncher -> gym.make -> RlGamesVecEnvWrapper -> rl_games.Runner`
 
-说明：
+Notes:
 
-- `training/default.yaml` 提供运行时参数和 rl_games/PPO 超参数。
-- `env/default.yaml` 覆盖仿真步长、decimation、双臂控制参数以及移动底盘速度/轮系参数。
-- `task/default.yaml` 覆盖任务成功判据相关参数。
-- `reward/default.yaml` 通过 `scripts/train.py` 的 `_inject_reward_params()` 写回 `DoorPushEnvCfg`，其中也包含移动底盘的安全项系数。
-- `inference/default.yaml` 供 `scripts/render_policy_rollouts.py` 使用，负责 checkpoint、推理模式、视频输出目录、录制步数、设备和录制相机 `eye/lookat`。
-
-仓库中已删除旧训练链路对应的 `policy`、`curriculum`、`visualization` 配置，以及自定义 PPO / rollout / adapter 相关入口。
+- No curriculum config. The occupancy curriculum has been removed.
+- No cup/occupancy parameters in any active config.
+- PPO uses RoboDuet unified values: horizon=24, epochs=5, batches=4, LR=1e-3, entropy=0.01, KL=0.01.
+- Raw actions are unbounded; clip_actions=1e6 (not 1.0).

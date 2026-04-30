@@ -1,167 +1,6 @@
 # Affordance-Guided Interaction
 
-基于 **Isaac Lab** 仿真器与 **PPO** 强化学习算法，训练双臂机器人（Unitree Z1 × 2 + Dingo 底座）在持杯约束下完成“推门并进门”任务。当前成功条件要求门角达到 `1.2 rad`、杯子不掉、且 `base_link` 穿过门洞。策略接收仿真 ground truth 计算的 `door_geometry`（6 维门板几何）以及 `door_frame_corners`（12 维门洞内沿四角）作为门相关输入。
-
----
-
-## 快速开始
-
-### 环境依赖
-
-| 依赖 | 版本要求 | 说明 |
-|---|---|---|
-| Isaac Lab | ≥ 1.0 | 仿真引擎（含 Isaac Sim 4.x） |
-| Python | ≥ 3.10 | Isaac Lab 自带的 Python 环境 |
-| PyTorch | ≥ 2.0 | GPU 加速训练 |
-| TensorBoard | 可选 | 训练指标可视化 |
-
-### 安装
-
-```bash
-# 克隆仓库
-git clone https://github.com/<your-org>/Affordance-Guided-Interaction.git
-cd Affordance-Guided-Interaction
-
-# 确保 Isaac Lab 的 Python 环境已激活
-# 如果使用 conda：
-conda activate isaaclab
-
-# 将项目 src 加入 PYTHONPATH（或在已有 conda 环境中安装）
-export PYTHONPATH="${PWD}/src:${PYTHONPATH}"
-
-# 验证安装
-python -c "from affordance_guided_interaction.training import PPOTrainer; print('✅ OK')"
-```
-
----
-
-## 训练
-
-训练入口现在固定为：
-
-```bash
-python scripts/train.py
-```
-
-所有训练运行参数统一在 [configs/training/default.yaml](configs/training/default.yaml) 中调整，包括：
-
-- `headless`
-- `device`
-- `seed`
-- `resume`
-- `log_dir`
-- `ckpt_dir`
-- `num_envs`
-- `total_steps`
-
-### 本地验证（4060 Laptop）
-
-将 [configs/training/default.yaml](configs/training/default.yaml) 中的当前生效值切到文档内注释给出的 `4060 Laptop` 建议配置后运行：
-
-```bash
-python scripts/train.py
-```
-
-> 预期行为：控制台每轮迭代打印 `actor_loss / critic_loss / entropy / reward / stage`，无报错即管线正常。
-
-### 服务器训练（A100）
-
-将 [configs/training/default.yaml](configs/training/default.yaml) 中的当前生效值切到文档内注释给出的 `A100` 建议配置后运行：
-
-```bash
-python scripts/train.py
-```
-
-### 推荐环境数配置
-
-| 硬件 | YAML 中的 `num_envs` 建议值 | 用途 |
-|---|---|---|
-| RTX 4060 Laptop | 2 – 4 | 本地功能验证、debug |
-| RTX 4090 | 16 – 32 | 中等规模训练 |
-| A100 80GB | 64 – 128 | 正式训练 |
-
----
-
-## 训练监控
-
-### TensorBoard
-
-```bash
-tensorboard --logdir runs/
-```
-
-记录的核心指标：
-
-| 分类 | 指标 | 含义 |
-|---|---|---|
-| **损失** | `train/actor_loss` | 策略梯度损失 |
-| | `train/critic_loss` | 价值函数损失 |
-| | `train/entropy` | 策略熵（探索度） |
-| **优化** | `train/clip_fraction` | PPO 裁剪比例 |
-| | `train/approx_kl` | 近似 KL 散度 |
-| | `train/explained_variance` | Critic 拟合质量 |
-| **环境** | `collect/mean_reward` | 平均回合奖励 |
-| | `collect/completed_episodes` | 完成的 episode 数 |
-| **课程** | `curriculum/stage` | 当前课程阶段 (1-3) |
-| | `curriculum/window_mean` | 滑动窗口平均成功率 |
-
-### Checkpoint
-
-Checkpoint 默认每 50 轮迭代自动保存至 `checkpoints/` 目录，训练中断 (`Ctrl+C`) 时也会自动保存最终状态。
-
-每个 checkpoint 包含：Actor / Critic 权重、PPO 优化器状态、课程管理器进度。
-
----
-
-## 配置体系
-
-所有训练超参均通过 `configs/` 目录下的 YAML 文件管理：
-
-```
-configs/
-├── training/default.yaml    # PPO 超参、总步数、mini-batch 配置
-├── env/default.yaml         # 物理步长、机器人规格、USD 资产路径
-├── policy/default.yaml      # Actor/Critic 网络架构参数
-├── task/default.yaml        # 任务成功/失败判定条件
-└── curriculum/default.yaml  # 课程跃迁窗口与阈值
-```
-
-> 奖励权重已内联至 `DoorPushEnvCfg`（`door_push_env_cfg.py`），数学设计文档见 [`envs/Reward.md`](src/affordance_guided_interaction/envs/Reward.md)。
-
-修改配置后无需改动代码，`train.py` 会自动合并所有配置文件，并直接读取训练 YAML 中的运行时参数。
-
-### 关键超参速查
-
-```yaml
-# configs/training/default.yaml
-headless: false            # 是否无窗口运行
-num_envs: 2                # 并行环境数（当前生效值）
-total_steps: 50_000        # 总训练步数（当前生效值）
-n_steps_per_rollout: 128   # 每轮采集步数
-
-ppo:
-  gamma: 0.99              # 折扣因子
-  lam: 0.95                # GAE λ
-  clip_eps: 0.2            # PPO 裁剪参数
-  actor_lr: 3.0e-4         # Actor 学习率
-  critic_lr: 3.0e-4        # Critic 学习率
-  num_epochs: 5            # 优化轮数
-  seq_length: 16           # TBPTT 截断长度
-```
-
----
-
-## 课程学习
-
-训练采用三阶段课程自动跃迁，当滑动窗口（50 epoch）平均成功率 ≥ 80% 时自动进入下一阶段：
-
-| 阶段 | 门类型 | 持杯概率 | 学习目标 |
-|---|---|---|---|
-| Stage 1 | push | 0% | 基础推门接触 |
-| Stage 2 | push | 100% | 力控与稳定性约束 |
-| Stage 3 | push | 50% | 有杯 / 无杯混合场景下的稳定推门 |
-
-> 当前课程只针对 push 任务调度训练难度；阶段变化只影响持杯采样概率，门类型保持为 `push`。
+基于 **Isaac Lab** 与 **PPO** 训练双臂移动底盘机器人推开无把手门并穿门。79 维观测、15 维 raw Gaussian action、单 teacher PPO 策略。
 
 ---
 
@@ -170,76 +9,256 @@ ppo:
 ```
 Affordance-Guided-Interaction/
 ├── scripts/
-│   └── train.py                  # rl_games 训练入口
+│   ├── train.py                    # 训练入口
+│   ├── load_scene.py               # 场景加载/可视化
+│   └── render_policy_rollouts.py   # 策略推理回放
+├── configs/
+│   ├── training/default.yaml       # 训练 profile、环境数、总步数
+│   ├── env/default.yaml            # 物理步长、PD 增益、底盘参数
+│   ├── task/default.yaml           # 门角阈值、成功条件
+│   ├── reward/default.yaml         # 奖励权重与缩放
+│   └── inference/default.yaml      # 推理回放配置
 ├── src/affordance_guided_interaction/
-│   ├── envs/                     # DoorPush DirectRLEnv 及配置
-│   ├── tasks/                    # Gym task registry + rl_games agent 配置
+│   ├── envs/
+│   │   ├── door_push_env.py        # DirectRLEnv 核心（观测/奖励/终止/reset）
+│   │   ├── door_push_env_cfg.py    # 场景与环境参数 configclass
+│   │   ├── door_reward_math.py     # 各 reward 项的 tensor 计算
+│   │   ├── joint_target_math.py    # torque-proxy 关节目标映射
+│   │   ├── base_control_math.py    # 底盘速度命令映射（planar/wheel/force）
+│   │   ├── batch_math.py           # 批量四元数/坐标变换/基座采样
+│   │   ├── physx_mass_ops.py       # 门质量随机化写入 PhysX
+│   │   ├── gripper_hold.py         # Gripper 闭合保持
+│   │   └── doorway_geometry.py     # 门洞几何常量
+│   ├── tasks/door_push_direct/
+│   │   ├── __init__.py             # Gym task 注册
+│   │   └── agents/
+│   │       └── rl_games_ppo_cfg.yaml  # rl_games PPO agent 配置
 │   └── utils/
-│       ├── runtime_env.py        # 运行环境与 headless 解析
-│       └── train_runtime_config.py # 训练运行时配置解析
-├── src/teleop_cup_grasp/         # 杯体抓取遥操作（独立模块）
-├── configs/                      # 训练链路 YAML 配置
-├── assets/                       # USD 仿真资产
-├── model/                        # 预训练权重
-├── docs/                         # 当前流程文档
-```
-└── checkpoints/                  # 训练 checkpoint（自动生成）
+│       ├── rl_games_observer.py    # TensorBoard 自定义 observer
+│       ├── rl_games_config.py      # rl_games 配置构建
+│       ├── runtime_env.py          # 运行环境检测
+│       └── train_runtime_config.py # 训练配置解析与 profile 选择
+├── assets/
+│   ├── robot/usd/                  # 机器人 USD 资产
+│   └── minimal_push_door/          # 门板与侧墙 USD 资产
+├── tests/                          # 单元测试
+├── docs/
+│   └── training_pipeline_detailed.md  # 训练流水线数学详解
+└── RoboDuet/                       # 参考论文代码（独立模块）
 ```
 
 ---
 
-## 技术架构
+## 快速开始
 
-```
-             ┌──────────────────────────────────────────────────────┐
-             │  train.py                                           │
-             │  配置加载 → 环境创建 → 采集-优化-课程循环            │
-             └────────────────────┬─────────────────────────────────┘
-                                  │
-             ┌────────────────────▼─────────────────────────────────┐
-             │  DirectRLEnvAdapter                                  │
-             │  DoorPushEnv (tensor) → VecEnvProtocol (list[dict]) │
-             │  训练管线桥接层                                      │
-             └────────────────────┬─────────────────────────────────┘
-                                  │
-             ┌────────────────────▼─────────────────────────────────┐
-             │  DoorPushEnv  (DirectRLEnv)                         │
-             │  ┌──────────────────────────────────────────────┐   │
-             │  │ 自包含 GPU 批量环境                           │   │
-             │  │                                              │   │
-             │  │  • _get_observations()  非对称 Actor/Critic  │   │
-             │  │  • _get_rewards()       12 项 tensor 奖励    │   │
-             │  │  • _get_dones()         终止判定              │   │
-             │  │  • _reset_idx()         批量杯体抓取初始化    │   │
-             │  └──────────────────────────────────────────────┘   │
-             └────────────────────┬─────────────────────────────────┘
-                                  │
-          ┌───────────────────────┼───────────────────────┐
-          │                       │                       │
-┌─────────▼──────────┐ ┌─────────▼──────────┐ ┌──────────▼─────────┐
-│ DoorPushEnvCfg     │ │ DoorPushSceneCfg   │ │ Isaac Lab Cloner   │
-│ 环境参数+奖励权重  │ │ 声明式场景定义     │ │ 自动 N 环境复制    │
-│ (configclass)      │ │ Robot/Door/Cup/    │ │ GPU 批量仿真       │
-│                    │ │ ContactSensor      │ │                    │
-└────────────────────┘ └────────────────────┘ └────────────────────┘
-          │                       │                       │
-          └───────────────────────┼───────────────────────┘
-                                  │
-             ┌────────────────────▼─────────────────────────────────┐
-             │  Isaac Lab SimulationContext + PhysX GPU             │
-             │  GPU 物理仿真 (ArticulationView / RigidBodyView)    │
-             └──────────────────────────────────────────────────────┘
+### 依赖
+
+- Isaac Lab >= 1.0（含 Isaac Sim 4.x）
+- Python >= 3.10
+- PyTorch >= 2.0
+
+### 训练
+
+```bash
+python scripts/train.py
 ```
 
-### 核心设计
+默认使用 `env_256` profile（256 并行环境）。可在 `configs/training/default.yaml` 最后一行切换 profile。
 
-- **无 Python 循环**：所有 per-env 状态为 `(num_envs, ...)` 形状的 torch tensor，观测 / 奖励 / 终止判定均为纯 tensor 操作
-- **Cloner 自动复制**：`DoorPushSceneCfg` 声明式定义场景（机器人、门、杯体、接触传感器），Isaac Lab Cloner 自动为 N 个并行环境复制完整场景子树
-- **自包含环境**：`DoorPushEnv` 内置 12 项奖励计算（任务进展 + 稳定性约束 + 安全惩罚）、非对称 Actor/Critic 观测构建、批量杯体抓取初始化，无需外部 Manager
-- **非对称观测**：Actor 含传感器噪声 + `door_geometry(6D)` + `door_frame_corners(12D)`；Critic 含无噪声物理状态 + 门关节角/速度/质量等 privileged 信息
-- **适配器桥接**：`DirectRLEnvAdapter` 将 tensor 接口转换为训练管线 (`RolloutCollector`) 期望的 `VecEnvProtocol`
+### 场景可视化(还没维护)
+
+```bash
+python scripts/load_scene.py
+```
+
+### 策略推理回放(还没维护)
+
+```bash
+python scripts/render_policy_rollouts.py
+```
 
 ---
+
+## 训练监控
+
+```bash
+tensorboard --logdir runs/
+```
+
+核心指标：
+
+| 分类 | Tag | 含义 |
+| --- | --- | --- |
+| 奖励 | `reward/total` | episode 总奖励均值 |
+| | `reward/opening` | 开门奖励 |
+| | `reward/passing` | 穿门奖励 |
+| | `reward/shaping` | 正则化奖励 |
+| 成功率 | `success/rate` | 成功穿门比例 |
+| | `success/opened_enough_rate` | 门角 >= 30° 比例 |
+| 诊断 | `task/door_angle_mean` | done env 门角均值 |
+| | `task/base_cross_progress` | 底盘穿门进度 |
+| | `losses/a_loss` | PPO actor loss |
+| | `losses/c_loss` | PPO critic loss |
+| | `losses/entropy` | 策略熵 |
+
+---
+
+## 配置体系
+
+所有参数通过 `configs/` 下的 YAML 文件管理，修改后无需改动代码。
+
+### 训练 profile（`configs/training/default.yaml`）
+
+最后一行控制生效的 profile：
+
+```yaml
+<<: [*runtime_defaults, *profile_env256]   # 修改此处切换 profile
+```
+
+可选 profile：
+
+| Profile | `num_envs` | `total_steps` | 适用硬件 |
+| --- | --- | --- | --- |
+| `env_256` | 256 | 5 亿 | RTX 4060 / debug |
+| `env_512` | 512 | 4 亿 | RTX 4070 |
+| `env_1024` | 1024 | 3 亿 | RTX 4090 |
+| `env_2048` | 2048 | 2 亿 | RTX 4090 |
+| `env_4096` | 4096 | 3 亿 | A100 |
+| `env_6144` | 6144 | 30 亿 | A100 x2 |
+
+运行时参数：
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `headless` | `true` | 无窗口模式 |
+| `device` | `cuda:0` | 训练 GPU |
+| `seed` | `42` | 随机种子 |
+| `log_dir` | `runs` | 日志目录 |
+
+PPO 超参数（`ppo_common` 段）：
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `gamma` | `0.99` | 折扣因子 |
+| `lam` | `0.95` | GAE λ |
+| `clip_eps` | `0.2` | PPO clip 系数 |
+| `entropy_coef` | `0.01` | 熵正则系数 |
+| `actor_lr` | `1e-3` | 学习率 |
+| `num_epochs` | `5` | 每 rollout 更新轮数 |
+| `num_mini_batches` | `4` | mini-batch 数 |
+
+### 环境参数（`configs/env/default.yaml`）
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `physics_dt` | `0.008333` | 物理步长 (~120 Hz) |
+| `decimation` | `2` | 控制频率 = 60 Hz |
+| `arm_action_scale_rad` | `0.25` | raw action → 关节偏移缩放 |
+| `arm_pd_stiffness` | `50.0` | 手臂 PD 刚度 |
+| `arm_pd_damping` | `4.5` | 手臂 PD 阻尼 |
+| `base_max_lin_vel_x/y` | `0.5` | 底盘最大线速度 |
+| `base_max_ang_vel_z` | `1.0` | 底盘最大角速度 |
+
+### 奖励权重（`configs/reward/default.yaml`）
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `opening.scale` | `3.0` | 开门奖励缩放 |
+| `opening.theta_hat` | `75.0` | 开门目标角 (°) |
+| `opening.theta_pass` | `70.0` | 进入 passing 阶段的角度 (°) |
+| `shaping.w_min_arm_motion` | `0.3` | 最小手臂运动惩罚权重 |
+| `shaping.w_stretched_arm` | `1.0` | 手臂过伸惩罚权重 |
+| `shaping.w_end_effector_to_panel` | `1.0` | 末端靠近门板奖励权重 |
+| `shaping.w_command_limit` | `0.1` | raw action 过大惩罚权重 |
+| `shaping.w_collision` | `2.0` | 硬碰撞惩罚权重 |
+
+### 任务阈值（`configs/task/default.yaml`）
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `theta_open` | `0.5236` (π/6) | opened_enough 判定角 |
+| `theta_pass` | `1.2217` (70°) | passing stage 切换角 |
+| `theta_hat` | `1.3090` (75°) | 开门奖励目标角 |
+| `reverse_angle_limit` | `-0.05` | 反向开门阈值 |
+
+### 网络结构（`rl_games_ppo_cfg.yaml`）
+
+位于 `src/.../agents/rl_games_ppo_cfg.yaml`，控制策略网络：
+
+| 参数 | 默认值 |
+| --- | --- |
+| MLP 层 | `[512, 256, 128]` |
+| 激活函数 | `elu` |
+| `fixed_sigma` | `True` |
+| `sigma_init` | `-2.0` |
+
+---
+
+## 域随机化
+
+每个 episode reset 时自动采样：
+
+| 参数 | 范围 | 说明 |
+| --- | --- | --- |
+| 门板质量 | $U[15, 75]$ kg | 写入 PhysX |
+| 铰链阻力 | $U[0, 30]$ Nm，20% 概率置零 | 静态摩擦扭矩 |
+| 空气阻尼 | $U[0, 4]$ Nm·s² | 二次阻尼 |
+| Closer 阻尼 | $\alpha \cdot \tau_{res}$，$\alpha \sim U[1.5, 3]$，40% 概率置零 | 线性阻尼 |
+| 基座距离 | $U[1, 2]$ m | 距门距离 |
+| 基座横向偏移 | $U[-2, 2]$ m | 门洞法向偏移 |
+| 基座初始 yaw | $U[-\pi, \pi]$ | 相对门洞方向 |
+| 基座初始速度 | $U[-0.5, 0.5]$ m/s | xy 方向 |
+
+随机化参数在 `DoorPushEnvCfg` 中配置（`door_push_env_cfg.py`）。
+
+---
+
+## 技术参考
+
+本项目的实现参考了三个来源，分别对应训练管线骨架、奖励设计、PPO 训练框架：
+
+### 训练管线骨架 — Isaac Lab 官方示例
+
+`scripts/train.py` 的整体结构沿袭自 Isaac Lab 官方训练脚本 `IsaacLab/scripts/reinforcement_learning/rl_games/train.py`：
+
+- **配置加载**：YAML 多文件合并 → task registry 查找 env/agent cfg → `AppLauncher` 初始化
+- **环境创建**：`gym.make(task_name, cfg=env_cfg)` → `RlGamesVecEnvWrapper` 适配 rl_games 接口
+- **训练循环**：由 rl_games `Runner` 驱动，环境侧为 Isaac Lab `DirectRLEnv`
+
+主要差异在于我们把官方脚本中的硬编码路径改为了 `configs/` 下可配置的 profile 体系，并加入了自定义 TensorBoard observer。
+
+### 奖励与任务设计 — RoboDuet 论文 (2409.04882)
+
+奖励的 opening/passing/shaping 三阶段结构和域随机化参数范围直接来自论文 *RoboDuet* 的 Appendix A/B：
+
+- **Opening reward** $r_{od}$：$1 - |\theta - \hat\theta|/\hat\theta$，目标角 75°，缩放 3.0
+- **Passing reward** $r_p$：底盘速度在 progress 方向的投影 / 最大速度，clip [0, 1]
+- **Stage 切换**：门角 > 70° 从 opening 进入 passing，opening reward 取满值
+- **域随机化**：门质量 [15,75] kg、铰链阻力 [0,30] Nm（20% 置零）、空气阻尼 [0,4]、closer 阻尼 = α·τ_res（α~[1.5,3]，40% 置零）、基座距离 [1,2]m、横向偏移 [-2,2]m、yaw [-π,π]
+
+与论文的不同之处：
+- 论文包含门把手操作（handle grasp/turn）、学生策略蒸馏、RNN student、多门类型估计，我们当前任务是 **handle-free push door**，不涉及这些
+- 论文随机化手臂 PD 增益（$K_p \sim U[40,60]$, $K_d \sim U[3,6]$），我们当前使用固定值
+- 论文有门几何尺寸随机化，我们使用单一门模型
+
+`RoboDuet/` 目录下保留了论文的原始实现供参考。
+
+### PPO 训练框架 — rl_games
+
+PPO 算法本身使用 [rl_games](https://github.com/Denys88/rl_games) 库，与 RoboDuet 论文代码的选择一致：
+
+- Actor-Critic 共享 backbone（`network.separate: False`），MLP [512, 256, 128]
+- Clipped surrogate objective + clipped value loss + entropy bonus
+- 自适应学习率（基于 KL 散度阈值 0.01）
+- Mixed precision（bfloat16）
+
+RoboDuet 的 PPO 实现（`RoboDuet/go1_gym_learn/ppo_cse_unified/ppo.py`）是独立手写的双头 PPO（dog/arm 分离 value head + β 交叉 advantage），而我们的项目直接使用 rl_games 库的单头 PPO，配置在 `src/.../agents/rl_games_ppo_cfg.yaml` 中。
+
+---
+
+## 详细文档
+
+训练流水线的完整数学建模（MDP 定义、动作映射、观测构造、奖励公式、PPO loss、GAE、域随机化）见 [`docs/training_pipeline_detailed.md`](docs/training_pipeline_detailed.md)。
 
 ## License
 

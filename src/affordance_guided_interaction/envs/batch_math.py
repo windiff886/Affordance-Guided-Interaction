@@ -356,3 +356,59 @@ def compute_relative_angular_velocity_world(
 ) -> Tensor:
     """Compute the angular velocity of a point relative to the base in world frame."""
     return point_ang_vel_w - base_ang_vel_w
+
+
+def sample_base_poses_in_door_frame(
+    n: int,
+    *,
+    door_origin_xy: tuple[float, float] = (2.95, 0.00),
+    door_cross_dir_xy: tuple[float, float] = (-1.0, 0.0),
+    door_lateral_dir_xy: tuple[float, float] = (0.0, 1.0),
+    base_height: float = 0.014855,
+    distance_to_wall_range: tuple[float, float] = (1.0, 2.0),
+    lateral_offset_range: tuple[float, float] = (-2.0, 2.0),
+    yaw_range: tuple[float, float] = (-math.pi, math.pi),
+    device: torch.device | str = "cpu",
+) -> tuple[Tensor, Tensor]:
+    """Sample base poses in door-frame coordinates, paper-aligned.
+
+    The base is placed on the outside side of the door:
+        pos_xy = door_origin - distance * cross_dir + offset * lateral_dir
+        yaw = atan2(cross_dir) + U(-pi, pi)
+
+    Parameters
+    ----------
+    n : int -- number of samples
+    door_origin_xy : door frame origin in world XY
+    door_cross_dir_xy : unit vector from outside to inside (pointing into doorway)
+    door_lateral_dir_xy : unit vector along door lateral direction
+    base_height : z height of base link
+    distance_to_wall_range : (min, max) distance from base to wall
+    lateral_offset_range : (min, max) lateral offset
+    yaw_range : (min, max) yaw range in radians
+    device : torch device
+
+    Returns
+    -------
+    positions : (n, 3) world coordinates [x, y, z]
+    yaws : (n,) radians
+    """
+    dev = torch.device(device)
+    origin = torch.tensor(door_origin_xy, dtype=torch.float32, device=dev)
+    cross = torch.tensor(door_cross_dir_xy, dtype=torch.float32, device=dev)
+    lateral = torch.tensor(door_lateral_dir_xy, dtype=torch.float32, device=dev)
+
+    distance = torch.empty(n, device=dev).uniform_(*distance_to_wall_range)
+    offset = torch.empty(n, device=dev).uniform_(*lateral_offset_range)
+
+    pos_xy = (origin.unsqueeze(0)
+              - distance.unsqueeze(-1) * cross.unsqueeze(0)
+              + offset.unsqueeze(-1) * lateral.unsqueeze(0))
+
+    base_z = torch.full((n,), base_height, device=dev)
+    positions = torch.stack([pos_xy[:, 0], pos_xy[:, 1], base_z], dim=-1)
+
+    door_yaw = math.atan2(float(door_cross_dir_xy[1]), float(door_cross_dir_xy[0]))
+    yaws = door_yaw + torch.empty(n, device=dev).uniform_(*yaw_range)
+
+    return positions, yaws

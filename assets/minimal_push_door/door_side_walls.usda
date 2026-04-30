@@ -1,0 +1,40 @@
+#usda 1.0
+(
+    defaultPrim = "DoorSideWalls"
+    doc = """Static wall segments flanking the doorway, extracted from room_shell.usda.
+
+    Contains only the two front-wall segments adjacent to the door opening.
+    Does NOT include back wall, side walls, floor, or front-wall header.
+    Place at env origin; door should be at (2.93, 0, 0).
+    """
+    metersPerUnit = 1
+    kilogramsPerUnit = 1
+    upAxis = "Z"
+)
+
+def Xform "DoorSideWalls"
+{
+    # ── Front wall, left segment (y < -0.5) ──────────────────────────
+    def Cube "FrontWallLeft" (
+        prepend apiSchemas = ["PhysicsCollisionAPI"]
+    )
+    {
+        color3f[] primvars:displayColor = [(0.90, 0.90, 0.88)]
+        double size = 1
+        double3 xformOp:translate = (2.95, -1.50, 1.1)
+        float3 xformOp:scale = (0.1, 2.0, 2.2)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+    }
+
+    # ── Front wall, right segment (y > +0.5) ─────────────────────────
+    def Cube "FrontWallRight" (
+        prepend apiSchemas = ["PhysicsCollisionAPI"]
+    )
+    {
+        color3f[] primvars:displayColor = [(0.90, 0.90, 0.88)]
+        double size = 1
+        double3 xformOp:translate = (2.95, 1.50, 1.1)
+        float3 xformOp:scale = (0.1, 2.0, 2.2)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+    }
+}

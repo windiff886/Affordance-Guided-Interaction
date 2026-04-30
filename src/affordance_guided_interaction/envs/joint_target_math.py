@@ -27,12 +27,49 @@ def build_grasp_init_joint_positions(
     return joint_pos
 
 
-def rescale_normalized_joint_actions(actions: Tensor, q_min: Tensor, q_max: Tensor) -> Tensor:
-    """Map normalized actions in ``[-1, 1]`` to joint-position targets."""
-    bounded_actions = torch.clamp(actions, -1.0, 1.0)
-    half_range = 0.5 * (q_max - q_min)
-    center = 0.5 * (q_max + q_min)
-    return center.unsqueeze(0) + bounded_actions * half_range.unsqueeze(0)
+def compute_torque_proxy_joint_targets(
+    actions: Tensor,
+    *,
+    default_joint_pos: Tensor,
+    current_joint_pos: Tensor,
+    torque_limits: Tensor,
+    stiffness: Tensor,
+    action_scale: float,
+    sigma: float,
+) -> Tensor:
+    """Compute joint-position targets using the torque-proxy clamping model.
+
+    A raw target is first formed from the default pose plus a scaled action offset.
+    The target is then clamped to a band around the *current* joint position whose
+    half-width is proportional to ``torque_limits / stiffness`` (scaled by ``sigma``).
+    This prevents the policy from requesting position targets that would require
+    torques beyond the actuator limits.
+
+    Parameters
+    ----------
+    actions:
+        Normalized actions from the policy (shape ``[B, num_joints]``).
+    default_joint_pos:
+        Default (rest) joint positions (shape ``[num_joints]``).
+    current_joint_pos:
+        Current joint positions (shape ``[B, num_joints]``).
+    torque_limits:
+        Per-joint maximum torque (shape ``[num_joints]``).
+    stiffness:
+        Per-joint PD stiffness (shape ``[num_joints]``).
+    action_scale:
+        Multiplicative scale applied to actions before adding to defaults.
+    sigma:
+        Safety factor controlling how tightly the target is clamped around the
+        current position (higher = looser clamp).
+    """
+    raw_target = default_joint_pos.unsqueeze(0) + actions * action_scale
+    delta_limit = sigma * torque_limits / stiffness
+    return torch.clamp(
+        raw_target,
+        current_joint_pos - delta_limit.unsqueeze(0),
+        current_joint_pos + delta_limit.unsqueeze(0),
+    )
 
 
 def compute_joint_limit_margin_penalty(

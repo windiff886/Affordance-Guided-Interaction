@@ -9,29 +9,26 @@ import torch
 
 
 def build_gripper_hold_targets(
-    left_occupied: torch.Tensor,
-    right_occupied: torch.Tensor,
-    occupied_deg: float,
-    unoccupied_deg: float,
+    num_envs: int,
+    neutral_deg: float,
+    device: torch.device | str = "cpu",
 ) -> torch.Tensor:
     """Build per-env left/right gripper hold targets in radians.
 
+    Returns a ``(N, 2)`` tensor where both the left and right gripper target
+    angles are set to *neutral_deg* (converted to radians).
+    Both grippers always use the same neutral position.
+
     Parameters
     ----------
-    left_occupied, right_occupied:
-        Shape ``(N,)`` 的布尔张量，表示左右臂是否处于持杯状态。
-    occupied_deg:
-        持杯侧夹爪保持角（单位：度）。
-    unoccupied_deg:
-        非持杯侧夹爪保持角（单位：度）。
+    num_envs:
+        Number of parallel environments (``N``).
+    neutral_deg:
+        Neutral gripper hold angle in degrees.
+    device:
+        Torch device for the returned tensor.
     """
-    if left_occupied.shape != right_occupied.shape:
-        raise ValueError("left_occupied and right_occupied must have the same shape")
-
-    occupied = torch.tensor(float(occupied_deg), device=left_occupied.device)
-    unoccupied = torch.tensor(float(unoccupied_deg), device=left_occupied.device)
-
-    left_target_deg = torch.where(left_occupied, occupied, unoccupied)
-    right_target_deg = torch.where(right_occupied, occupied, unoccupied)
-    targets_deg = torch.stack((left_target_deg, right_target_deg), dim=-1)
-    return torch.deg2rad(targets_deg.to(dtype=torch.float32))
+    target_rad = torch.tensor(float(neutral_deg), dtype=torch.float32, device=device)
+    target_rad = torch.deg2rad(target_rad)
+    # Shape (N, 2): [left_target, right_target]
+    return target_rad.expand(num_envs, 2).clone()

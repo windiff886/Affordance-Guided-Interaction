@@ -1,6 +1,6 @@
 runtime_defaults: &runtime_defaults
   headless: true
-  device: cuda:1
+  device: cuda:0
   seed: 42
   resume: null
   log_dir: runs
@@ -11,85 +11,77 @@ ppo_common: &ppo_common
   clip_eps: 0.2
   value_clip_eps: 0.2
   use_clipped_value_loss: true
-  entropy_coef: 0.001
+  entropy_coef: 0.01
   sigma_init_logstd: -2.0
-  adaptive_lr_max: 1.0e-3
-  value_coef: 0.5
+  adaptive_lr_min: 1.0e-5
+  adaptive_lr_max: 1.0e-2
+  actor_lr: 1.0e-3
+  critic_lr: 1.0e-3
+  value_coef: 1.0
+  bounds_loss_coef: 0.0
   max_grad_norm: 1.0
-  seq_length: 16
+  seq_length: 4
   normalize_advantages: true
 
 profiles:
   env_256: &profile_env256
     num_envs: 256
     total_steps: 500_000_000
-    n_steps_per_rollout: 64
+    n_steps_per_rollout: 24
     checkpoint_interval: 100
     ppo:
       <<: *ppo_common
-      actor_lr: 3.0e-4
-      critic_lr: 3.0e-4
-      num_mini_batches: 8
-      num_epochs: 4
+      num_mini_batches: 4
+      num_epochs: 5
 
   env_512: &profile_env512
     num_envs: 512
     total_steps: 400_000_000
-    n_steps_per_rollout: 64
+    n_steps_per_rollout: 24
     checkpoint_interval: 75
     ppo:
       <<: *ppo_common
-      actor_lr: 3.0e-4
-      critic_lr: 3.0e-4
-      num_mini_batches: 16
-      num_epochs: 4
+      num_mini_batches: 4
+      num_epochs: 5
 
   env_1024: &profile_env1024
     num_envs: 1024
     total_steps: 300_000_000
-    n_steps_per_rollout: 64
+    n_steps_per_rollout: 24
     checkpoint_interval: 50
     ppo:
       <<: *ppo_common
-      actor_lr: 2.5e-4
-      critic_lr: 2.5e-4
-      num_mini_batches: 16
-      num_epochs: 3
+      num_mini_batches: 4
+      num_epochs: 5
 
   env_2048: &profile_env2048
     num_envs: 2048
     total_steps: 200_000_000
-    n_steps_per_rollout: 64
+    n_steps_per_rollout: 24
     checkpoint_interval: 25
     ppo:
       <<: *ppo_common
-      actor_lr: 2.0e-4
-      critic_lr: 2.0e-4
-      num_mini_batches: 32
-      num_epochs: 3
+      num_mini_batches: 4
+      num_epochs: 5
 
   env_4096: &profile_env4096
     num_envs: 4096
     total_steps: 300_000_000
-    n_steps_per_rollout: 64
+    n_steps_per_rollout: 24
     checkpoint_interval: 20
     ppo:
       <<: *ppo_common
-      actor_lr: 2.0e-4
-      critic_lr: 2.0e-4
-      num_mini_batches: 16
-      num_epochs: 2
+      num_mini_batches: 4
+      num_epochs: 5
 
   env_6144: &profile_env6144
     num_envs: 6144
     total_steps: 3000_000_000
-    n_steps_per_rollout: 64
+    n_steps_per_rollout: 24
     checkpoint_interval: 20
     ppo:
       <<: *ppo_common
-      actor_lr: 2.0e-4
-      critic_lr: 2.0e-4
-      num_mini_batches: 24
-      num_epochs: 2
+      num_mini_batches: 4
+      num_epochs: 5
 
 <<: [*runtime_defaults, *profile_env6144]
