@@ -211,6 +211,15 @@ $$
 
 由于硬碰撞传感器依赖 PhysX rigid/contact view，当前场景保持 `replicate_physics=True`，但显式设置 `clone_in_fabric=False`。若启用 Fabric clone，ContactSensor 在 `sim.reset()` 初始化时会出现 contact reporter body 数量不匹配，训练会在进入 rl_games 前中断。
 
+机器人 articulation root 固定在世界中，通过 planar joints 表达底盘平面运动；当前机器人自碰撞保持开启：
+
+```text
+fix_root_link=True
+enabled_self_collisions=True
+solver_position_iteration_count=24
+solver_velocity_iteration_count=12
+```
+
 门的默认 root pose 为：
 
 $$
@@ -241,8 +250,10 @@ $$
 `left_jointGripper` 和 `right_jointGripper` 固定在闭合角：
 
 $$
-q_{\text{gripper}}=\operatorname{rad}(-32^\circ).
+q_{\text{gripper}}=\operatorname{rad}(0^\circ).
 $$
+
+对应 URDF gripper 关节限位为 $[-90^\circ,0^\circ]$：$-90^\circ$ 是打开端，$0^\circ$ 是完全闭合端。历史抓杯流程中的 $-32^\circ$ / $-34^\circ$ 是夹住杯壁的保持角，不是当前无杯任务的完全闭合角。
 
 底盘训练默认使用 planar joint velocity backend，对应：
 
@@ -325,7 +336,7 @@ $$
 
 $$
 q_{\text{default}}=
-(0,0,0,0,0,\pi/2,0,0,0,0,0,\pi/2).
+(0,0,0,0,0,0,0,0,0,0,0,0).
 $$
 
 先得到 raw target：
@@ -1146,8 +1157,8 @@ $$
 1. 采样 domain randomization。
 2. 采样 base pose。
 3. 写 robot root state。
-4. 写 robot joint state，包括双臂默认姿态、planar base pose 和初始速度。
-5. 固定 gripper closed target。
+4. 写 robot joint state，包括双臂全零默认姿态、gripper 完全闭合位置、planar base pose 和初始速度。
+5. 固定 gripper closed target；这里不仅设置控制目标，reset 时也已经把 gripper joint position 写到闭合端。
 6. 把 door joint state 重置为 0。
 7. 写 arm target 和 planar base velocity target；只有在 `training_planar_base_only=False` 的非默认路径下才额外写 wheel velocity target。
 8. `scene.write_data_to_sim()`。

@@ -81,8 +81,9 @@ DOOR_LATERAL_DIR_XY: tuple[float, float] = (0.0, 1.0)
 
 DOOR_LEAF_BODY_NAME: str = "DoorLeaf"
 
-# Gripper constants (non-policy-controlled)
-GRIPPER_CLOSED_DEG: float = -32.0
+# Gripper constants (non-policy-controlled).
+# URDF joint range is [-90 deg, 0 deg]: -90 is open, 0 is fully closed.
+GRIPPER_CLOSED_DEG: float = 0.0
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -141,9 +142,9 @@ class DoorPushSceneCfg(InteractiveSceneCfg):
             ),
             articulation_props=sim_utils.ArticulationRootPropertiesCfg(
                 fix_root_link=True,
-                enabled_self_collisions=False,
-                solver_position_iteration_count=8,
-                solver_velocity_iteration_count=4,
+                enabled_self_collisions=True,
+                solver_position_iteration_count=24,
+                solver_velocity_iteration_count=12,
             ),
         ),
         init_state=ArticulationCfg.InitialStateCfg(
@@ -162,8 +163,8 @@ class DoorPushSceneCfg(InteractiveSceneCfg):
                 joint_names_expr=["left_joint2", "right_joint2"],
                 effort_limit=60.0,
                 velocity_limit=2.175,
-                stiffness=50.0,
-                damping=4.5,
+                stiffness=1000.0,
+                damping=100.0,
             ),
             "arm_joints": ImplicitActuatorCfg(
                 joint_names_expr=[
@@ -174,8 +175,8 @@ class DoorPushSceneCfg(InteractiveSceneCfg):
                 ],
                 effort_limit=30.0,
                 velocity_limit=2.175,
-                stiffness=50.0,
-                damping=4.5,
+                stiffness=1000.0,
+                damping=100.0,
             ),
             "gripper": ImplicitActuatorCfg(
                 joint_names_expr=["left_jointGripper", "right_jointGripper"],
@@ -292,11 +293,11 @@ class DoorPushEnvCfg(DirectRLEnvCfg):
     arm_action_scale_rad: float = 0.25
     torque_proxy_sigma: float = 0.7
     arm_default_joint_pos: tuple[float, ...] = (
-        0.0, 0.0, 0.0, 0.0, 0.0, math.pi / 2.0,
-        0.0, 0.0, 0.0, 0.0, 0.0, math.pi / 2.0,
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
     )
-    arm_pd_stiffness: float = 50.0
-    arm_pd_damping: float = 4.5
+    arm_pd_stiffness: float = 1000.0
+    arm_pd_damping: float = 100.0
     base_control_backend: str = "planar_joint_velocity"
     training_planar_base_only: bool = False
     emit_wheel_debug_state: bool = True

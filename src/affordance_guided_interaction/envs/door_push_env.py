@@ -758,13 +758,16 @@ class DoorPushEnv(DirectRLEnv):
         default_root[:, 7:] = 0.0
         robot.write_root_state_to_sim(default_root, env_ids)
 
-        # Set arm joints to default [0,0,0,0,0,pi/2] per arm
+        # Set arm joints to the configured default pose.
         default_jpos = robot.data.default_joint_pos[env_ids].clone()
         default_jvel = robot.data.default_joint_vel[env_ids].clone()
 
         # Arm defaults
         arm_default = torch.tensor(self.cfg.arm_default_joint_pos, device=self.device, dtype=torch.float32)
         default_jpos[:, self._arm_joint_ids] = arm_default.unsqueeze(0).expand(n, -1)
+
+        # Gripper closed (position, not just target)
+        default_jpos[:, self._gripper_joint_ids] = self._gripper_closed_targets.unsqueeze(0).expand(n, -1)
 
         # Planar base pose
         default_jpos[:, self._planar_joint_ids[0]] = self._base_pos[env_ids, 0]

@@ -37,7 +37,25 @@ from affordance_guided_interaction.utils.train_runtime_config import resolve_tra
 ARM_ACTION_DIM = 12
 BASE_ACTION_DIM = 3
 ACTION_DIM = ARM_ACTION_DIM + BASE_ACTION_DIM
-BASE_ACTION_LABELS = ("Base Vx", "Base Vy", "Base Wz")
+BASE_ACTION_LABELS = ("Base Vx (m/s)", "Base Vy (m/s)", "Base Wz (rad/s)")
+
+
+def _get_arm_joint_ranges(controller: ManualDoorPushController) -> list[tuple[float, float]]:
+    """Read per-joint position limits from the robot articulation."""
+    robot = controller.base_env.scene["robot"]
+    arm_joint_ids = controller.base_env._arm_joint_ids
+    limits = robot.data.soft_joint_pos_limits[0]  # (num_joints, 2)
+    return [(float(limits[jid, 0]), float(limits[jid, 1])) for jid in arm_joint_ids]
+
+
+def _get_base_slider_ranges(controller: ManualDoorPushController) -> list[tuple[float, float]]:
+    """Velocity ranges for the three base command dimensions."""
+    cfg = controller.base_env.cfg
+    return [
+        (-cfg.base_max_lin_vel_x, cfg.base_max_lin_vel_x),
+        (-cfg.base_max_lin_vel_y, cfg.base_max_lin_vel_y),
+        (-cfg.base_max_ang_vel_z, cfg.base_max_ang_vel_z),
+    ]
 
 
 def build_action_tensor(action_values: Sequence[float], *, device: str | torch.device) -> torch.Tensor:
@@ -89,12 +107,17 @@ class ManualDoorPushController:
         self.pending_reset: bool = False
         self.last_step_info: dict[str, Any] = {}
         self.last_env_action = torch.zeros(ACTION_DIM, dtype=torch.float32)
+        self._arm_defaults: list[float] = self.base_env._arm_default_pos.tolist()
+        self._arm_scale: float = float(self.base_env.cfg.arm_action_scale_rad)
 
     def request_reset(self) -> None:
         self.pending_reset = True
 
     def zero_actions(self) -> None:
-        self.device.reset()
+        for i in range(ARM_ACTION_DIM):
+            self.device.set_action_value(i, self._arm_defaults[i])
+        for i in range(ARM_ACTION_DIM, ACTION_DIM):
+            self.device.set_action_value(i, 0.0)
 
     def toggle_pause(self) -> None:
         self.paused = not self.paused
@@ -129,12 +152,25 @@ class ManualDoorPushController:
 
     def _apply_pending_reset(self) -> None:
         self.env.reset()
-        self.device.reset()
+        state = self.base_env.get_debug_state()
+        arm_q = state["arm_joint_positions"][0].detach().cpu().tolist()
+        for i in range(ARM_ACTION_DIM):
+            self.device.set_action_value(i, arm_q[i])
+        for i in range(ARM_ACTION_DIM, ACTION_DIM):
+            self.device.set_action_value(i, 0.0)
         self.pending_reset = False
 
     def _build_env_action(self) -> torch.Tensor:
-        """Pass raw action values directly to the environment."""
-        return self.device.advance().unsqueeze(0)
+        """Convert joint-target + base-velocity sliders to raw actions."""
+        values = self.device.action_values
+        raw = [0.0] * ACTION_DIM
+        for i in range(ARM_ACTION_DIM):
+            raw[i] = (values[i] - self._arm_defaults[i]) / self._arm_scale
+        cfg = self.base_env.cfg
+        raw[ARM_ACTION_DIM] = values[ARM_ACTION_DIM] / cfg.base_max_lin_vel_x
+        raw[ARM_ACTION_DIM + 1] = values[ARM_ACTION_DIM + 1] / cfg.base_max_lin_vel_y
+        raw[ARM_ACTION_DIM + 2] = values[ARM_ACTION_DIM + 2] / cfg.base_max_ang_vel_z
+        return torch.tensor([raw], dtype=torch.float32, device=str(self.base_env.device))
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -244,7 +280,7 @@ def _format_status_text(controller: ManualDoorPushController) -> str:
         "joint_tracking:",
         *tracking_lines,
         "",
-        "raw_action:",
+        "slider_targets (arm rad, base m/s rad/s):",
         ", ".join(f"{value:+.3f}" for value in controller.device.action_values),
     ]
     return "\n".join(lines)
@@ -309,8 +345,9 @@ def _build_ui(controller: ManualDoorPushController) -> tuple[list[Any], Any, Any
                     ui.Button("Zero Actions", clicked_fn=controller.zero_actions)
 
                 ui.Spacer(height=6)
-                ui.Label("15D Raw Action Sliders [-1, 1]", height=22)
+                ui.Label("Arm Joint Targets (rad)", height=22)
 
+                arm_ranges = _get_arm_joint_ranges(controller)
                 for idx, joint_name in enumerate(arm_joint_names):
                     model = ui.SimpleFloatModel(0.0)
                     slider_models.append(model)
@@ -324,15 +361,16 @@ def _build_ui(controller: ManualDoorPushController) -> tuple[list[Any], Any, Any
                             ui=ui,
                             label_text=_joint_slider_label(joint_name),
                             model=model,
-                            range_min=-1.0,
-                            range_max=1.0,
+                            range_min=arm_ranges[idx][0],
+                            range_max=arm_ranges[idx][1],
                             step=0.02,
                             value_format=".3f",
                         )
                     )
 
                 ui.Spacer(height=6)
-                ui.Label("Base Raw Actions [-1, 1]", height=22)
+                ui.Label("Base Velocity Commands", height=22)
+                base_ranges = _get_base_slider_ranges(controller)
                 for idx, label_text in enumerate(BASE_ACTION_LABELS):
                     action_index = ARM_ACTION_DIM + idx
                     model = ui.SimpleFloatModel(0.0)
@@ -347,8 +385,8 @@ def _build_ui(controller: ManualDoorPushController) -> tuple[list[Any], Any, Any
                             ui=ui,
                             label_text=label_text,
                             model=model,
-                            range_min=-1.0,
-                            range_max=1.0,
+                            range_min=base_ranges[idx][0],
+                            range_max=base_ranges[idx][1],
                             step=0.02,
                             value_format=".3f",
                         )
