@@ -45,6 +45,7 @@ params:
     device_name: 'cuda:0'
     multi_gpu: False
     ppo: True
+    clip_actions: False
     mixed_precision: True
     normalize_input: True
     normalize_value: True

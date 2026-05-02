@@ -12,6 +12,7 @@ ppo_common: &ppo_common
   value_clip_eps: 0.2
   use_clipped_value_loss: true
   entropy_coef: 0.01
+  clip_actions: false
   sigma_init_logstd: -2.0
   adaptive_lr_min: 1.0e-5
   adaptive_lr_max: 1.0e-2

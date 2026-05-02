@@ -227,6 +227,7 @@ def build_rl_games_agent_cfg(
     if "adaptive_lr_min" in ppo_cfg:
         config_section["adaptive_lr_min"] = float(ppo_cfg["adaptive_lr_min"])
     config_section["entropy_coef"] = float(ppo_cfg.get("entropy_coef", config_section.get("entropy_coef", 0.0)))
+    config_section["clip_actions"] = bool(ppo_cfg.get("clip_actions", False))
     config_section["critic_coef"] = float(ppo_cfg.get("value_coef", config_section.get("critic_coef", 1.0)))
     config_section["bounds_loss_coef"] = float(
         ppo_cfg.get("bounds_loss_coef", config_section.get("bounds_loss_coef", 0.0))

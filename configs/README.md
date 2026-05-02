@@ -20,4 +20,5 @@ Notes:
 - No curriculum config. The occupancy curriculum has been removed.
 - No cup/occupancy parameters in any active config.
 - PPO uses RoboDuet unified values: horizon=24, epochs=5, batches=4, LR=1e-3, entropy=0.01, KL=0.01.
-- Raw actions are unbounded; clip_actions=1e6 (not 1.0).
+- Raw actions enter the environment without rl_games action preprocessing (`config.clip_actions=false`).
+- The IsaacLab wrapper keeps `env.clip_actions=1e6` only as an emergency bound; it must not be used by rl_games to rescale actions.

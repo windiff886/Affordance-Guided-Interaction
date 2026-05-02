@@ -72,14 +72,15 @@
 - $a_t\in\mathbb R^{15}$ 表示策略输出的 raw action，其中前 12 维控制双臂，后 3 维控制底盘。
 - $o_t\in\mathbb R^{79}$ 表示策略和 critic 共用的低维状态观测。
 
-需要特别注意：当前动作空间在 Gym 层定义为
+需要特别注意：IsaacLab rl_games wrapper 层仍保留一个极大的 emergency action bound：
 
 $$
 \mathcal A=[-10^6,10^6]^{15},
 $$
 
-rl_games 的 `clip_actions` 也设置为 `1000000.0`。因此 policy 输出不是常见的
-`[-1,1]` 归一化动作；动作只在映射到关节目标和底盘速度命令时被安全限幅。
+但 rl_games PPO config 中的 `config.clip_actions=False`。因此 rl_games 不会把 policy
+sample 先裁到 `[-1,1]` 再按上面的 action space 重映射到 `[-10^6,10^6]`。
+策略输出作为 raw Gaussian action 原样进入环境；动作只在映射到关节目标和底盘速度命令时被安全限幅。
 
 <a id="sec-1"></a>
 ## 1. 任务介绍：项目在训练什么，解决什么问题
@@ -673,7 +674,7 @@ r_{\text{pcl}}
 \right).
 $$
 
-因为当前 action 没有被 rl_games 裁到 `[-1,1]`，这个惩罚是限制 raw policy 输出幅值的主要 reward 约束。
+因为当前 action 不经过 rl_games 的 `[-1,1]` 裁剪和 action-space 重映射，这个惩罚是限制 raw policy 输出幅值的主要 reward 约束。
 
 #### 硬碰撞惩罚
 
@@ -832,6 +833,7 @@ $$
 | `sigma_init.val` | `-2.0` |
 | `normalize_input` | `True` |
 | `normalize_value` | `True` |
+| `clip_actions` | `False` |
 | `mixed_precision` | `True` |
 
 PPO 主要超参数为：
@@ -855,7 +857,7 @@ PPO 主要超参数为：
 | `mini_epochs` | `5` |
 | `seq_length` | `4` |
 
-训练脚本要求 `actor_lr == critic_lr`，因为当前 rl_games-only 路径使用单优化器；默认二者均为 `1.0e-3`。`bounds_loss_coef=0.0` 显式禁用 rl_games 的 action mean bounds loss；该键不能省略，否则当前 rl_games 版本会让 `bound_loss()` 返回 Python `int`，在 PPO 更新阶段触发 `b_loss.unsqueeze(...)` 类型错误。
+训练脚本要求 `actor_lr == critic_lr`，因为当前 rl_games-only 路径使用单优化器；默认二者均为 `1.0e-3`。`clip_actions=False` 显式关闭 rl_games continuous action preprocessing，避免把 raw policy sample 先裁到 `[-1,1]` 再按 wrapper action space 重映射。`bounds_loss_coef=0.0` 显式禁用 rl_games 的 action mean bounds loss；该键不能省略，否则当前 rl_games 版本会让 `bound_loss()` 返回 Python `int`，在 PPO 更新阶段触发 `b_loss.unsqueeze(...)` 类型错误。
 
 ### 4.4 策略分布
 
