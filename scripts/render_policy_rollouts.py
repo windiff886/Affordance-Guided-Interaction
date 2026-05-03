@@ -43,6 +43,7 @@ from scripts.train import (
     build_rl_games_agent_cfg,
     load_config,
 )
+from affordance_guided_interaction.utils.rl_games_direct_std import register_direct_std_rl_games_components
 from affordance_guided_interaction.utils.rl_games_config import build_rl_games_wrapper_kwargs
 from affordance_guided_interaction.utils.train_runtime_config import TrainRuntimeConfig
 
@@ -401,6 +402,7 @@ def _build_player(
     params["load_path"] = checkpoint_path
 
     _register_rl_games_env(env)
+    register_direct_std_rl_games_components()
 
     runner = Runner()
     runner.load(agent_cfg)

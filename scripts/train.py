@@ -28,6 +28,12 @@ if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
 from affordance_guided_interaction.utils.runtime_env import resolve_headless_mode
+from affordance_guided_interaction.utils.rl_games_direct_std import (
+    DIRECT_STD_MODEL_NAME,
+    DIRECT_STD_NETWORK_NAME,
+    normalize_direct_std_config,
+    register_direct_std_rl_games_components,
+)
 from affordance_guided_interaction.utils.rl_games_config import (
     build_rl_games_wrapper_kwargs,
 )
@@ -197,6 +203,8 @@ def build_rl_games_agent_cfg(
 
     params = agent_cfg.setdefault("params", {})
     env_section = params.setdefault("env", {})
+    model_section = params.setdefault("model", {})
+    network_section = params.setdefault("network", {})
     config_section = params.setdefault("config", {})
 
     params["seed"] = int(runtime_cfg.seed)
@@ -227,6 +235,9 @@ def build_rl_games_agent_cfg(
     if "adaptive_lr_min" in ppo_cfg:
         config_section["adaptive_lr_min"] = float(ppo_cfg["adaptive_lr_min"])
     config_section["entropy_coef"] = float(ppo_cfg.get("entropy_coef", config_section.get("entropy_coef", 0.0)))
+    config_section["mixed_precision"] = bool(
+        ppo_cfg.get("mixed_precision", config_section.get("mixed_precision", False))
+    )
     config_section["clip_actions"] = bool(ppo_cfg.get("clip_actions", False))
     config_section["critic_coef"] = float(ppo_cfg.get("value_coef", config_section.get("critic_coef", 1.0)))
     config_section["bounds_loss_coef"] = float(
@@ -247,9 +258,22 @@ def build_rl_games_agent_cfg(
     reward_shaper = config_section.setdefault("reward_shaper", {})
     reward_shaper["scale_value"] = float(training_cfg.get("reward_scale", reward_shaper.get("scale_value", 1.0)))
 
-    continuous_space = params.setdefault("network", {}).setdefault("space", {}).setdefault("continuous", {})
+    if "model_name" in ppo_cfg:
+        model_section["name"] = str(ppo_cfg["model_name"])
+    if "network_name" in ppo_cfg:
+        network_section["name"] = str(ppo_cfg["network_name"])
+
+    continuous_space = network_section.setdefault("space", {}).setdefault("continuous", {})
     sigma_init = continuous_space.setdefault("sigma_init", {})
-    if "sigma_init_logstd" in ppo_cfg:
+    if "direct_std" in ppo_cfg:
+        direct_std_cfg = normalize_direct_std_config(ppo_cfg.get("direct_std"))
+        model_section["name"] = str(ppo_cfg.get("model_name", DIRECT_STD_MODEL_NAME))
+        network_section["name"] = str(ppo_cfg.get("network_name", DIRECT_STD_NETWORK_NAME))
+        continuous_space["fixed_sigma"] = True
+        continuous_space["sigma_activation"] = "None"
+        continuous_space["direct_std"] = direct_std_cfg
+        sigma_init["val"] = float(direct_std_cfg["arm_init"])
+    elif "sigma_init_logstd" in ppo_cfg:
         sigma_init["val"] = float(ppo_cfg["sigma_init_logstd"])
     elif "sigma_init_val" in ppo_cfg:
         sigma_init["val"] = float(ppo_cfg["sigma_init_val"])
@@ -426,6 +450,7 @@ def main(argv: list[str] | None = None) -> int:
         from isaaclab_rl.rl_games import RlGamesGpuEnv, RlGamesVecEnvWrapper
 
         _ensure_tasks_registered()
+        register_direct_std_rl_games_components()
 
         config_name = agent_cfg["params"]["config"]["name"]
         log_root_path = (runtime_cfg.log_dir / _DEFAULT_LOG_ROOT / config_name).resolve()

@@ -824,17 +824,19 @@ $$
 | 字段 | 当前值 |
 | --- | --- |
 | `algo.name` | `a2c_continuous` |
-| `model.name` | `continuous_a2c_logstd` |
-| `network.name` | `actor_critic` |
+| `model.name` | `continuous_a2c_direct_std` |
+| `network.name` | `door_push_actor_critic_direct_std` |
 | `network.separate` | `False` |
 | MLP | `[512, 256, 128]` |
 | activation | `elu` |
 | `fixed_sigma` | `True` |
-| `sigma_init.val` | `-2.0` |
+| `sigma_init.val` | `0.1` |
+| `direct_std.arm_init` | `0.1` |
+| `direct_std.base_init` | `1.0` |
 | `normalize_input` | `True` |
 | `normalize_value` | `True` |
 | `clip_actions` | `False` |
-| `mixed_precision` | `True` |
+| `mixed_precision` | `False` |
 
 PPO 主要超参数为：
 
@@ -846,7 +848,7 @@ PPO 主要超参数为：
 | `lr_schedule` | `adaptive` |
 | `kl_threshold` | `0.01` |
 | `adaptive_lr_min` | `1.0e-5` |
-| `adaptive_lr_max` | `1.0e-2` |
+| `adaptive_lr_max` | `1.0e-3` |
 | `e_clip` | `0.2` |
 | `entropy_coef` | `0.01` |
 | `critic_coef` | `1.0` |
@@ -861,9 +863,15 @@ PPO 主要超参数为：
 
 ### 4.4 策略分布
 
-当前模型为 `continuous_a2c_logstd`，即独立对角高斯策略。网络输出均值 $\mu_\phi(o_t)\in\mathbb R^{15}$，标准差由参数化 $\log\sigma$ 给出（`fixed_sigma=True`，$\sigma$ 不依赖观测）。
+当前模型为 `continuous_a2c_direct_std`，即 RoboDuet 风格的独立对角高斯策略。网络输出均值 $\mu_\phi(o_t)\in\mathbb R^{15}$，标准差由直接可训练参数 $\sigma\in\mathbb R^{15}$ 给出（`fixed_sigma=True`，$\sigma$ 不依赖观测），不再使用 `sigma = exp(logstd)`。
 
-初始化时 $\log\sigma = -2.0$，对应 $\sigma\approx 0.135$。
+动作维度顺序为前 12 维 arm，后 3 维 base。初始化为：
+
+$$
+\sigma_{1:12}=0.1,\qquad \sigma_{13:15}=1.0.
+$$
+
+该实现按 RoboDuet 方案 A 使用裸 direct std。训练时如果 $\sigma$ 变成非正数或非有限值，自定义模型会直接抛出错误终止训练，而不是静默进入 `Normal` 的非法 scale。
 
 策略分布为：
 
@@ -871,7 +879,7 @@ $$
 \pi_\phi(a\mid o)=\prod_{k=1}^{15}\mathcal N(a_k;\,\mu_{\phi,k}(o),\,\sigma_k^2).
 $$
 
-给定动作 $a$ 和分布参数 $(\mu,\sigma)$，负对数概率的精确实现为（`ModelA2CContinuousLogStd.Network.neglogp`）：
+给定动作 $a$ 和分布参数 $(\mu,\sigma)$，负对数概率由 `torch.distributions.Normal(mu, sigma).log_prob(a)` 计算，其数学形式为：
 
 $$
 -\log\pi_\phi(a\mid o)=
@@ -1085,13 +1093,13 @@ $$
 L^{\text{total}} \leftarrow L^{\text{total}} + L^{\text{aux}}.
 $$
 
-当前 `actor_critic` 网络的 `get_aux_loss()` 返回 `None`，所以 aux loss 不生效。
+当前 `door_push_actor_critic_direct_std` 网络的 `get_aux_loss()` 返回 `None`，所以 aux loss 不生效。
 
 ### 4.12 优化与梯度处理
 
 **优化器**：Adam，$\text{lr}=1\times 10^{-3}$，$\epsilon=10^{-8}$，无 weight decay。
 
-**Mixed Precision**：`mixed_precision=True`，使用 `torch.amp.autocast('cuda', dtype=torch.bfloat16)`。前向和 loss 计算在 bfloat16 下执行，梯度通过 `GradScaler` 缩放。
+**Mixed Precision**：`mixed_precision=False`。PPO 前向、KL、entropy、log_prob 和 loss 计算保持 FP32，以避免自动混合精度放大高斯策略分布的数值问题。
 
 **梯度裁剪**：`truncate_grads=True`，在 scaler unscale 之后执行：
 
@@ -1124,13 +1132,13 @@ $$
 
 当前配置 `schedule_type='legacy'`，即 KL 在每个 mini-batch 后即时计算并更新学习率。
 
-**自适应规则**（`kl_threshold=0.01`，`adaptive_lr_min=1e-5`，`adaptive_lr_max=1e-2`）：
+**自适应规则**（`kl_threshold=0.01`，`adaptive_lr_min=1e-5`，`adaptive_lr_max=1e-3`）：
 
 $$
 \text{lr} \leftarrow
 \begin{cases}
 \max\big(\text{lr}/1.5,\;10^{-5}\big), & D_{\text{KL}} > 2\times 0.01 = 0.02,\\
-\min\big(\text{lr}\times 1.5,\;10^{-2}\big), & D_{\text{KL}} < 0.5\times 0.01 = 0.005,\\
+\min\big(\text{lr}\times 1.5,\;10^{-3}\big), & D_{\text{KL}} < 0.5\times 0.01 = 0.005,\\
 \text{lr}, & \text{otherwise}.
 \end{cases}
 $$

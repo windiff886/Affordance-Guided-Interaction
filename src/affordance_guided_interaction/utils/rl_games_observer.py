@@ -202,6 +202,7 @@ class DoorPushTensorboardObserver(IsaacAlgoObserver):
             if count > 0:
                 self.writer.add_scalar(rand_key, self._random_sums[rand_key] / count, frame)
 
+        self._write_direct_std_stats(frame)
         self._reset_custom_stats()
 
     def _reset_custom_stats(self) -> None:
@@ -260,3 +261,23 @@ class DoorPushTensorboardObserver(IsaacAlgoObserver):
         if count <= 0:
             return None
         return self._reward_sums[key] / count
+
+    def _write_direct_std_stats(self, frame: int) -> None:
+        model = getattr(self.algo, "model", None)
+        net = getattr(model, "a2c_network", None)
+        sigma = getattr(net, "sigma", None)
+        direct_std_config = getattr(net, "direct_std_config", None)
+        if sigma is None or not isinstance(direct_std_config, dict) or not direct_std_config.get("enabled", False):
+            return
+
+        std = sigma.detach()
+        self.writer.add_scalar("policy/std_min", float(std.min().item()), frame)
+        self.writer.add_scalar("policy/std_max", float(std.max().item()), frame)
+        self.writer.add_scalar("policy/std_mean", float(std.mean().item()), frame)
+
+        arm_dim = int(direct_std_config.get("arm_action_dim", 0))
+        base_dim = int(direct_std_config.get("base_action_dim", 0))
+        if arm_dim > 0 and std.numel() >= arm_dim:
+            self.writer.add_scalar("policy/std_arm_mean", float(std[:arm_dim].mean().item()), frame)
+        if base_dim > 0 and std.numel() >= arm_dim + base_dim:
+            self.writer.add_scalar("policy/std_base_mean", float(std[arm_dim:arm_dim + base_dim].mean().item()), frame)

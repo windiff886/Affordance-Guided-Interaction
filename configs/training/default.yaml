@@ -13,9 +13,18 @@ ppo_common: &ppo_common
   use_clipped_value_loss: true
   entropy_coef: 0.01
   clip_actions: false
-  sigma_init_logstd: -2.0
+  mixed_precision: false
+  model_name: continuous_a2c_direct_std
+  network_name: door_push_actor_critic_direct_std
+  direct_std:
+    enabled: true
+    arm_action_dim: 12
+    base_action_dim: 3
+    arm_init: 0.1
+    base_init: 1.0
+    validate_positive: true
   adaptive_lr_min: 1.0e-5
-  adaptive_lr_max: 1.0e-2
+  adaptive_lr_max: 1.0e-3
   actor_lr: 1.0e-3
   critic_lr: 1.0e-3
   value_coef: 1.0

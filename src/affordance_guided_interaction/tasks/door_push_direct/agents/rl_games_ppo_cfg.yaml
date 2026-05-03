@@ -9,10 +9,10 @@ params:
     name: a2c_continuous
 
   model:
-    name: continuous_a2c_logstd
+    name: continuous_a2c_direct_std
 
   network:
-    name: actor_critic
+    name: door_push_actor_critic_direct_std
     separate: False
     space:
       continuous:
@@ -23,8 +23,15 @@ params:
           name: default
         sigma_init:
           name: const_initializer
-          val: -2.0
+          val: 0.1
         fixed_sigma: True
+        direct_std:
+          enabled: True
+          arm_action_dim: 12
+          base_action_dim: 3
+          arm_init: 0.1
+          base_init: 1.0
+          validate_positive: True
     mlp:
       units: [512, 256, 128]
       activation: elu
@@ -46,7 +53,7 @@ params:
     multi_gpu: False
     ppo: True
     clip_actions: False
-    mixed_precision: True
+    mixed_precision: False
     normalize_input: True
     normalize_value: True
     num_actors: -1
@@ -58,7 +65,7 @@ params:
     learning_rate: 1.0e-3
     lr_schedule: adaptive
     kl_threshold: 0.01
-    adaptive_lr_max: 1.0e-2
+    adaptive_lr_max: 1.0e-3
     adaptive_lr_min: 1.0e-5
     score_to_win: 100000000
     max_epochs: 4578
