@@ -32,6 +32,7 @@ params:
           arm_init: 0.1
           base_init: 1.0
           validate_positive: True
+          raw_action_saturation_threshold: 1.0
     mlp:
       units: [512, 256, 128]
       activation: elu
@@ -72,7 +73,7 @@ params:
     save_best_after: 20
     save_frequency: 20
     grad_norm: 1.0
-    entropy_coef: 0.01
+    entropy_coef: 0.001
     bounds_loss_coef: 0.0
     truncate_grads: True
     e_clip: 0.2

@@ -13,6 +13,7 @@ DEFAULT_ARM_ACTION_DIM = 12
 DEFAULT_BASE_ACTION_DIM = 3
 DEFAULT_ARM_STD = 0.1
 DEFAULT_BASE_STD = 1.0
+DEFAULT_RAW_ACTION_SATURATION_THRESHOLD = 1.0
 
 _REGISTERED = False
 
@@ -27,6 +28,9 @@ def normalize_direct_std_config(config: dict[str, Any] | None) -> dict[str, Any]
         "arm_init": float(config.get("arm_init", DEFAULT_ARM_STD)),
         "base_init": float(config.get("base_init", DEFAULT_BASE_STD)),
         "validate_positive": bool(config.get("validate_positive", True)),
+        "raw_action_saturation_threshold": float(
+            config.get("raw_action_saturation_threshold", DEFAULT_RAW_ACTION_SATURATION_THRESHOLD)
+        ),
     }
     if normalized["arm_action_dim"] < 0:
         raise ValueError(f"direct_std.arm_action_dim must be non-negative, got {normalized['arm_action_dim']}.")
@@ -36,6 +40,11 @@ def normalize_direct_std_config(config: dict[str, Any] | None) -> dict[str, Any]
         raise ValueError(f"direct_std.arm_init must be positive, got {normalized['arm_init']}.")
     if normalized["base_init"] <= 0.0:
         raise ValueError(f"direct_std.base_init must be positive, got {normalized['base_init']}.")
+    if normalized["raw_action_saturation_threshold"] <= 0.0:
+        raise ValueError(
+            "direct_std.raw_action_saturation_threshold must be positive, "
+            f"got {normalized['raw_action_saturation_threshold']}."
+        )
     return normalized
 
 
@@ -50,6 +59,14 @@ def register_direct_std_rl_games_components() -> None:
     from rl_games.common import divergence
 
     class DoorPushDirectStdNetwork(network_builder.A2CBuilder.Network):
+        _policy_diag_mu_abs_sum: torch.Tensor | None
+        _policy_diag_mu_abs_max: torch.Tensor | None
+        _policy_diag_mu_count: int
+        _policy_diag_raw_abs_sum: torch.Tensor | None
+        _policy_diag_raw_abs_max: torch.Tensor | None
+        _policy_diag_raw_saturated_sum: torch.Tensor | None
+        _policy_diag_raw_count: int
+
         def __init__(self, params: dict[str, Any], **kwargs):
             super().__init__(params, **kwargs)
             self.direct_std_config = normalize_direct_std_config(
@@ -57,6 +74,7 @@ def register_direct_std_rl_games_components() -> None:
             )
             if self.direct_std_config["enabled"]:
                 self._initialize_direct_std()
+            self._reset_policy_diagnostics()
 
         def _initialize_direct_std(self) -> None:
             if not getattr(self, "is_continuous", False):
@@ -90,6 +108,60 @@ def register_direct_std_rl_games_components() -> None:
                 sigma = result[1]
                 _validate_sigma(sigma)
             return result
+
+        def record_policy_diagnostics(self, mu: torch.Tensor, raw_actions: torch.Tensor | None) -> None:
+            if raw_actions is None:
+                return
+
+            with torch.no_grad():
+                mu_abs = mu.detach().abs()
+                raw_abs = raw_actions.detach().abs()
+                threshold = float(self.direct_std_config["raw_action_saturation_threshold"])
+                saturated = raw_abs > threshold
+
+                self._policy_diag_mu_abs_sum = _sum_accumulate(self._policy_diag_mu_abs_sum, mu_abs.sum())
+                self._policy_diag_mu_count += int(mu_abs.numel())
+                self._policy_diag_mu_abs_max = _max_accumulate(self._policy_diag_mu_abs_max, mu_abs.max())
+
+                self._policy_diag_raw_abs_sum = _sum_accumulate(self._policy_diag_raw_abs_sum, raw_abs.sum())
+                self._policy_diag_raw_count += int(raw_abs.numel())
+                self._policy_diag_raw_abs_max = _max_accumulate(self._policy_diag_raw_abs_max, raw_abs.max())
+                self._policy_diag_raw_saturated_sum = _sum_accumulate(
+                    self._policy_diag_raw_saturated_sum,
+                    saturated.to(dtype=raw_abs.dtype).sum(),
+                )
+
+        def consume_policy_diagnostics(self) -> dict[str, float]:
+            stats: dict[str, float] = {}
+            if self._policy_diag_mu_count > 0:
+                assert self._policy_diag_mu_abs_sum is not None
+                assert self._policy_diag_mu_abs_max is not None
+                stats["mu_abs_mean"] = float(
+                    (self._policy_diag_mu_abs_sum / self._policy_diag_mu_count).detach().item()
+                )
+                stats["mu_abs_max"] = float(self._policy_diag_mu_abs_max.detach().item())
+            if self._policy_diag_raw_count > 0:
+                assert self._policy_diag_raw_abs_sum is not None
+                assert self._policy_diag_raw_abs_max is not None
+                assert self._policy_diag_raw_saturated_sum is not None
+                stats["raw_action_abs_mean"] = float(
+                    (self._policy_diag_raw_abs_sum / self._policy_diag_raw_count).detach().item()
+                )
+                stats["raw_action_abs_max"] = float(self._policy_diag_raw_abs_max.detach().item())
+                stats["raw_action_saturation_rate"] = float(
+                    (self._policy_diag_raw_saturated_sum / self._policy_diag_raw_count).detach().item()
+                )
+            self._reset_policy_diagnostics()
+            return stats
+
+        def _reset_policy_diagnostics(self) -> None:
+            self._policy_diag_mu_abs_sum = None
+            self._policy_diag_mu_abs_max = None
+            self._policy_diag_mu_count = 0
+            self._policy_diag_raw_abs_sum = None
+            self._policy_diag_raw_abs_max = None
+            self._policy_diag_raw_saturated_sum = None
+            self._policy_diag_raw_count = 0
 
     class DoorPushDirectStdA2CBuilder(network_builder.A2CBuilder):
         def build(self, name, **kwargs):
@@ -131,6 +203,7 @@ def register_direct_std_rl_games_components() -> None:
                 distr = torch.distributions.Normal(mu, sigma, validate_args=False)
 
                 if is_train:
+                    self.a2c_network.record_policy_diagnostics(mu, prev_actions)
                     entropy = distr.entropy().sum(dim=-1)
                     prev_neglogp = -distr.log_prob(prev_actions).sum(dim=-1)
                     return {
@@ -143,6 +216,7 @@ def register_direct_std_rl_games_components() -> None:
                     }
 
                 selected_action = distr.sample()
+                self.a2c_network.record_policy_diagnostics(mu, selected_action)
                 neglogp = -distr.log_prob(selected_action).sum(dim=-1)
                 entropy = distr.entropy().sum(dim=-1)
                 return {
@@ -175,3 +249,17 @@ def _validate_sigma(sigma: torch.Tensor) -> None:
         "DoorPush direct std became non-positive or non-finite. "
         f"finite_min={min_value}, finite_max={max_value}."
     )
+
+
+def _sum_accumulate(current: torch.Tensor | None, value: torch.Tensor) -> torch.Tensor:
+    value = value.detach()
+    if current is None:
+        return value
+    return current + value
+
+
+def _max_accumulate(current: torch.Tensor | None, value: torch.Tensor) -> torch.Tensor:
+    value = value.detach()
+    if current is None:
+        return value
+    return torch.maximum(current, value)

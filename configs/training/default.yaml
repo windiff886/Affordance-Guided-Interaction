@@ -1,6 +1,6 @@
 runtime_defaults: &runtime_defaults
   headless: true
-  device: cuda:0
+  device: cuda:1
   seed: 42
   resume: null
   log_dir: runs
@@ -11,7 +11,7 @@ ppo_common: &ppo_common
   clip_eps: 0.2
   value_clip_eps: 0.2
   use_clipped_value_loss: true
-  entropy_coef: 0.01
+  entropy_coef: 0.001
   clip_actions: false
   mixed_precision: false
   model_name: continuous_a2c_direct_std
@@ -23,6 +23,7 @@ ppo_common: &ppo_common
     arm_init: 0.1
     base_init: 1.0
     validate_positive: true
+    raw_action_saturation_threshold: 1.0
   adaptive_lr_min: 1.0e-5
   adaptive_lr_max: 1.0e-3
   actor_lr: 1.0e-3

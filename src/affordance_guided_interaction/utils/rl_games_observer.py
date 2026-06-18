@@ -126,10 +126,12 @@ class DoorPushTensorboardObserver(IsaacAlgoObserver):
             "total": "reward/total",
             "opening": "reward/opening",
             "opening/open_door_target": "reward/open_door_target",
+            "opening/end_effector_to_panel": "reward/end_effector_to_panel",
             "passing": "reward/passing",
             "shaping": "reward/shaping",
             "shaping/min_arm_motion": "reward/min_arm_motion",
             "shaping/stretched_arm": "reward/penalize_stretched_arm",
+            # Compatibility for older env extras emitted before r_eep moved into opening.
             "shaping/end_effector_to_panel": "reward/end_effector_to_panel",
             "shaping/command_limit": "reward/penalize_command_limit",
             "shaping/collision": "reward/penalize_collision",
@@ -281,3 +283,10 @@ class DoorPushTensorboardObserver(IsaacAlgoObserver):
             self.writer.add_scalar("policy/std_arm_mean", float(std[:arm_dim].mean().item()), frame)
         if base_dim > 0 and std.numel() >= arm_dim + base_dim:
             self.writer.add_scalar("policy/std_base_mean", float(std[arm_dim:arm_dim + base_dim].mean().item()), frame)
+
+        consume_policy_diagnostics = getattr(net, "consume_policy_diagnostics", None)
+        if not callable(consume_policy_diagnostics):
+            return
+
+        for key, value in consume_policy_diagnostics().items():
+            self.writer.add_scalar(f"policy/{key}", value, frame)

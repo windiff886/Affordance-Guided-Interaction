@@ -4,8 +4,7 @@ runtime:
   seed: 42
 
 policy:
-  checkpoint: runs/rl_games/door_push_direct/2026-04-26_05-00-28/nn/last_door_push_direct_ep_7540_rew_-2783.1467.pth
-  deterministic: true
+  checkpoint: /root/Affordance-Guided-Interaction/runs/rl_games/door_push_direct/2026-05-05_05-21-30/nn/last_door_push_direct_ep_5540_rew_5733.7603.pth
 
 rollout:
   task_name: Affordance-DoorPush-Direct-v0

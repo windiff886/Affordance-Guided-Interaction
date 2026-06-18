@@ -82,11 +82,11 @@ _DOORWAY_CENTER_OFFSET_FROM_ROOT = (0.02, 0.45, 1.0)
 _EPISODE_REWARD_KEYS = (
     "opening",
     "opening/open_door_target",
+    "opening/end_effector_to_panel",
     "passing",
     "shaping",
     "shaping/min_arm_motion",
     "shaping/stretched_arm",
-    "shaping/end_effector_to_panel",
     "shaping/command_limit",
     "shaping/collision",
     "total",
@@ -427,7 +427,6 @@ class DoorPushEnv(DirectRLEnv):
 
         # Door state
         door_root_pos_w = door.data.root_pos_w       # (N, 3)
-        door_root_quat_w = door.data.root_quat_w     # (N, 4)
         door_leaf_pos_w = door.data.body_pos_w[:, self._door_panel_body_idx]
         door_leaf_quat_w = door.data.body_quat_w[:, self._door_panel_body_idx]
         theta = door.data.joint_pos[:, 0]             # (N,)
@@ -534,9 +533,8 @@ class DoorPushEnv(DirectRLEnv):
 
         reward_info: dict[str, Tensor] = {}
 
-        # Opening reward
-        r_od = compute_opening_reward(theta, self.cfg.theta_hat)
-        r_o = self.cfg.rew_opening_scale * r_od
+        # Normalized door-angle opening target; combined with EE-panel proximity below.
+        r_od_normalized = compute_opening_reward(theta, self.cfg.theta_hat)
 
         # Stage
         stage = compute_stage(theta, self.cfg.theta_pass)
@@ -631,12 +629,14 @@ class DoorPushEnv(DirectRLEnv):
 
         r_s = (self.cfg.rew_ma_weight * r_ma
                + self.cfg.rew_psa_weight * r_psa
-               + self.cfg.rew_eep_weight * r_eep
                + self.cfg.rew_pcl_weight * r_pcl
                + self.cfg.rew_pc_weight * r_pc)
 
+        r_o = (self.cfg.rew_opening_scale * r_od_normalized
+               + self.cfg.rew_eep_weight * r_eep)
+
         # Total reward
-        r_o_max = self.cfg.rew_opening_scale  # max opening reward
+        r_o_max = self.cfg.rew_opening_scale + self.cfg.rew_eep_weight
         r_total = torch.where(
             stage < 0.5,
             r_o + r_s,
@@ -644,12 +644,12 @@ class DoorPushEnv(DirectRLEnv):
         )
 
         reward_info["opening"] = r_o
-        reward_info["opening/open_door_target"] = r_od
+        reward_info["opening/open_door_target"] = r_od_normalized
+        reward_info["opening/end_effector_to_panel"] = r_eep
         reward_info["passing"] = r_p
         reward_info["shaping"] = r_s
         reward_info["shaping/min_arm_motion"] = r_ma
         reward_info["shaping/stretched_arm"] = r_psa
-        reward_info["shaping/end_effector_to_panel"] = r_eep
         reward_info["shaping/command_limit"] = r_pcl
         reward_info["shaping/collision"] = r_pc
         reward_info["total"] = r_total

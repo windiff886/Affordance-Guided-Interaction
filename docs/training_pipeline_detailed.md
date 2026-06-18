@@ -510,11 +510,22 @@ $$
 r_t=
 \begin{cases}
 r_o+r_s, & \theta_t\le \theta_{\text{pass}},\\
-3.0+r_p+r_s, & \theta_t>\theta_{\text{pass}}.
+r_{o,\max}+r_p+r_s, & \theta_t>\theta_{\text{pass}}.
 \end{cases}
 $$
 
-这里 $3.0$ 是 opening reward 的最大尺度 `rew_opening_scale`。
+其中：
+
+$$
+r_{o,\max}
+=
+\mathrm{rew\_opening\_scale}
++
+\mathrm{rew\_eep\_weight}.
+$$
+
+也就是说，进入 passing stage 后，总奖励保留 opening reward 的符号化最大值，
+而不是继续使用即时 opening reward。
 
 ### 3.4 Opening reward
 
@@ -535,10 +546,16 @@ $$
 实际 opening reward 为：
 
 $$
-r_o=3.0\,r_{\text{od}}.
+r_o
+=
+\mathrm{rew\_opening\_scale}\,r_{\text{od}}
++
+\mathrm{rew\_eep\_weight}\,r_{\text{eep}}.
 $$
 
-这个项在 passing stage 之前直接进入总奖励；进入 passing stage 后，总奖励使用常数 $3.0$ 代替即时 $r_o$。
+当前默认值下，这等价于 $r_o=3.0\,r_{\text{od}}+1.0\,r_{\text{eep}}$。
+这个项在 passing stage 之前直接进入总奖励；进入 passing stage 后，总奖励使用
+$r_{o,\max}=\mathrm{rew\_opening\_scale}+\mathrm{rew\_eep\_weight}$ 代替即时 $r_o$。
 
 ### 3.5 Passing reward
 
@@ -588,10 +605,11 @@ $$
 r_s=
 0.3\,r_{\text{ma}}
 +1.0\,r_{\text{psa}}
-+1.0\,r_{\text{eep}}
 +0.1\,r_{\text{pcl}}
 +2.0\,r_{\text{pc}}.
 $$
+
+$r_{\text{eep}}$ 属于 opening reward，不属于 shaping regularizer。
 
 #### 最小手臂运动项
 
@@ -640,7 +658,8 @@ $$
 
 #### 末端到门板靠近奖励
 
-仿照论文中的 end-effector-to-handle/door 接近项，当前无把手任务使用双臂末端到门板中心的更近距离：
+仿照论文中的 end-effector-to-handle/door 接近项，当前无把手任务使用双臂末端到门板中心的更近距离。
+该项记为 $r_{\text{eep}}$，并作为 opening reward 的一部分进入 $r_o$：
 
 $$
 r_{\text{eep}}
@@ -655,7 +674,7 @@ r_{\text{eep}}
 \right).
 $$
 
-该项鼓励至少一只手靠近门板；距离在 base frame 中计算。
+该项鼓励至少一只手靠近门板；距离在 base frame 中计算。它不计入 $r_s$。
 
 #### raw command limit 惩罚
 
@@ -714,11 +733,11 @@ $$
 | --- | --- |
 | `opening` | $r_o$ 的 episode 累计 |
 | `opening/open_door_target` | $r_{\text{od}}$ 的 episode 累计 |
+| `opening/end_effector_to_panel` | $r_{\text{eep}}$ 的 episode 累计 |
 | `passing` | $r_p$ 的 episode 累计 |
 | `shaping` | $r_s$ 的 episode 累计 |
 | `shaping/min_arm_motion` | $r_{\text{ma}}$ 的 episode 累计 |
 | `shaping/stretched_arm` | $r_{\text{psa}}$ 的 episode 累计 |
-| `shaping/end_effector_to_panel` | $r_{\text{eep}}$ 的 episode 累计 |
 | `shaping/command_limit` | $r_{\text{pcl}}$ 的 episode 累计 |
 | `shaping/collision` | $r_{\text{pc}}$ 的 episode 累计 |
 | `total` | $r_t$ 的 episode 累计 |
@@ -850,7 +869,7 @@ PPO 主要超参数为：
 | `adaptive_lr_min` | `1.0e-5` |
 | `adaptive_lr_max` | `1.0e-3` |
 | `e_clip` | `0.2` |
-| `entropy_coef` | `0.01` |
+| `entropy_coef` | `0.001` |
 | `critic_coef` | `1.0` |
 | `bounds_loss_coef` | `0.0` |
 | `grad_norm` | `1.0` |
@@ -871,7 +890,7 @@ $$
 \sigma_{1:12}=0.1,\qquad \sigma_{13:15}=1.0.
 $$
 
-该实现按 RoboDuet 方案 A 使用裸 direct std。训练时如果 $\sigma$ 变成非正数或非有限值，自定义模型会直接抛出错误终止训练，而不是静默进入 `Normal` 的非法 scale。
+该实现按 RoboDuet 方案 A 使用裸 direct std。训练时如果 $\sigma$ 变成非正数或非有限值，自定义模型会直接抛出错误终止训练，而不是静默进入 `Normal` 的非法 scale。模型还会累计策略诊断量，并由 TensorBoard observer 写出 `policy/mu_abs_mean`、`policy/mu_abs_max`、`policy/raw_action_abs_mean`、`policy/raw_action_abs_max` 和 `policy/raw_action_saturation_rate`。其中 raw action saturation 使用阈值 `direct_std.raw_action_saturation_threshold=1.0`，与 command-limit reward 的 raw action 阈值一致。
 
 策略分布为：
 
@@ -1065,7 +1084,7 @@ $$
 L_t^{\text{entropy}} = -\mathcal H_t.
 $$
 
-系数 `entropy_coef=0.01`。
+系数 `entropy_coef=0.001`。该值用于降低 entropy 对 direct std 持续增大的显式推动，同时保留少量探索压力。
 
 ### 4.11 总 Loss
 
@@ -1309,11 +1328,11 @@ $$
 | `reward/total` | `total` | episode 总 reward 累计均值 |
 | `reward/opening` | `opening` | opening reward 累计均值 |
 | `reward/open_door_target` | `opening/open_door_target` | 未乘 scale 的开门目标项累计均值 |
+| `reward/end_effector_to_panel` | `opening/end_effector_to_panel` | 末端到门板靠近奖励累计均值 |
 | `reward/passing` | `passing` | passing reward 累计均值 |
 | `reward/shaping` | `shaping` | shaping reward 累计均值 |
 | `reward/min_arm_motion` | `shaping/min_arm_motion` | 最小手臂运动项累计均值 |
 | `reward/penalize_stretched_arm` | `shaping/stretched_arm` | 手臂过伸惩罚累计均值 |
-| `reward/end_effector_to_panel` | `shaping/end_effector_to_panel` | 末端到门板靠近奖励累计均值 |
 | `reward/penalize_command_limit` | `shaping/command_limit` | raw action 过大惩罚累计均值 |
 | `reward/penalize_collision` | `shaping/collision` | 硬碰撞惩罚累计均值 |
 
@@ -1346,7 +1365,24 @@ $$
 | `task/reverse_open_rate` | done env 最后一帧中反向开门诊断比例 |
 | `task/fail_timeout_rate` | done env 中 timeout 且非 success 的失败比例 |
 
-### 6.5 randomization tags
+### 6.5 policy diagnostics tags
+
+| TensorBoard tag | 含义 |
+| --- | --- |
+| `policy/std_min` | direct std 参数的最小值 |
+| `policy/std_max` | direct std 参数的最大值 |
+| `policy/std_mean` | direct std 参数的均值 |
+| `policy/std_arm_mean` | 前 12 维 arm direct std 均值 |
+| `policy/std_base_mean` | 后 3 维 base direct std 均值 |
+| `policy/mu_abs_mean` | 最近打印周期内策略均值 $|\mu|$ 的均值 |
+| `policy/mu_abs_max` | 最近打印周期内策略均值 $|\mu|$ 的最大值 |
+| `policy/raw_action_abs_mean` | 最近打印周期内 raw action 绝对值均值 |
+| `policy/raw_action_abs_max` | 最近打印周期内 raw action 绝对值最大值 |
+| `policy/raw_action_saturation_rate` | 最近打印周期内 `|raw_action| > 1.0` 的元素比例 |
+
+`policy/raw_action_saturation_rate` 是训练诊断量，不会改变 action，也不会重新引入 rl_games action clip/rescale。
+
+### 6.6 randomization tags
 
 | TensorBoard tag | 含义 |
 | --- | --- |
